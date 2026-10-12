@@ -3232,7 +3232,7 @@ class PlayerRepositoryImpl @Inject constructor(
         // index switch, a pause edge (exact resume position), or ≥5s drift.
         val pauseEdge = lastObservedIsPlaying && !newState.isPlaying
         lastObservedIsPlaying = newState.isPlaying
-        if (track != null) {
+        if (track != null && newState.source !is com.stash.core.model.PlaybackSource.AllSongs) {
             savePositionIfDue(track.id, newState.positionMs, newState.currentIndex, pauseEdge)
         }
 
@@ -3256,7 +3256,7 @@ class PlayerRepositoryImpl @Inject constructor(
             lastSavedShuffle = newState.isShuffleEnabled
             lastSavedRepeatMode = newState.repeatMode
             lastSavedSource = newState.source
-            if (queueIds.isNotEmpty()) {
+            if (queueIds.isNotEmpty() && newState.source !is com.stash.core.model.PlaybackSource.AllSongs) {
                 scope.launch {
                     playbackStateStore.saveQueue(
                         queueIds,
@@ -3301,6 +3301,7 @@ class PlayerRepositoryImpl @Inject constructor(
         val controller = controllerDeferred?.takeIf { it.isConnected } ?: return
         val state = _playerState.value
         val track = state.currentTrack ?: return
+        if (state.source is com.stash.core.model.PlaybackSource.AllSongs) return
         savePositionIfDue(track.id, controller.currentPosition.coerceAtLeast(0), state.currentIndex, pauseEdge = false)
     }
 

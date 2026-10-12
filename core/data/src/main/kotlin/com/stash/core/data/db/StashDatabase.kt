@@ -18,6 +18,7 @@ import com.stash.core.data.db.dao.ListeningEventDao
 import com.stash.core.data.db.dao.LyricsDao
 import com.stash.core.data.db.dao.PlaylistDao
 import com.stash.core.data.db.dao.RemoteSnapshotDao
+import com.stash.core.data.db.dao.ScannedSongDao
 import com.stash.core.data.db.dao.SharedMixDao
 import com.stash.core.data.db.dao.SourceAccountDao
 import com.stash.core.data.db.dao.SpotifyResolutionDao
@@ -44,6 +45,8 @@ import com.stash.core.data.db.entity.PlaylistEntity
 import com.stash.core.data.db.entity.PlaylistTrackCrossRef
 import com.stash.core.data.db.entity.RemotePlaylistSnapshotEntity
 import com.stash.core.data.db.entity.RemoteTrackSnapshotEntity
+import com.stash.core.data.db.entity.ScanFolderEntity
+import com.stash.core.data.db.entity.ScannedSongEntity
 import com.stash.core.data.db.entity.SharedMixEntity
 import com.stash.core.data.db.entity.SourceAccountEntity
 import com.stash.core.data.db.entity.SpotifyResolutionEntity
@@ -98,8 +101,10 @@ import com.stash.core.data.db.entity.TrackTagEntity
         SyncUndoMembershipEntity::class,
         ArtistImageEntity::class,
         SharedMixEntity::class,
+        ScanFolderEntity::class,
+        ScannedSongEntity::class,
     ],
-    version = 55,
+    version = 56,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -150,6 +155,8 @@ abstract class StashDatabase : RoomDatabase() {
     abstract fun webLibraryExportDao(): WebLibraryExportDao
 
     abstract fun mirrorDao(): com.stash.core.data.db.dao.MirrorDao
+
+    abstract fun scannedSongDao(): ScannedSongDao
 
 
     companion object {
@@ -1428,6 +1435,39 @@ abstract class StashDatabase : RoomDatabase() {
         }
 
         /**
+         * v54 → v55: All Songs. `scan_folders` (user-chosen SAF trees) and `scanned_songs`
+         * (what the scanner found, FK-cascaded off its folder). Isolated from `tracks`. Additive.
+         */
+        val MIGRATION_54_55 = object : Migration(54, 55) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `scan_folders` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`tree_uri` TEXT NOT NULL, " +
+                        "`display_name` TEXT NOT NULL, " +
+                        "`added_at` INTEGER NOT NULL)",
+                )
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_scan_folders_tree_uri` ON `scan_folders` (`tree_uri`)")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `scanned_songs` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`folder_id` INTEGER NOT NULL, " +
+                        "`uri` TEXT NOT NULL, " +
+                        "`title` TEXT NOT NULL, " +
+                        "`artist` TEXT NOT NULL, " +
+                        "`album` TEXT NOT NULL, " +
+                        "`duration_ms` INTEGER NOT NULL, " +
+                        "`file_format` TEXT NOT NULL, " +
+                        "`file_size_bytes` INTEGER NOT NULL, " +
+                        "`date_added` INTEGER NOT NULL, " +
+                        "FOREIGN KEY(`folder_id`) REFERENCES `scan_folders`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
+                )
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_scanned_songs_uri` ON `scanned_songs` (`uri`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_scanned_songs_folder_id` ON `scanned_songs` (`folder_id`)")
+            }
+        }
+
+        /**
          * v54 -> v55: an index on `tracks (canonical_title, canonical_artist)`, the
          * pair every lookup of a song by its words filters on (the sync's diff,
          * Search downloads, likes, hand-offs, discovery). Without it each lookup
@@ -1439,7 +1479,7 @@ abstract class StashDatabase : RoomDatabase() {
          * get the one loose rule's values from CanonicalRecomputeWorker after the
          * app starts (Kotlin, in batches): SQL here can't run that rule.
          */
-        val MIGRATION_54_55 = object : Migration(54, 55) {
+        val MIGRATION_55_56 = object : Migration(55, 56) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_tracks_canonical_title_canonical_artist` " +
