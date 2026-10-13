@@ -263,7 +263,7 @@ private fun StashNavGraph(
             )
         }
         composable<AllSongsRoute> {
-            AllSongsScreen()
+            AllSongsScreen(onSelectionModeChanged = onSelectionModeChanged)
         }
         composable<SearchRoute> {
             SearchScreen(

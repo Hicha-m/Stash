@@ -104,7 +104,7 @@ import com.stash.core.data.db.entity.TrackTagEntity
         ScanFolderEntity::class,
         ScannedSongEntity::class,
     ],
-    version = 56,
+    version = 57,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -1468,6 +1468,17 @@ abstract class StashDatabase : RoomDatabase() {
         }
 
         /**
+         * v56 -> v57: `scanned_songs.album_art_path`, the embedded cover of a scanned song.
+         * NULL on every existing row: the next scan looks for each one's cover and fills it in
+         * ("" when the file has none), so nothing needs backfilling here.
+         */
+        val MIGRATION_56_57 = object : Migration(56, 57) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `scanned_songs` ADD COLUMN `album_art_path` TEXT")
+            }
+        }
+
+        /**
          * v54 -> v55: an index on `tracks (canonical_title, canonical_artist)`, the
          * pair every lookup of a song by its words filters on (the sync's diff,
          * Search downloads, likes, hand-offs, discovery). Without it each lookup
@@ -1556,6 +1567,8 @@ abstract class StashDatabase : RoomDatabase() {
                 MIGRATION_52_53,
                 MIGRATION_53_54,
                 MIGRATION_54_55,
+                MIGRATION_55_56,
+                MIGRATION_56_57,
             )
         }
     }

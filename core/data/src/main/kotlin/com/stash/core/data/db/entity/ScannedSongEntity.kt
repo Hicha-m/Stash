@@ -33,4 +33,9 @@ data class ScannedSongEntity(
     @ColumnInfo(name = "file_format") val fileFormat: String,
     @ColumnInfo(name = "file_size_bytes") val fileSizeBytes: Long,
     @ColumnInfo(name = "date_added") val dateAdded: Long,
+    /**
+     * The embedded cover, saved under filesDir/scanned_art (songs with the same image share one file).
+     * NULL = not looked at yet (rows from before v57; the next scan fills it), "" = looked, none embedded.
+     */
+    @ColumnInfo(name = "album_art_path") val albumArtPath: String? = null,
 )

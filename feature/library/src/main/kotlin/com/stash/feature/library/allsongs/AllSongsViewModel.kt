@@ -3,6 +3,7 @@ package com.stash.feature.library.allsongs
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -14,6 +15,7 @@ import com.stash.core.model.MusicSource
 import com.stash.core.model.PlaybackSource
 import com.stash.core.model.Track
 import com.stash.core.model.scannedTrackId
+import com.stash.feature.library.SortOrder
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
@@ -22,6 +24,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -30,6 +33,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.FileNotFoundException
 import javax.inject.Inject
 
 @HiltViewModel
@@ -43,8 +47,17 @@ class AllSongsViewModel @Inject constructor(
     val folders: StateFlow<List<ScanFolderEntity>> = dao.observeFolders()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    val songs: StateFlow<List<Track>> = dao.observeSongs()
-        .map { rows -> rows.map { it.toTrack() } }
+    private val _sortOrder = MutableStateFlow(SortOrder.ALPHABETICAL)
+    val sortOrder: StateFlow<SortOrder> = _sortOrder.asStateFlow()
+
+    /** What the search field shows. The list below filters by it off the main thread. */
+    private val _query = MutableStateFlow("")
+    val query: StateFlow<String> = _query.asStateFlow()
+
+    /** The list as shown: searched, then sorted. Play, shuffle and selection all act on this. */
+    val songs: StateFlow<List<Track>> = combine(dao.observeSongs(), _sortOrder, _query) { rows, order, q ->
+        sortAndFilter(rows, order, q).map { it.toTrack() }
+    }
         .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
@@ -65,15 +78,21 @@ class AllSongsViewModel @Inject constructor(
         rescan()
     }
 
+    fun setSortOrder(order: SortOrder) {
+        _sortOrder.value = order
+    }
+
+    fun setQuery(query: String) {
+        _query.value = query
+    }
+
     fun rescan() {
         viewModelScope.launch { scanAll() }
     }
 
     fun addFolder(uri: Uri) {
         viewModelScope.launch {
-            try {
-                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (e: SecurityException) {
+            if (!takeGrant(uri)) {
                 _status.value = "Couldn't get access to that folder"
                 return@launch
             }
@@ -105,16 +124,39 @@ class AllSongsViewModel @Inject constructor(
         }
     }
 
-    /** Songs go with the folder (FK cascade), and so does the folder's read grant. */
+    /** Songs go with the folder (FK cascade), and so do the folder's grant and its cover files. */
     fun removeFolder(folder: ScanFolderEntity) {
         viewModelScope.launch {
             dao.deleteFolder(folder.id)
             releaseGrant(Uri.parse(folder.treeUri), dao.getFolders())
+            scanMutex.withLock { scanner.sweepArt() }
         }
     }
 
     /**
-     * Gives back the persisted read grant on [tree] unless something still needs it: Stash's
+     * Read and write: write is what lets Delete remove a file. A provider that offers no write
+     * still gets its read grant, so scanning and playing work and only deleting doesn't.
+     */
+    private fun takeGrant(uri: Uri): Boolean {
+        val resolver = context.contentResolver
+        return try {
+            resolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            true
+        } catch (e: SecurityException) {
+            try {
+                resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                true
+            } catch (e2: SecurityException) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Gives back the persisted grant on [tree] unless something still needs it: Stash's
      * download folder (the same tree URI shares one grant, and releasing it would break downloads)
      * or a scanned folder in [remaining]. Android caps an app's persisted grants, so unused ones
      * shouldn't pile up.
@@ -124,7 +166,10 @@ class AllSongsViewModel @Inject constructor(
         if (scanner.downloadTreeUri()?.toString() == tree.toString()) return
         withContext(Dispatchers.IO) {
             try {
-                context.contentResolver.releasePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                context.contentResolver.releasePersistableUriPermission(
+                    tree,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
             } catch (e: SecurityException) {
                 // Already gone (revoked, or never held): nothing to release.
             }
@@ -146,6 +191,56 @@ class AllSongsViewModel @Inject constructor(
         val queue = songs.value.shuffled()
         if (queue.isEmpty()) return
         viewModelScope.launch { player.setQueue(queue, 0, PlaybackSource.AllSongs) }
+    }
+
+    /** Each lands right after the playing song; going backwards keeps the selection's order. */
+    fun playNext(tracks: List<Track>) {
+        if (tracks.isEmpty()) return
+        viewModelScope.launch {
+            tracks.asReversed().forEach { player.addNext(it) }
+            _status.value = "Playing ${tracks.size} next"
+        }
+    }
+
+    fun addToQueue(tracks: List<Track>) {
+        if (tracks.isEmpty()) return
+        viewModelScope.launch {
+            if (player.addToQueue(tracks)) _status.value = "Added ${tracks.size} to the queue"
+        }
+    }
+
+    /**
+     * Deletes the files themselves, then their rows. A file that is already gone loses its row too;
+     * one that can't be deleted (no write access) keeps it and is counted in the status.
+     */
+    fun deleteSongs(tracks: List<Track>) {
+        viewModelScope.launch {
+            val deleted = ArrayList<String>()
+            var failed = 0
+            withContext(Dispatchers.IO) {
+                for (track in tracks) {
+                    val uri = track.filePath?.let(Uri::parse) ?: continue
+                    try {
+                        if (DocumentsContract.deleteDocument(context.contentResolver, uri)) {
+                            deleted.add(uri.toString())
+                        } else {
+                            failed++
+                        }
+                    } catch (e: FileNotFoundException) {
+                        deleted.add(uri.toString())
+                    } catch (e: Exception) {
+                        failed++
+                    }
+                }
+            }
+            deleted.chunked(500).forEach { dao.deleteByUrisAnyFolder(it) }
+            scanMutex.withLock { scanner.sweepArt() }
+            _status.value = if (failed > 0) {
+                "Couldn't delete $failed file(s). Add the folder again to allow deleting."
+            } else {
+                "Deleted ${deleted.size} file(s)"
+            }
+        }
     }
 
     private suspend fun scanAll() = scanMutex.withLock {
@@ -170,6 +265,7 @@ class AllSongsViewModel @Inject constructor(
                     failed++
                 }
             }
+            scanner.sweepArt()
         } finally {
             _scanning.value = false
         }
@@ -186,6 +282,29 @@ class AllSongsViewModel @Inject constructor(
     }
 }
 
+/**
+ * Search matches title, artist or album. "Recently added" is by the file's modified time (what
+ * "new on this phone" means for files that were already there), else the day it was first found.
+ */
+private fun sortAndFilter(rows: List<ScannedSongEntity>, order: SortOrder, query: String): List<ScannedSongEntity> {
+    val q = query.trim()
+    val matched = if (q.isEmpty()) {
+        rows
+    } else {
+        rows.filter {
+            it.title.contains(q, ignoreCase = true) ||
+                it.artist.contains(q, ignoreCase = true) ||
+                it.album.contains(q, ignoreCase = true)
+        }
+    }
+    return when (order) {
+        SortOrder.ALPHABETICAL -> matched.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
+        SortOrder.RECENT -> matched.sortedByDescending { if (it.lastModified > 0) it.lastModified else it.dateAdded }
+        SortOrder.DURATION -> matched.sortedByDescending { it.durationMs }
+        else -> matched // MOST_PLAYED isn't offered here: scanned songs have no play counts
+    }
+}
+
 /** A scanned row as the player's Track: an id in the scanned range ([scannedTrackId]), local and on disk. */
 internal fun ScannedSongEntity.toTrack(): Track = Track(
     id = scannedTrackId(id),
@@ -196,6 +315,7 @@ internal fun ScannedSongEntity.toTrack(): Track = Track(
     filePath = uri,
     fileFormat = fileFormat,
     fileSizeBytes = fileSizeBytes,
+    albumArtPath = albumArtPath?.takeIf { it.isNotEmpty() },
     dateAdded = dateAdded,
     source = MusicSource.LOCAL,
     isDownloaded = true,
