@@ -8,33 +8,47 @@ import com.stash.core.common.constants.StashConstants
 import com.stash.core.data.db.dao.ScannedSongDao
 import com.stash.core.data.db.entity.ScanFolderEntity
 import com.stash.core.data.db.entity.ScannedSongEntity
+import com.stash.core.data.prefs.StoragePreference
+import com.stash.core.model.SCANNED_UNKNOWN_ARTIST
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.IOException
+import java.security.MessageDigest
 import javax.inject.Inject
 import javax.inject.Singleton
-
-data class ScanResult(val added: Int, val removed: Int)
+import kotlin.coroutines.coroutineContext
 
 /**
- * Walks a user-chosen SAF tree for audio files and syncs `scanned_songs` with it.
- * One ContentResolver query per directory (no per-file DocumentFile IPC), tag reads
- * bounded by Semaphore(4), only NEW files are tag-read on a rescan.
+ * One folder's scan: songs [added], tags re-read for files that [updated] on disk, songs [removed]
+ * because their file is gone, and whether some subfolder couldn't be listed ([incomplete]; nothing
+ * was removed then).
+ */
+data class ScanResult(val added: Int, val updated: Int, val removed: Int, val incomplete: Boolean)
+
+/**
+ * Walks a user-chosen SAF tree for playable audio files and syncs `scanned_songs` with it.
+ * One ContentResolver query per directory (no per-file DocumentFile IPC); tag reads bounded by
+ * Semaphore(4); a rescan reads tags only for new files and files whose size or modified time moved.
  */
 @Singleton
 class AllSongsScanner @Inject constructor(
     @ApplicationContext private val context: Context,
     private val dao: ScannedSongDao,
+    private val storagePreference: StoragePreference,
 ) {
-    private data class AudioFile(val uri: String, val name: String, val size: Long)
 
-    fun displayName(tree: Uri): String {
+    /** The folder's name as the provider shows it. A provider query, so off the main thread. */
+    suspend fun displayName(tree: Uri): String = withContext(Dispatchers.IO) {
         val name = try {
             val doc = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
             context.contentResolver
@@ -43,77 +57,118 @@ class AllSongsScanner @Inject constructor(
         } catch (e: Exception) {
             null
         }
-        return name ?: tree.lastPathSegment ?: "Folder"
+        name ?: tree.lastPathSegment ?: "Folder"
     }
 
-    /** Throws if the folder can't be read, so a missing SD card / revoked grant never wipes its songs. */
+    /** Stash's download folder when the user picked one (null: downloads stay in app storage). */
+    suspend fun downloadTreeUri(): Uri? = storagePreference.externalTreeUri.first()
+
+    /**
+     * Why [tree] can't be added next to [folders], or null when it can (see [folderConflict]).
+     * A URI that isn't a SAF tree can't be compared and is let through; its scan fails instead.
+     */
+    internal suspend fun conflictFor(tree: Uri, folders: List<ScanFolderEntity>): FolderConflict? {
+        val candidate = treeRef(tree) ?: return null
+        val added = folders.mapNotNull { f -> treeRef(Uri.parse(f.treeUri))?.let { it to f.displayName } }
+        return folderConflict(candidate, added, downloadTreeUri()?.let(::treeRef))
+    }
+
+    /** Throws if the folder itself can't be read, so a missing SD card / revoked grant never wipes its songs. */
     suspend fun scan(folder: ScanFolderEntity): ScanResult = withContext(Dispatchers.IO) {
         val tree = Uri.parse(folder.treeUri)
-        val files = walk(tree)
-        val known = dao.getUris(folder.id).toHashSet()
-        val found = files.mapTo(HashSet()) { it.uri }
+        val skip = treeRef(tree)?.let { downloadSubtreeToSkip(it, downloadTreeUri()?.let(::treeRef)) }
+        val listing = walk(tree, skip)
+        val plan = planRescan(dao.getStamps(folder.id), listing.files, listing.complete)
 
-        val gone = known.filter { it !in found }
-        gone.chunked(500).forEach { dao.deleteByUris(folder.id, it) }
+        plan.gone.chunked(500).forEach { dao.deleteByUris(folder.id, it) }
 
-        val fresh = files.filter { it.uri !in known }
         val sem = Semaphore(4)
-        val songs = coroutineScope {
-            fresh.map { f -> async { sem.withPermit { readTags(folder.id, f) } } }.awaitAll()
+        val (fresh, changed) = coroutineScope {
+            val fresh = plan.fresh.map { f ->
+                async { sem.withPermit { readTags(folder.id, f, dateAdded = System.currentTimeMillis()) } }
+            }
+            // Re-read in place: the row keeps its id (a queue holding the song still finds it) and
+            // the day it was first found.
+            val changed = plan.changed.map { (stamp, f) ->
+                async { sem.withPermit { readTags(folder.id, f, dateAdded = stamp.dateAdded).copy(id = stamp.id) } }
+            }
+            fresh.awaitAll() to changed.awaitAll()
         }
-        songs.chunked(200).forEach { dao.insertSongs(it) }
-        ScanResult(added = songs.size, removed = gone.size)
+        fresh.chunked(200).forEach { dao.insertSongs(it) }
+        changed.chunked(200).forEach { dao.updateSongs(it) }
+        fillMissingArt(folder.id)
+        ScanResult(added = fresh.size, updated = changed.size, removed = plan.gone.size, incomplete = !listing.complete)
     }
 
-    private fun walk(tree: Uri): List<AudioFile> {
+    private class Listing(val files: List<ListedFile>, val complete: Boolean)
+
+    /**
+     * Every playable file under [tree], depth first, skipping hidden folders and [skipDocId] (the
+     * download tree inside this one). A subfolder that can't be listed marks the listing
+     * incomplete rather than looking empty, so a hiccup never reads as "those songs were deleted".
+     */
+    private suspend fun walk(tree: Uri, skipDocId: String?): Listing {
         val resolver = context.contentResolver
-        val out = ArrayList<AudioFile>()
+        val out = ArrayList<ListedFile>()
         val stack = ArrayList<String>()
         stack.add(DocumentsContract.getTreeDocumentId(tree))
         var isRoot = true
+        var complete = true
         while (stack.isNotEmpty()) {
+            coroutineContext.ensureActive() // leaving the screen mid-scan stops the walk
             val parentId = stack.removeAt(stack.lastIndex)
             val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
-            val cursor = resolver.query(
-                children,
-                arrayOf(
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE,
-                    DocumentsContract.Document.COLUMN_SIZE,
-                ),
-                null, null, null,
-            )
+            val cursor = try {
+                resolver.query(children, COLUMNS, null, null, null)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null // SecurityException / IllegalArgumentException from the provider: same as no answer
+            }
             if (cursor == null) {
-                if (isRoot) throw IOException("Can't read folder") else continue
+                if (isRoot) throw IOException("Can't read folder")
+                complete = false
+                continue
             }
             isRoot = false
             cursor.use { c ->
                 while (c.moveToNext()) {
                     val docId = c.getString(0) ?: continue
                     val name = c.getString(1) ?: continue
-                    val mime = c.getString(2) ?: ""
-                    val size = c.getLong(3)
+                    val mime = c.getString(2)
                     if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                        if (!name.startsWith(".")) stack.add(docId)
-                    } else if (isAudio(name, mime) && !(size in 1 until StashConstants.MIN_PLAYABLE_LOCAL_BYTES)) {
-                        out.add(AudioFile(DocumentsContract.buildDocumentUriUsingTree(tree, docId).toString(), name, size))
+                        if (!name.startsWith(".") && docId != skipDocId) stack.add(docId)
+                        continue
                     }
+                    val ext = playableAudioExtension(name, mime) ?: continue
+                    // A size the provider doesn't report is 0 ("unknown") and kept; a reported
+                    // empty or too-small file is a failed copy, not a song.
+                    val sizeKnown = !c.isNull(3)
+                    val size = if (sizeKnown) c.getLong(3) else 0L
+                    if (sizeKnown && size < StashConstants.MIN_PLAYABLE_LOCAL_BYTES) continue
+                    val lastModified = if (c.isNull(4)) 0L else c.getLong(4)
+                    out.add(
+                        ListedFile(
+                            uri = DocumentsContract.buildDocumentUriUsingTree(tree, docId).toString(),
+                            name = name,
+                            ext = ext,
+                            size = size,
+                            lastModified = lastModified,
+                        ),
+                    )
                 }
             }
         }
-        return out
+        return Listing(out, complete)
     }
 
-    private fun isAudio(name: String, mime: String): Boolean =
-        mime.startsWith("audio/") || name.substringAfterLast('.', "").lowercase() in AUDIO_EXTENSIONS
-
-    private fun readTags(folderId: Long, f: AudioFile): ScannedSongEntity {
-        val ext = f.name.substringAfterLast('.', "").lowercase()
+    private suspend fun readTags(folderId: Long, f: ListedFile, dateAdded: Long): ScannedSongEntity {
+        coroutineContext.ensureActive()
         var title: String? = null
         var artist: String? = null
         var album: String? = null
         var duration = 0L
+        var art: ByteArray? = null
         val r = MediaMetadataRetriever()
         try {
             r.setDataSource(context, Uri.parse(f.uri))
@@ -122,6 +177,7 @@ class AllSongsScanner @Inject constructor(
                 ?: r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST)
             album = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)
             duration = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            art = r.embeddedPicture
         } catch (e: Exception) {
             // Unreadable tags: fall back to the filename below.
         } finally {
@@ -131,16 +187,98 @@ class AllSongsScanner @Inject constructor(
             folderId = folderId,
             uri = f.uri,
             title = title?.takeIf { it.isNotBlank() } ?: f.name.substringBeforeLast('.'),
-            artist = artist?.takeIf { it.isNotBlank() } ?: "Unknown Artist",
+            artist = artist?.takeIf { it.isNotBlank() } ?: SCANNED_UNKNOWN_ARTIST,
             album = album?.takeIf { it.isNotBlank() } ?: "",
             durationMs = duration,
-            fileFormat = ext.ifBlank { "audio" },
+            fileFormat = f.ext,
             fileSizeBytes = f.size,
-            dateAdded = System.currentTimeMillis(),
+            lastModified = f.lastModified,
+            dateAdded = dateAdded,
+            albumArtPath = saveArt(art) ?: "",
         )
     }
 
+    private val artDir: File get() = File(context.filesDir, ART_DIR).also { it.mkdirs() }
+
+    /**
+     * Saves [bytes] as a cover file named by its content, so songs of one album share one file.
+     * Returns its path, or null when there is no art or it couldn't be written.
+     */
+    private fun saveArt(bytes: ByteArray?): String? {
+        if (bytes == null || bytes.isEmpty()) return null
+        return try {
+            val hash = MessageDigest.getInstance("SHA-1").digest(bytes).joinToString("") { "%02x".format(it) }
+            val file = File(artDir, "$ART_PREFIX$hash.jpg")
+            if (!file.exists()) file.writeBytes(bytes)
+            file.absolutePath
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Rows from before covers were scanned (album_art_path NULL): look for each one's cover, once. */
+    private suspend fun fillMissingArt(folderId: Long) {
+        val sem = Semaphore(4)
+        coroutineScope {
+            dao.getUnarted(folderId).map { row ->
+                async {
+                    sem.withPermit {
+                        coroutineContext.ensureActive()
+                        val path = try {
+                            readArt(row.uri)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            return@withPermit // unreadable right now: stays NULL, tried again next scan
+                        }
+                        dao.setAlbumArtPath(row.id, path ?: "")
+                    }
+                }
+            }.awaitAll()
+        }
+    }
+
+    private fun readArt(uri: String): String? {
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(context, Uri.parse(uri))
+            return saveArt(r.embeddedPicture)
+        } finally {
+            runCatching { r.release() }
+        }
+    }
+
+    /**
+     * Deletes cover files no row points at any more (a removed song, a retagged one, a removed
+     * folder). Call it with scans stopped: a scan writes a cover before its row is inserted.
+     */
+    suspend fun sweepArt() {
+        withContext(Dispatchers.IO) {
+            val keep = dao.getArtPaths().toHashSet()
+            artDir.listFiles()?.forEach { f ->
+                if (f.name.startsWith(ART_PREFIX) && f.absolutePath !in keep) f.delete()
+            }
+        }
+    }
+
     private companion object {
-        val AUDIO_EXTENSIONS = setOf("mp3", "flac", "m4a", "aac", "ogg", "oga", "opus", "wav")
+        const val ART_DIR = "scanned_art"
+        const val ART_PREFIX = "scanned_"
+
+        val COLUMNS = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
+
+        /** [tree] as the folder rules compare it, or null when it isn't a SAF tree URI. */
+        fun treeRef(tree: Uri): TreeRef? = try {
+            val authority = tree.authority ?: return null
+            TreeRef(authority, DocumentsContract.getTreeDocumentId(tree))
+        } catch (e: IllegalArgumentException) {
+            null
+        }
     }
 }

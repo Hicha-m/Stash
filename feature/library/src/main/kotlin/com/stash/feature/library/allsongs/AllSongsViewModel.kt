@@ -3,6 +3,7 @@ package com.stash.feature.library.allsongs
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.stash.core.data.db.dao.ScannedSongDao
@@ -11,8 +12,8 @@ import com.stash.core.data.db.entity.ScannedSongEntity
 import com.stash.core.media.PlayerRepository
 import com.stash.core.model.MusicSource
 import com.stash.core.model.PlaybackSource
-import com.stash.core.model.SCANNED_ID_BASE
 import com.stash.core.model.Track
+import com.stash.core.model.scannedTrackId
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
@@ -28,6 +29,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 @HiltViewModel
@@ -75,6 +77,19 @@ class AllSongsViewModel @Inject constructor(
                 _status.value = "Couldn't get access to that folder"
                 return@launch
             }
+            // Picked again (typically after access was lost: the SD card was out, or Android dropped
+            // the grant). The grant just taken is fresh, so scan it now instead of refusing it.
+            if (dao.getFolderByTreeUri(uri.toString()) != null) {
+                _status.value = "Already added. Scanning it again."
+                scanAll()
+                return@launch
+            }
+            val folders = dao.getFolders()
+            scanner.conflictFor(uri, folders)?.let { conflict ->
+                releaseGrant(uri, folders)
+                _status.value = conflict.message
+                return@launch
+            }
             val id = dao.insertFolder(
                 ScanFolderEntity(
                     treeUri = uri.toString(),
@@ -90,17 +105,40 @@ class AllSongsViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Songs go with the folder (FK cascade). The URI grant is NOT released: the same tree may be
-     * Stash's download folder, and releasing it would break that.
-     */
+    /** Songs go with the folder (FK cascade), and so does the folder's read grant. */
     fun removeFolder(folder: ScanFolderEntity) {
-        viewModelScope.launch { dao.deleteFolder(folder.id) }
+        viewModelScope.launch {
+            dao.deleteFolder(folder.id)
+            releaseGrant(Uri.parse(folder.treeUri), dao.getFolders())
+        }
     }
 
-    fun play(index: Int) {
+    /**
+     * Gives back the persisted read grant on [tree] unless something still needs it: Stash's
+     * download folder (the same tree URI shares one grant, and releasing it would break downloads)
+     * or a scanned folder in [remaining]. Android caps an app's persisted grants, so unused ones
+     * shouldn't pile up.
+     */
+    private suspend fun releaseGrant(tree: Uri, remaining: List<ScanFolderEntity>) {
+        if (remaining.any { it.treeUri == tree.toString() }) return
+        if (scanner.downloadTreeUri()?.toString() == tree.toString()) return
+        withContext(Dispatchers.IO) {
+            try {
+                context.contentResolver.releasePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (e: SecurityException) {
+                // Already gone (revoked, or never held): nothing to release.
+            }
+        }
+    }
+
+    /**
+     * Plays the list from the song with [trackId]. By id, not by list position: a rescan can
+     * reorder or shrink the list between the frame the user tapped and this call.
+     */
+    fun play(trackId: Long) {
         val queue = songs.value
-        if (index !in queue.indices) return
+        val index = queue.indexOfFirst { it.id == trackId }
+        if (index < 0) return
         viewModelScope.launch { player.setQueue(queue, index, PlaybackSource.AllSongs) }
     }
 
@@ -113,17 +151,22 @@ class AllSongsViewModel @Inject constructor(
     private suspend fun scanAll() = scanMutex.withLock {
         _scanning.value = true
         var added = 0
+        var updated = 0
         var removed = 0
         var failed = 0
+        var incomplete = 0
         try {
             for (folder in dao.getFolders()) {
                 try {
                     val r = scanner.scan(folder)
                     added += r.added
+                    updated += r.updated
                     removed += r.removed
+                    if (r.incomplete) incomplete++
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    Log.w(TAG, "scan failed for folder ${folder.id}", e)
                     failed++
                 }
             }
@@ -131,16 +174,21 @@ class AllSongsViewModel @Inject constructor(
             _scanning.value = false
         }
         _status.value = when {
-            failed > 0 -> "$failed folder(s) couldn't be read (moved, or access lost?)"
-            added + removed > 0 -> "Added $added, removed $removed"
+            failed > 0 -> "$failed folder(s) couldn't be read (moved, or access lost?). Add it again to restore access."
+            incomplete > 0 -> "Some subfolders couldn't be read; their songs were kept."
+            added + updated + removed > 0 -> "Added $added, updated $updated, removed $removed"
             else -> null
         }
     }
+
+    private companion object {
+        const val TAG = "AllSongs"
+    }
 }
 
-/** Id below SCANNED_ID_BASE: can't collide with a `tracks` row or a radio/search hash id. */
+/** A scanned row as the player's Track: an id in the scanned range ([scannedTrackId]), local and on disk. */
 internal fun ScannedSongEntity.toTrack(): Track = Track(
-    id = SCANNED_ID_BASE - id,
+    id = scannedTrackId(id),
     title = title,
     artist = artist,
     album = album,

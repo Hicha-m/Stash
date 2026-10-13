@@ -3,7 +3,6 @@ package com.stash.feature.library.allsongs
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -13,8 +12,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
@@ -40,7 +40,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.stash.core.model.Track
 import com.stash.core.ui.components.TrackListItem
 import com.stash.core.ui.components.TrackRowFitScope
 import com.stash.core.ui.components.bottomChromePadding
@@ -122,10 +121,10 @@ fun AllSongsScreen(
         } else {
             TrackRowFitScope {
                 LazyColumn(contentPadding = PaddingValues(bottom = bottomChromePadding(8.dp))) {
-                    itemsIndexed(songs, key = { _, t -> t.id }) { index, track ->
+                    items(songs, key = { it.id }) { track ->
                         TrackListItem(
                             track = track,
-                            onClick = { viewModel.play(index) },
+                            onClick = { viewModel.play(track.id) },
                             isPlaying = track.id == playingId,
                         )
                     }
@@ -162,47 +161,11 @@ fun AllSongsScreen(
             confirmButton = {
                 TextButton(onClick = { picker.launch(null) }) {
                     Icon(Icons.Filled.CreateNewFolder, contentDescription = null)
-                    Text("  Add folder")
+                    Spacer(Modifier.width(8.dp))
+                    Text("Add folder")
                 }
             },
             dismissButton = { TextButton(onClick = { showFolders = false }) { Text("Done") } },
         )
-    }
-}
-
-@Composable
-private fun SongRow(track: Track, isPlaying: Boolean, onClick: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = 20.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = track.title,
-                style = MaterialTheme.typography.bodyLarge,
-                color = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = if (track.album.isBlank()) track.artist else "${track.artist} · ${track.album}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        if (track.durationMs > 0) {
-            val s = track.durationMs / 1000
-            Text(
-                text = "%d:%02d".format(s / 60, s % 60),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(start = 12.dp),
-            )
-        }
     }
 }
