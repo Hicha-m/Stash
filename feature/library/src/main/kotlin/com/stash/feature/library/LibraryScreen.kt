@@ -1790,6 +1790,11 @@ private fun TracksTab(
         return
     }
 
+    // Tag rows Offline/Online only when the list actually mixes both.
+    val mixed = remember(tracks) {
+        tracks.any { it.isDownloaded } && tracks.any { !it.isDownloaded }
+    }
+
     // Track selected for the context-menu bottom sheet (opened via the ⋮ now;
     // long-press enters multi-select instead).
     var selectedTrack by remember { mutableStateOf<Track?>(null) }
@@ -1829,6 +1834,7 @@ private fun TracksTab(
                         onLongPress = { if (!selection.isActive) selection.enter(track.id) },
                         selectionActive = selection.isActive,
                         selected = selection.isSelected(track.id),
+                        showAvailabilityTag = mixed,
                         onMoreClick = { selectedTrack = track },
                     )
                 }

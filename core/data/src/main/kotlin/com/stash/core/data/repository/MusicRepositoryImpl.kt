@@ -297,6 +297,9 @@ class MusicRepositoryImpl @Inject constructor(
             // on each tracks write (a play count, a lyrics stamp, every finished download).
             .flowOn(Dispatchers.Default)
 
+    override fun getLibraryTracksIncludingOnline(): Flow<List<Track>> =
+        trackDao.getLibraryWithOnlineByDateAdded().map { rows -> rows.map { it.toDomain() } }
+
     override fun getTracksByArtist(artist: String): Flow<List<Track>> =
         trackDao.getByArtist(artist)
             .map { entities ->

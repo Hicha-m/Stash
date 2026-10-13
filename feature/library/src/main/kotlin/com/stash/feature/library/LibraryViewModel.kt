@@ -281,7 +281,7 @@ class LibraryViewModel @Inject constructor(
      * when the file goes.
      */
     private val downloadedTracks: Flow<List<Track>> =
-        combine(musicRepository.getAllTracks(), downloadRemoval.hiddenIds) { tracks, hidden ->
+        combine(musicRepository.getLibraryTracksIncludingOnline(), downloadRemoval.hiddenIds) { tracks, hidden ->
             if (hidden.isEmpty()) tracks else tracks.filterNot { it.id in hidden }
         }
 
@@ -394,6 +394,8 @@ class LibraryViewModel @Inject constructor(
             SourceFilter.NON_FLAC -> allTracks.filter {
                 it.isDownloaded && it.fileFormat.lowercase() !in LOSSLESS_CODECS
             }
+            SourceFilter.DOWNLOADED -> allTracks.filter { it.isDownloaded }
+            SourceFilter.ONLINE -> allTracks.filter { !it.isDownloaded }
         }
 
         // -- Apply client-side search filter --
