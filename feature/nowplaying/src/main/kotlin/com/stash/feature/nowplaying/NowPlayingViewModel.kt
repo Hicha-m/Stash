@@ -9,6 +9,8 @@ import androidx.palette.graphics.Palette
 import com.stash.core.data.lossless.LosslessUpgrader
 import com.stash.core.data.prefs.NowPlayingAction
 import com.stash.core.data.prefs.NowPlayingPreference
+import com.stash.core.data.prefs.LyricsSourcePreference
+import com.stash.data.lyrics.TtmlUpgradeResult
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.media.PlayerRepository
 import com.stash.core.media.SleepTimerController
@@ -1174,6 +1176,52 @@ class NowPlayingViewModel @Inject constructor(
             _userMessages.tryEmit("Looking for FLAC\u2026")
             val result = losslessUpgrader.upgradeToLossless(track)
             _userMessages.tryEmit(snackbarCopyFor(result))
+        }
+    }
+    
+    /**
+    * Upgrade the playing track's stored lyrics to Apple's word-synced TTML, like the
+    * library-wide upgrade pass but for this one song. Library tracks only: a stream has
+    * no stored row to upgrade. Runs past this screen (see [launchUserAction]); the lyrics
+    * view updates by itself when the row is rewritten.
+    */
+    fun upgradeLyricsForCurrentTrack() {
+        val state = _uiState.value
+        val track = state.currentTrack ?: return
+        if (state.currentTrackStored != true) {
+            _userMessages.tryEmit("Only songs in your library can have their lyrics upgraded.")
+            return
+        }
+        launchUserAction {
+            if (lyricsPreference.sourcePreference.first() == LyricsSourcePreference.LRC_ONLY) {
+                _userMessages.tryEmit("Turn on Apple Music as the lyrics source to upgrade lyrics.")
+                return@launchUserAction
+            }
+            val row = lyricsRepository.get(track.id)
+            when {
+                row == null -> {
+                    _userMessages.tryEmit("No lyrics to upgrade yet. Open the lyrics first.")
+                    return@launchUserAction
+                }
+                row.instrumental -> {
+                    _userMessages.tryEmit("This track is instrumental.")
+                    return@launchUserAction
+                }
+                row.ttml != null -> {
+                    _userMessages.tryEmit("Lyrics are already word-synced.")
+                    return@launchUserAction
+                }
+            }
+            _userMessages.tryEmit("Looking for better lyrics\u2026")
+            _userMessages.tryEmit(
+                when (lyricsRepository.upgradeToTtml(track.id)) {
+                    TtmlUpgradeResult.UPGRADED -> "Lyrics upgraded to word-synced"
+                    TtmlUpgradeResult.NO_TTML -> "No word-synced lyrics available for this song"
+                    TtmlUpgradeResult.RATE_LIMITED -> "Apple is rate-limiting lyrics, try again later"
+                    TtmlUpgradeResult.FAILED -> "Couldn't check lyrics sources"
+                    TtmlUpgradeResult.SKIPPED -> "Nothing to upgrade for this song"
+                },
+            )
         }
     }
 

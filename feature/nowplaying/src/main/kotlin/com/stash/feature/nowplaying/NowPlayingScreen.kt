@@ -650,6 +650,17 @@ fun NowPlayingScreen(
                             androidx.compose.material3.Text("Find in FLAC")
                         }
                     }
+                    if (uiState.currentTrackStored == true) {
+                        androidx.compose.material3.OutlinedButton(
+                            onClick = {
+                                viewModel.upgradeLyricsForCurrentTrack()
+                                showWrongMatchDialog = false
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            androidx.compose.material3.Text("Upgrade lyrics")
+                        }
+                    }
                     androidx.compose.material3.OutlinedButton(
                         onClick = {
                             viewModel.flagCurrentTrackAsWrongMatch()
