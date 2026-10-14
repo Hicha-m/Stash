@@ -1435,11 +1435,49 @@ abstract class StashDatabase : RoomDatabase() {
         }
 
         /**
-         * v54 → v55: All Songs. `scan_folders` (user-chosen SAF trees) and `scanned_songs`
-         * (what the scanner found, FK-cascaded off its folder). Isolated from `tracks`. Additive.
+         * v54 -> v55: an index on `tracks (canonical_title, canonical_artist)`, the
+         * pair every lookup of a song by its words filters on (the sync's diff,
+         * Search downloads, likes, hand-offs, discovery). Without it each lookup
+         * scanned the whole table, inside the sync's write transactions, on
+         * libraries of ~19k rows. Not unique: one key holds every version of a
+         * song, and rows that already share a key must keep existing.
+         *
+         * Index only; no row changes. Rows that a stricter rule wrote before v55
+         * get the one loose rule's values from CanonicalRecomputeWorker after the
+         * app starts (Kotlin, in batches): SQL here can't run that rule.
          */
         val MIGRATION_54_55 = object : Migration(54, 55) {
             override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_tracks_canonical_title_canonical_artist` " +
+                        "ON `tracks` (`canonical_title`, `canonical_artist`)",
+                )
+            }
+        }
+
+        /**
+         * v55 -> v56: All Songs. `scan_folders` (the SAF trees the user picked) and
+         * `scanned_songs` (what the scanner found in them, deleted with their folder).
+         * Both live apart from `tracks`: nothing here is a library song.
+         *
+         * Converges from EITHER v55 that exists in the wild:
+         *  - master's v55 (has the tracks index, no scan tables), and
+         *  - the All Songs PR's debug builds, which also called themselves v55 but
+         *    carried the scan tables (without `last_modified`) and NOT the tracks index.
+         * So it (re)creates master's index idempotently, then drops and recreates the
+         * two scan tables. They are a cache of what is on disk; the next scan refills
+         * them, so dropping loses nothing a user made except the folder list, which
+         * only those debug builds had.
+         */
+        val MIGRATION_55_56 = object : Migration(55, 56) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_tracks_canonical_title_canonical_artist` " +
+                        "ON `tracks` (`canonical_title`, `canonical_artist`)",
+                )
+                // Child first: scanned_songs holds the FK onto scan_folders.
+                db.execSQL("DROP TABLE IF EXISTS `scanned_songs`")
+                db.execSQL("DROP TABLE IF EXISTS `scan_folders`")
                 db.execSQL(
                     "CREATE TABLE IF NOT EXISTS `scan_folders` (" +
                         "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
@@ -1459,6 +1497,7 @@ abstract class StashDatabase : RoomDatabase() {
                         "`duration_ms` INTEGER NOT NULL, " +
                         "`file_format` TEXT NOT NULL, " +
                         "`file_size_bytes` INTEGER NOT NULL, " +
+                        "`last_modified` INTEGER NOT NULL, " +
                         "`date_added` INTEGER NOT NULL, " +
                         "FOREIGN KEY(`folder_id`) REFERENCES `scan_folders`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)",
                 )
@@ -1475,27 +1514,6 @@ abstract class StashDatabase : RoomDatabase() {
         val MIGRATION_56_57 = object : Migration(56, 57) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE `scanned_songs` ADD COLUMN `album_art_path` TEXT")
-            }
-        }
-
-        /**
-         * v54 -> v55: an index on `tracks (canonical_title, canonical_artist)`, the
-         * pair every lookup of a song by its words filters on (the sync's diff,
-         * Search downloads, likes, hand-offs, discovery). Without it each lookup
-         * scanned the whole table, inside the sync's write transactions, on
-         * libraries of ~19k rows. Not unique: one key holds every version of a
-         * song, and rows that already share a key must keep existing.
-         *
-         * Index only; no row changes. Rows that a stricter rule wrote before v55
-         * get the one loose rule's values from CanonicalRecomputeWorker after the
-         * app starts (Kotlin, in batches): SQL here can't run that rule.
-         */
-        val MIGRATION_55_56 = object : Migration(55, 56) {
-            override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL(
-                    "CREATE INDEX IF NOT EXISTS `index_tracks_canonical_title_canonical_artist` " +
-                        "ON `tracks` (`canonical_title`, `canonical_artist`)",
-                )
             }
         }
 
