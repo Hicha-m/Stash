@@ -48,9 +48,28 @@ class LibraryViewModelSourceFilterTest {
         assertThat(state.tracks.map { it.id }).containsExactly(1L)
     }
 
+    @Test fun downloaded_keeps_only_tracks_on_the_phone() = runTest {
+        val vm = buildVm(musicRepoMock(listOf(downloadedOpus, downloadedFlac, streamOnlyOpus)))
+        vm.setSourceFilter(SourceFilter.DOWNLOADED)
+
+        val state = vm.uiState.first { !it.isLoading && it.sourceFilter == SourceFilter.DOWNLOADED }
+
+        assertThat(state.tracks.map { it.id }).containsExactly(1L, 2L)
+    }
+
+    @Test fun online_keeps_only_tracks_not_downloaded() = runTest {
+        val vm = buildVm(musicRepoMock(listOf(downloadedOpus, downloadedFlac, streamOnlyOpus)))
+        vm.setSourceFilter(SourceFilter.ONLINE)
+
+        val state = vm.uiState.first { !it.isLoading && it.sourceFilter == SourceFilter.ONLINE }
+
+        assertThat(state.tracks.map { it.id }).containsExactly(3L)
+    }
+
     // ── harness (mirrors LibraryViewModelSortTest) ────────────────────────
     private fun musicRepoMock(allTracks: List<Track>): MusicRepository = mock {
         on { getAllTracks() } doReturn flowOf(allTracks)
+        on { getLibraryTracksIncludingOnline() } doReturn flowOf(allTracks)
         on { getAllPlaylists() } doReturn flowOf(emptyList())
         on { getAllArtists() } doReturn flowOf(emptyList())
         on { getAllAlbums() } doReturn flowOf(emptyList())
