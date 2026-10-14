@@ -93,8 +93,8 @@ fun TrackListItem(
         )
         TrackListItemRow(
             track, onClick, modifier, isPlaying, onMoreClick, onLongPress, isResolving, selectionActive, selected, fit,
+            showAvailabilityTag = showAvailabilityTag,
         )
-        showAvailabilityTag = showAvailabilityTag,
     } else {
         BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
             val fit = rememberTrackListItemFit(
@@ -102,8 +102,8 @@ fun TrackListItem(
             )
             TrackListItemRow(
                 track, onClick, Modifier, isPlaying, onMoreClick, onLongPress, isResolving, selectionActive, selected, fit,
+                showAvailabilityTag = showAvailabilityTag,
             )
-            showAvailabilityTag = showAvailabilityTag,
         }
     }
 }
