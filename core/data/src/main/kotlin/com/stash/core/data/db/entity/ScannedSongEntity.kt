@@ -6,7 +6,13 @@ import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
-/** A song found by the All Songs scanner. Isolated from `tracks`; deleted with its folder. */
+/**
+ * A song found by the All Songs scanner. Isolated from `tracks`; deleted with its folder.
+ *
+ * [fileSizeBytes] and [lastModified] are the file's stamp as SAF last reported it: a rescan
+ * re-reads the tags of any file whose stamp moved (a retag, a replaced file), and keeps
+ * the row's [id] so a queue that holds the song still finds it.
+ */
 @Entity(
     tableName = "scanned_songs",
     foreignKeys = [
@@ -32,6 +38,8 @@ data class ScannedSongEntity(
     @ColumnInfo(name = "duration_ms") val durationMs: Long,
     @ColumnInfo(name = "file_format") val fileFormat: String,
     @ColumnInfo(name = "file_size_bytes") val fileSizeBytes: Long,
+    /** SAF `COLUMN_LAST_MODIFIED` in epoch ms; 0 when the provider doesn't report it. */
+    @ColumnInfo(name = "last_modified") val lastModified: Long,
     @ColumnInfo(name = "date_added") val dateAdded: Long,
     /**
      * The embedded cover, saved under filesDir/scanned_art (songs with the same image share one file).
