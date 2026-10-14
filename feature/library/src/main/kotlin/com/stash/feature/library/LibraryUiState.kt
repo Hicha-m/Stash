@@ -61,9 +61,12 @@ enum class SourceFilter { ALL, YOUTUBE, SPOTIFY, FLAC, NON_FLAC }
 
 /**
  * @property name           Display name of the artist.
- * @property trackCount     Number of tracks by this artist in the library.
- * @property totalDurationMs Combined duration of all tracks in milliseconds.
+ * @property trackCount     Songs the artist's page lists (see [buildArtistCards]): every song
+ *                          crediting them in Stream only, the downloaded ones in Download.
+ * @property totalDurationMs Combined duration of those songs in milliseconds.
  * @property artUrl         Remote artwork URL (album art proxy from their top track).
+ * @property downloadedCount What "Delete All by Artist" removes and its dialog names: the
+ *                          downloaded songs whose credit leads with this artist. 0 hides it.
  */
 data class ArtistInfo(
     val name: String,
@@ -71,6 +74,7 @@ data class ArtistInfo(
     val totalDurationMs: Long,
     val artUrl: String? = null,
     val photoUrl: String? = null,
+    val downloadedCount: Int = 0,
 )
 
 /**

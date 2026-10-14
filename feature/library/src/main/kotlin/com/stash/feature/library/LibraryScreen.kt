@@ -2168,15 +2168,19 @@ private fun ArtistsGrid(
                     selectedArtist = null
                 },
             )
-            BottomSheetActionRow(
-                icon = Icons.Default.Delete,
-                label = "Delete All by Artist",
-                tint = MaterialTheme.colorScheme.error,
-                onClick = {
-                    artistToDelete = artist
-                    selectedArtist = null
-                },
-            )
+            // Deletes downloaded songs only: an artist with none (Stream only lists them) has
+            // nothing on the phone to delete.
+            if (artist.downloadedCount > 0) {
+                BottomSheetActionRow(
+                    icon = Icons.Default.Delete,
+                    label = "Delete All by Artist",
+                    tint = MaterialTheme.colorScheme.error,
+                    onClick = {
+                        artistToDelete = artist
+                        selectedArtist = null
+                    },
+                )
+            }
 
             Spacer(modifier = Modifier.height(24.dp))
         }
@@ -2187,7 +2191,17 @@ private fun ArtistsGrid(
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { artistToDelete = null },
             title = { Text("Delete all by ${artist.name}?") },
-            text = { Text("This will delete all ${artist.trackCount} downloaded songs by this artist from your device.") },
+            // downloadedCount, not trackCount: the card counts every song its page lists, but
+            // this deletes only the downloaded ones it leads (LibraryViewModel.deleteArtist).
+            text = {
+                Text(
+                    if (artist.downloadedCount == 1) {
+                        "This will delete the 1 downloaded song by this artist from your device."
+                    } else {
+                        "This will delete all ${artist.downloadedCount} downloaded songs by this artist from your device."
+                    },
+                )
+            },
             confirmButton = {
                 androidx.compose.material3.TextButton(
                     onClick = {
