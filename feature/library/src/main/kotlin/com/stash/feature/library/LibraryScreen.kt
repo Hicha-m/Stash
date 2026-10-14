@@ -615,20 +615,15 @@ private fun LibraryContent(
             }
         }
 
-        // Compact header: title + Import (+), search, and sort/filter icons —
-        // replaces the old heading row + the six stacked control bars.
+        // Compact header: shuffle, Import (+), search, and sort/filter icons, on the right.
+        // No "Library" title: the tab bar already says where you are.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(start = 20.dp, end = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.End,
         ) {
-            Text(
-                text = "Library",
-                style = MaterialTheme.typography.headlineLarge,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.weight(1f),
-            )
             // Shuffle stays in the always-visible header so it's reachable even
             // once the hero has scrolled away. It shuffles what you're looking
             // at: the liked list on the Liked tab (issue #402 — it used to
@@ -1178,7 +1173,7 @@ private fun GlassSearchBar(
 // ── Local import progress strip ─────────────────────────────────────────────
 
 /**
- * Compact banner that appears below the "Library" heading while
+ * Compact banner that appears below the Library header while
  * [LocalImportState] is non-Idle. Shows progress during a batch import,
  * a summary after Done, or an error + dismiss after Error. Hides
  * completely when [state] is [LocalImportState.Idle].
