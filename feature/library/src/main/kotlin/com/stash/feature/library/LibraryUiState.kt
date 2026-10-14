@@ -38,6 +38,9 @@ data class LibraryUiState(
 
     /** Total downloaded songs in the library (unfiltered) — drives the Shuffle hero count. */
     val librarySongCount: Int = 0,
+
+    /** Stream-only mode: Songs shows online rows too, and the Downloaded/Online filter is offered. */
+    val streamingMode: Boolean = false,
 )
 
 /** Tabs available in the library browser. LIKED sits between Songs and Playlists. */

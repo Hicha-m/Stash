@@ -245,7 +245,9 @@ fun LibraryScreen(
             state = state,
             searchQuery = searchQuery,
             importState = importState,
-            onShuffleLibrary = viewModel::shuffleLibrary,
+            onShuffleLibrary = {
+                if (state.streamingMode) viewModel.shuffleVisible(state.tracks) else viewModel.shuffleLibrary()
+            },
             onShuffleLiked = viewModel::shuffleLiked,
             onTabSelected = viewModel::selectTab,
             onSearchQueryChanged = viewModel::setSearchQuery,
@@ -313,6 +315,20 @@ fun LibraryScreen(
         // Batch "Remove download" deletes files that can take hours to fetch again (a whole
         // Select all, one mis-tap from the confirmed Delete): confirm it first (shared dialog).
         var confirmRemoveDownloads by remember { mutableStateOf<List<Track>?>(null) }
+        var confirmDownloadIds by remember { mutableStateOf<List<Long>?>(null) }
+        confirmDownloadIds?.let { ids ->
+            AlertDialog(
+                onDismissRequest = { confirmDownloadIds = null },
+                title = { Text("Download ${ids.size} songs?") },
+                text = { Text("This queues ${ids.size} downloads and can use a lot of data and storage.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.downloadSelected(ids); selection.clear(); confirmDownloadIds = null
+                    }) { Text("Download") }
+                },
+                dismissButton = { TextButton(onClick = { confirmDownloadIds = null }) { Text("Cancel") } },
+            )
+        }
         confirmRemoveDownloads?.let { tracks ->
             RemoveDownloadsConfirmDialog(
                 count = tracks.size,
@@ -342,7 +358,10 @@ fun LibraryScreen(
                 }
             } else {
                 SelectionAction("download", "Download", Icons.Default.Download) {
-                    viewModel.downloadSelected(selectedIds); selection.clear()
+                    // Only the rows that still need downloading, and a confirm past 100.
+                    val ids = selectedTracks.filter { !it.isDownloaded }.map { it.id }
+                    if (ids.size > 100) confirmDownloadIds = ids
+                    else { viewModel.downloadSelected(ids); selection.clear() }
                 }
             },
             SelectionAction("delete", "Delete", Icons.Default.Delete) {
@@ -413,7 +432,8 @@ fun LibraryScreen(
                 Column {
                     Text(
                         "${n} song${if (n != 1) "s" else ""} will be removed from your " +
-                            "library and deleted from disk.",
+                            "${n} song${if (n != 1) "s" else ""} will be removed from your library" +
+                            if (batchTracks.any { it.isDownloaded }) " and deleted from disk." else ".",
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
@@ -729,6 +749,7 @@ private fun LibraryContent(
                 showDuration = state.activeTab == LibraryTab.TRACKS,
                 // The source filter narrows Songs only; offered elsewhere it looked broken.
                 showSourceFilter = state.activeTab == LibraryTab.TRACKS,
+                showAvailabilityFilter = state.streamingMode,
                 onSortSelected = onSortOrderChanged,
                 onFilterSelected = onSourceFilterChanged,
                 onDismiss = { sortFilterOpen = false },
@@ -1067,7 +1088,8 @@ private fun LikedTab(
                 Column {
                     Text(
                         "\"${track.title}\" by ${track.artist} will be removed from " +
-                            "your library and deleted from disk.",
+                            if (track.isDownloaded) "your library and deleted from disk."
+                            else "your library.",
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
@@ -1913,7 +1935,8 @@ private fun TracksTab(
                 Column {
                     Text(
                         "\"${track.title}\" by ${track.artist} will be removed from " +
-                            "your library and deleted from disk.",
+                            if (track.isDownloaded) "your library and deleted from disk."
+                            else "your library.",
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(

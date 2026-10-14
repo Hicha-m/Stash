@@ -40,6 +40,7 @@ fun LibrarySortFilterSheet(
     showDuration: Boolean,
     /** The SHOW ONLY section: Songs only, the one tab the source filter narrows. */
     showSourceFilter: Boolean = true,
+    showAvailabilityFilter: Boolean = false,
     onSortSelected: (SortOrder) -> Unit,
     onFilterSelected: (SourceFilter) -> Unit,
     onDismiss: () -> Unit,
@@ -59,6 +60,10 @@ fun LibrarySortFilterSheet(
         "Non-FLAC" to SourceFilter.NON_FLAC,
         "Downloaded" to SourceFilter.DOWNLOADED,
         "Online" to SourceFilter.ONLINE,
+        if (showAvailabilityFilter) {
+            add("Downloaded" to SourceFilter.DOWNLOADED)
+            add("Online" to SourceFilter.ONLINE)
+        }
     )
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {

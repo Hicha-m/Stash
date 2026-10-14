@@ -38,7 +38,7 @@ interface MusicRepository {
     fun getAllTracks(): Flow<List<Track>>
 
     /** Downloaded tracks plus online-only tracks in the user's playlists (Library > Songs). */
-    fun getLibraryTracksIncludingOnline(): Flow<List<Track>> = emptyFlow()
+    fun getLibraryTracksIncludingOnline(): Flow<List<Track>>
 
     /** Tracks by a specific artist. */
     fun getTracksByArtist(artist: String): Flow<List<Track>>

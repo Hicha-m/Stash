@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.DownloadDone  
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -284,19 +285,13 @@ private fun TrackListItemRow(
 
 @Composable
 private fun AvailabilityTag(downloaded: Boolean) {
-    val color = if (downloaded) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.onSurfaceVariant
-    androidx.compose.material3.Surface(
-        shape = RoundedCornerShape(4.dp),
-        color = color.copy(alpha = 0.15f),
-    ) {
-        Text(
-            text = if (downloaded) "Offline" else "Online",
-            style = MaterialTheme.typography.labelSmall,
-            color = color,
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
-        )
-    }
+    if (!downloaded) return
+    Icon(
+        imageVector = Icons.Default.DownloadDone,
+        contentDescription = "Downloaded",
+        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+        modifier = Modifier.size(14.dp),
+    )
 }
 
 // ── Previews ───────────────────────────────────────────────────────────────

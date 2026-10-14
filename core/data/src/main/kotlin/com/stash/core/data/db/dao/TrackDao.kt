@@ -292,7 +292,8 @@ private const val LIBRARY_ROW_COLUMNS = """
     t.file_path, t.file_format, t.quality_kbps, t.file_size_bytes,
     t.source, t.spotify_uri, t.youtube_id, t.album_art_url,
     t.album_art_path, t.date_added, t.last_played, t.play_count,
-    t.is_downloaded, t.match_confidence, t.match_dismissed, t.isrc,
+    (t.is_downloaded = 1 OR t.file_path IS NOT NULL) AS is_downloaded,
+    t.match_confidence, t.match_dismissed, t.isrc,
     t.explicit, t.bits_per_sample, t.sample_rate_hz,
     t.spotify_saved_at, t.ytmusic_saved_at, t.lastfm_loved_at,
     t.stash_liked_at, t.is_streamable, t.is_streamable_checked_at,
@@ -610,7 +611,7 @@ interface TrackDao {
             OR (bl.youtube_id  IS NOT NULL AND bl.youtube_id  = t.youtube_id)
         WHERE bl.canonical_key IS NULL
           AND (
-              t.is_downloaded = 1
+              (t.is_downloaded = 1 OR t.file_path IS NOT NULL)
               OR (
                   t.match_dismissed = 0
                   AND EXISTS (
@@ -620,6 +621,8 @@ interface TrackDao {
                         AND pt.removed_at IS NULL
                         AND p.is_active = 1
                         AND p.type NOT IN ('STASH_MIX', 'DAILY_MIX')
+                        AND (p.source_id IS NULL OR p.source_id NOT LIKE 'share:%')
+                        AND (p.sync_enabled = 1 OR p.keep_offline = 1)
                   )
               )
           )
