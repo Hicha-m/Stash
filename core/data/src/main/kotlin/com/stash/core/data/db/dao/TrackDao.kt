@@ -25,17 +25,22 @@ private const val BATCH_BIND_LIMIT = SQLITE_BIND_LIMIT
 private const val BATCH_NEVER_MATCH = "\u0000__stash_never_match__"
 
 /**
- * Summary projection for artist browsing.
+ * Summary projection for artist browsing: one row per (artist, album artist) credit pair.
  *
- * @property artist  Artist name.
- * @property trackCount  Number of tracks by this artist.
- * @property totalDurationMs  Combined duration of all tracks by this artist.
+ * @property artist  Artist credit, as stored (may name several acts).
+ * @property trackCount  Number of tracks with this credit pair.
+ * @property totalDurationMs  Combined duration of those tracks.
+ * @property artUrl  A stable non-null album art URL among them (MAX), or null.
+ * @property albumArtist  Album-artist credit, as stored ("" when untagged).
+ * @property downloadedCount  How many of [trackCount] are downloaded.
  */
 data class ArtistSummary(
     val artist: String,
     val trackCount: Int,
     val totalDurationMs: Long,
     val artUrl: String?,
+    val albumArtist: String = "",
+    val downloadedCount: Int = 0,
 )
 
 /**
@@ -596,18 +601,46 @@ interface TrackDao {
      * filters it to the exact credit match. LIKE's `%`-wrapping is
      * deliberately loose here — the repository filter is the authority,
      * SQL only avoids pulling the whole table.
+     *
+     * [includeNotDownloaded] is the Download switch's Library rule: false
+     * (Download) keeps downloaded rows only, true (Stream only) keeps every
+     * row. Callers MUST pass it explicitly — see [getByPlaylist].
      */
     @Query(
         """
         SELECT * FROM tracks
-        WHERE artist = :artist
+        WHERE (is_downloaded = 1 OR :includeNotDownloaded)
+          AND (artist = :artist
            OR album_artist = :artist
            OR artist LIKE '%' || :artist || '%'
-           OR album_artist LIKE '%' || :artist || '%'
+           OR album_artist LIKE '%' || :artist || '%')
         ORDER BY album ASC, title ASC
         """,
     )
-    fun getByArtist(artist: String): Flow<List<TrackEntity>>
+    fun getByArtist(artist: String, includeNotDownloaded: Boolean): Flow<List<TrackEntity>>
+
+    /**
+     * Candidate tracks for an album page and an album card's Play / Add to queue: every row whose
+     * `album` equals [album] ignoring case. The repository narrows them to the card's artist with
+     * [com.stash.core.common.matchesArtistCredits].
+     *
+     * `COLLATE NOCASE` folds ASCII case only, the same fold as the `LIKE` in [getByArtist]; the
+     * Albums grid merges cards by a full Unicode lower-case, so an album whose title differs from
+     * itself only in a non-ASCII letter's case ("Été" / "été") lists the spelling it was opened
+     * with. Ordered newest first, as the page was when it read the Songs feed.
+     *
+     * [includeNotDownloaded] follows the same rule as [getByArtist].
+     */
+    @Query(
+        """
+        SELECT * FROM tracks
+        WHERE album = :album COLLATE NOCASE
+          AND album != ''
+          AND (is_downloaded = 1 OR :includeNotDownloaded)
+        ORDER BY date_added DESC, id DESC
+        """,
+    )
+    fun getByAlbum(album: String, includeNotDownloaded: Boolean): Flow<List<TrackEntity>>
 
     /**
      * All tracks belonging to a playlist, resolved through the
@@ -1993,14 +2026,19 @@ interface TrackDao {
     // ── Aggregate queries ───────────────────────────────────────────────
 
     /**
-     * All distinct artists with their track count and total duration.
-     * Ordered by artist name ascending.
+     * Every distinct (artist, album artist) credit pair with its track count, downloaded count,
+     * total duration and art. Ordered by track count, then artist.
      *
-     * v0.9.27 — `includeStreamable` widens the row set to include
-     * stream-only library tracks so the Artists tab in Online mode
-     * mirrors the Albums tab. With `false` (default-pref behaviour),
-     * only `is_downloaded = 1` rows contribute. Callers MUST pass the
-     * flag explicitly — see [getByPlaylist] for rationale.
+     * The Library builds the Artists tab from this (`buildArtistCards` in :feature:library): a
+     * card's count must equal what its artist page lists, and that page takes every row
+     * crediting the artist in `artist` OR `album_artist` ([getByArtist]), so the pair is the
+     * grain the card needs. [ArtistSummary.downloadedCount] is what the card's "Delete All by
+     * Artist" can remove.
+     *
+     * [includeNotDownloaded] is the Download switch's Library rule: false (Download) counts
+     * downloaded rows only, true (Stream only) counts every row. It replaced
+     * `includeStreamable`, whose `is_streamable = 1` arm admitted nothing: no code path sets
+     * `is_streamable`. Callers MUST pass it explicitly — see [getByPlaylist] for rationale.
      *
      * `@Transaction`: thousands of artist groups span CursorWindows; one
      * snapshot per emission so a mass delete can't race the refills (#380 —
@@ -2016,16 +2054,18 @@ interface TrackDao {
     @Query(
         """
         SELECT artist,
+               album_artist AS albumArtist,
                COUNT(*) AS trackCount,
+               SUM(is_downloaded) AS downloadedCount,
                SUM(duration_ms) AS totalDurationMs,
                MAX(album_art_url) AS artUrl
         FROM tracks
-        WHERE is_downloaded = 1 OR (:includeStreamable AND is_streamable = 1)
-        GROUP BY artist
-        ORDER BY COUNT(*) DESC, artist ASC
+        WHERE is_downloaded = 1 OR :includeNotDownloaded
+        GROUP BY artist, album_artist
+        ORDER BY COUNT(*) DESC, artist ASC, album_artist ASC
         """
     )
-    fun getAllArtists(includeStreamable: Boolean): Flow<List<ArtistSummary>>
+    fun getAllArtists(includeNotDownloaded: Boolean): Flow<List<ArtistSummary>>
 
     /**
      * All distinct albums with their primary artist, track count, and
@@ -2047,6 +2087,12 @@ interface TrackDao {
      * while a 8 000-track playlist delete ran) — thousands of album groups
      * span windows and each refill re-executed the statement against a
      * table mid-delete. One snapshot per emission closes it.
+     *
+     * [includeNotDownloaded] follows [getAllArtists]: false (Download) counts downloaded rows
+     * only, true (Stream only) every row. The display-artist subquery reads the same rows, so
+     * an album with no album-artist tag is named after the act most of its COUNTED songs credit
+     * (the album page lists that act's songs; picking from rows the card doesn't count could
+     * open an empty page).
      */
     @Transaction
     @Query(
@@ -2059,6 +2105,7 @@ interface TrackDao {
                            SELECT artist FROM tracks
                            WHERE album = t.album AND artist != ''
                              AND COALESCE(album_artist, '') = COALESCE(t.album_artist, '')
+                             AND (is_downloaded = 1 OR :includeNotDownloaded)
                            GROUP BY artist
                            ORDER BY COUNT(*) DESC
                            LIMIT 1
@@ -2071,12 +2118,12 @@ interface TrackDao {
                MAX(t.album_art_url) AS artUrl
         FROM tracks t
         WHERE t.album != ''
-          AND (t.is_downloaded = 1 OR (:includeStreamable AND t.is_streamable = 1))
+          AND (t.is_downloaded = 1 OR :includeNotDownloaded)
         GROUP BY t.album, t.album_artist
         ORDER BY COUNT(*) DESC, t.album ASC
         """
     )
-    fun getAllAlbums(includeStreamable: Boolean): Flow<List<AlbumSummary>>
+    fun getAllAlbums(includeNotDownloaded: Boolean): Flow<List<AlbumSummary>>
 
     // ── Match dismissal & reconciliation ────────────────────────────────
 

@@ -298,7 +298,9 @@ class MusicRepositoryImpl @Inject constructor(
             .flowOn(Dispatchers.Default)
 
     override fun getTracksByArtist(artist: String): Flow<List<Track>> =
-        trackDao.getByArtist(artist)
+        libraryScope { includeNotDownloaded ->
+            trackDao.getByArtist(artist, includeNotDownloaded)
+        }
             .map { entities ->
                 entities
                     .filter { matchesArtistCredits(it.artist, it.albumArtist, artist) }
@@ -308,17 +310,42 @@ class MusicRepositoryImpl @Inject constructor(
             // candidate superset and off the main thread.
             .flowOn(Dispatchers.Default)
 
-    // v0.9.30 Path A: Library Songs/Albums/Artists views are curated =
-    // downloaded-only, always. Streaming mode does NOT change what shows
-    // in those Library sub-views — it would only expose ghost rows from
-    // historic failed downloads. The Spotify/Apple Music mental model:
-    // Library is YOUR saved music; search/streaming is a separate surface.
-    //
-    // EXCEPTION: getTracksByPlaylist. A playlist shows ALL of its tracks,
-    // streamable and downloaded, in every mode — streaming is always allowed,
-    // and tapping a streamable track streams it. (Until 2026-09-17 this
-    // followed the Online/Offline switch and hid streamable rows offline.)
-    // Tap-time playability is governed by live connectivity, not a preference.
+    override fun getTracksByAlbum(album: String, artist: String): Flow<List<Track>> =
+        libraryScope { includeNotDownloaded ->
+            trackDao.getByAlbum(album, includeNotDownloaded)
+        }
+            .map { entities ->
+                entities
+                    .filter {
+                        it.album.equals(album, ignoreCase = true) &&
+                            matchesArtistCredits(it.artist, it.albumArtist, artist)
+                    }
+                    .map { it.toDomain() }
+            }
+            .flowOn(Dispatchers.Default)
+
+    /**
+     * The Library's Artists and Albums tabs, their counts, and the artist and album pages follow
+     * the Download switch ([com.stash.core.data.prefs.StreamingPreference.enabled]): Stream only
+     * shows every song, Download only the downloaded ones. [query] gets `includeNotDownloaded`
+     * and is re-run when the switch flips, so an open tab or page follows it live.
+     *
+     * This replaced "v0.9.30 Path A" (those views were downloaded-only in every mode), which
+     * left a Stream only listener with an artist card counting 3 songs whose page listed 40. The
+     * Songs tab has its own feed, and a playlist is not a Library view: it shows every song in
+     * every mode (see [getTracksByPlaylist]).
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun <T> libraryScope(query: (includeNotDownloaded: Boolean) -> Flow<T>): Flow<T> =
+        streamingPreference.enabled
+            .distinctUntilChanged()
+            .flatMapLatest { streamOnly -> query(streamOnly) }
+
+    // A playlist shows ALL of its tracks, streamable and downloaded, in every
+    // mode — streaming is always allowed, and tapping a streamable track
+    // streams it. (Until 2026-09-17 this followed the Online/Offline switch
+    // and hid streamable rows offline.) Tap-time playability is governed by
+    // live connectivity, not a preference.
     @OptIn(ExperimentalCoroutinesApi::class)
     override fun getTracksByPlaylist(playlistId: Long): Flow<List<Track>> =
         trackDao.getByPlaylist(playlistId, includeStreamable = true)
@@ -327,19 +354,17 @@ class MusicRepositoryImpl @Inject constructor(
             .flowOn(Dispatchers.Default)
 
     /**
-     * Artists for the Library Artists tab: downloaded tracks only, like the
-     * Songs and Albums tabs (Liked and playlist detail show everything). Not
-     * tied to the Download switch — since v0.9.107 that switch decides what
-     * Sync writes to disk, never what a screen shows. If the Library is ever
-     * widened to stream-only content, widen this AND
-     * `ArtistImageDao.distinctArtistNames` together, so photos are resolved
-     * for exactly the artists the tab lists.
+     * Credit pairs for the Library Artists tab, in the Download switch's scope (see
+     * [libraryScope]): every song in Stream only, downloaded songs in Download.
+     * `ArtistImageDao.distinctArtistNames` takes the same scope, so photos are resolved for
+     * exactly the artists the tab lists; change the two together.
      */
     override fun getAllArtists(): Flow<List<ArtistSummary>> =
-        trackDao.getAllArtists(includeStreamable = false)
+        libraryScope { includeNotDownloaded -> trackDao.getAllArtists(includeNotDownloaded) }
 
+    /** Albums for the Library Albums tab, in the same scope as [getAllArtists]. */
     override fun getAllAlbums(): Flow<List<AlbumSummary>> =
-        trackDao.getAllAlbums(includeStreamable = false)
+        libraryScope { includeNotDownloaded -> trackDao.getAllAlbums(includeNotDownloaded) }
 
     override fun getRecentlyAdded(limit: Int): Flow<List<Track>> =
         trackDao.getRecentlyAdded(limit).map { entities -> entities.map { it.toDomain() } }
