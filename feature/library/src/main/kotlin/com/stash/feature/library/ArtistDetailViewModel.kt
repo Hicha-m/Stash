@@ -28,8 +28,10 @@ import javax.inject.Inject
  * UI state for the Artist Detail screen.
  *
  * @property artistName             The artist whose tracks are displayed.
- * @property tracks                 All tracks by this artist in the library,
- *                                  filtered by [searchQuery] when non-empty.
+ * @property tracks                 The artist's songs (every one in Stream only, the
+ *                                  downloaded ones in Download; see
+ *                                  [MusicRepository.getTracksByArtist]), filtered by
+ *                                  [searchQuery] when non-empty.
  * @property isLoading              True while the initial data load is in progress.
  * @property currentlyPlayingTrackId The ID of the currently-playing track, used
  *                                   to highlight the active row.
@@ -146,13 +148,13 @@ class ArtistDetailViewModel @Inject constructor(
             val tracks = uiState.value.tracks
             val tapped = tracks.firstOrNull { it.id == trackId } ?: return@launch
             val online = connectivityMonitor.isConnected()
-            if (!tapped.isLocal() && !online) {
-                _userMessages.tryEmit("This song isn't downloaded. Connect to play it.")
+            if (!tapped.isOnPhone() && !online) {
+                _userMessages.tryEmit(SONG_NEEDS_CONNECTION)
                 return@launch
             }
             _tappedTrackId.value = trackId
             try {
-                val queue = playableTracks(tracks, online)
+                val queue = playableNow(tracks, online)
                 val index = queue.indexOfFirst { it.id == trackId }
                 if (index < 0) return@launch
                 playerRepository.setQueue(queue, index)
@@ -169,9 +171,11 @@ class ArtistDetailViewModel @Inject constructor(
      */
     fun shuffleAll() {
         viewModelScope.launch {
-            val playable = playableTracks(uiState.value.tracks, connectivityMonitor.isConnected())
+            val listed = uiState.value.tracks
+            val playable = playableNow(listed, connectivityMonitor.isConnected())
             if (playable.isEmpty()) {
-                _userMessages.tryEmit("None of this artist's songs are downloaded. Connect to play them.")
+                // Songs listed, none playable: offline with nothing downloaded.
+                if (listed.isNotEmpty()) _userMessages.tryEmit(ARTIST_NEEDS_CONNECTION)
                 return@launch
             }
             val shuffled = playable.shuffled()
@@ -185,12 +189,6 @@ class ArtistDetailViewModel @Inject constructor(
             }
         }
     }
-
-    /** What can play now: everything when online, only songs with a file on the phone when not. */
-    private fun playableTracks(tracks: List<Track>, online: Boolean): List<Track> =
-        if (online) tracks else tracks.filter { it.isLocal() }
-
-    private fun Track.isLocal(): Boolean = filePath != null
 
     /** Inserts [track] immediately after the currently-playing track in the queue. */
     fun playNext(track: Track) {
