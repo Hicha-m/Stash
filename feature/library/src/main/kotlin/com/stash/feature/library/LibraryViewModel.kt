@@ -347,10 +347,25 @@ class LibraryViewModel @Inject constructor(
     ) { controls, query -> controls.copy(searchQuery = query) }
 
     /**
+     * [pipelineControls] with the Downloaded / Online filters read as All outside
+     * Stream-only mode. Those chips only exist in Stream-only, so a saved Online
+     * choice would otherwise empty the Songs list in Download mode with no chip to
+     * explain it. The saved choice itself is kept, so it comes back with Stream-only.
+     */
+    private val effectiveControls: Flow<ControlState> = combine(
+        pipelineControls,
+        streamingPreference.enabled,
+    ) { controls, streaming ->
+        val availability = controls.sourceFilter == SourceFilter.DOWNLOADED ||
+            controls.sourceFilter == SourceFilter.ONLINE
+        if (!streaming && availability) controls.copy(sourceFilter = SourceFilter.ALL) else controls
+    }
+
+    /**
      * Combined UI state that reacts to both data changes and user interactions.
      */
     val uiState: StateFlow<LibraryUiState> = combine(
-        pipelineControls,
+        effectiveControls,
         downloadedTracks,
         libraryDataFlow,
         musicRepository.getAllArtists(),
@@ -665,9 +680,15 @@ class LibraryViewModel @Inject constructor(
         viewModelScope.launch {
             // Streaming is always allowed: every track is playable, and a
             // not-downloaded one streams when it is reached.
-            // A downloaded tap queues only downloaded rows, so offline playback never walks
-            // into online neighbours. An online tap keeps the full list.
-            val playable = if (track.isDownloaded) allTracks.filter { it.isDownloaded } else allTracks
+            // Download mode: a downloaded tap queues only downloaded rows, so offline playback
+            // never walks into online neighbours. Stream-only: every row shown is playable, so
+            // the queue is exactly the list shown, whatever row was tapped.
+            val streaming = streamingPreference.enabled.first()
+            val playable = if (!streaming && track.isDownloaded) {
+                allTracks.filter { it.isDownloaded }
+            } else {
+                allTracks
+            }
             val index = playable.indexOfFirst { it.id == track.id }
             if (index >= 0) {
                 playerRepository.setQueue(playable, index, source = com.stash.core.model.PlaybackSource.Library)
