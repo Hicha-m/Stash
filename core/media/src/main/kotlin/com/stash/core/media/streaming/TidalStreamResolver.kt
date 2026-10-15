@@ -26,6 +26,7 @@ import javax.inject.Singleton
 @Singleton
 class TidalStreamResolver @Inject constructor(
     private val client: BitchordClient,
+    private val losslessPrefs: com.stash.data.download.lossless.LosslessSourcePreferences,
 ) {
     /** A server is configured (non-blocking; see [BitchordClient.configured]). */
     fun enabledHint(): Boolean = client.configured.value
@@ -40,8 +41,10 @@ class TidalStreamResolver @Inject constructor(
             durationMs = track.durationMs,
         )
         // allowAac: a CD-only track streams as Tidal's 320 kbps AAC rather than
-        // falling through to the lossy rungs below (JioSaavn / YouTube).
-        val s = client.resolve(query, allowAac = true) ?: run {
+        // falling through to the lossy rungs below (JioSaavn / YouTube) — unless
+        // the user switched "Tidal AAC when no FLAC" off (Tidal = FLAC only).
+        val allowAac = losslessPrefs.tidalAacFallbackNow()
+        val s = client.resolve(query, allowAac = allowAac) ?: run {
             Log.d(TAG, "no_result id=${track.id}")
             return null
         }

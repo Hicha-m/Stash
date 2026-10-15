@@ -59,6 +59,7 @@ class LosslessSourcePreferences @Inject constructor(
     private val losslessOfflineDismissedKey = booleanPreferencesKey("lossless_offline_dismissed")
     private val qualityTierKey = stringPreferencesKey("lossless_quality_tier")
     private val youtubeFallbackKey = booleanPreferencesKey("youtube_fallback_enabled")
+    private val tidalAacFallbackKey = booleanPreferencesKey("tidal_aac_fallback")
     // Retained only so [purgeRetiredSourceKeys] can delete them from existing
     // installs; the antra and arcod sources were removed.
     private val antraSessionKey = stringPreferencesKey("antra_session_cookie")
@@ -177,6 +178,20 @@ class LosslessSourcePreferences @Inject constructor(
      * silent-fallback behaviour exactly; the legacy yt-dlp tier picker
      * (MAX/BEST/HIGH/NORMAL/LOW) governs the fallback's quality.
      */
+    /**
+     * Tidal's 320 kbps AAC when a song has no lossless version, for streaming and
+     * downloads. Default ON; OFF keeps Tidal FLAC-only.
+     */
+    val tidalAacFallback: Flow<Boolean> = context.losslessDataStore.data.map { prefs ->
+        prefs[tidalAacFallbackKey] ?: true
+    }
+
+    suspend fun tidalAacFallbackNow(): Boolean = tidalAacFallback.first()
+
+    suspend fun setTidalAacFallback(value: Boolean) {
+        context.losslessDataStore.edit { prefs -> prefs[tidalAacFallbackKey] = value }
+    }
+
     val youtubeFallbackEnabled: Flow<Boolean> = context.losslessDataStore.data.map { prefs ->
         prefs[youtubeFallbackKey] ?: false
     }

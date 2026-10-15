@@ -494,6 +494,15 @@ class SettingsViewModel @Inject constructor(
         losslessPrefs.bitchordAccessToken.map { it != null }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
+    /** Tidal's 320 kbps AAC when a song has no FLAC (streaming + downloads). Default on. */
+    val tidalAacFallback: StateFlow<Boolean> =
+        losslessPrefs.tidalAacFallback
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), true)
+
+    fun onTidalAacFallbackChanged(value: Boolean) {
+        viewModelScope.launch { losslessPrefs.setTidalAacFallback(value) }
+    }
+
     private val _bitchordEndpointError = MutableStateFlow<String?>(null)
     val bitchordEndpointError: StateFlow<String?> = _bitchordEndpointError
 

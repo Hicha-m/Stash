@@ -96,6 +96,7 @@ class DownloadManagerPickedTrackTest {
         losslessUrlDownloader = losslessUrlDownloader,
         losslessPrefs = losslessPrefs,
         jioSaavnResolver = jioSaavnResolver,
+        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any()) } returns null },
         trackFinalizer = trackFinalizer,
         loudnessMeasurer = loudnessMeasurer,
         metadataEmbedder = metadataEmbedder,

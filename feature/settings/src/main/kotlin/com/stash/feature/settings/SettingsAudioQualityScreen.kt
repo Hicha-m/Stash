@@ -96,6 +96,7 @@ fun SettingsAudioQualityScreen(
     val bitchordEndpoint by viewModel.bitchordEndpoint.collectAsStateWithLifecycle()
     val bitchordEndpointError by viewModel.bitchordEndpointError.collectAsStateWithLifecycle()
     val bitchordHasToken by viewModel.bitchordHasToken.collectAsStateWithLifecycle()
+    val tidalAacFallback by viewModel.tidalAacFallback.collectAsStateWithLifecycle()
     val flacViewModel: FlacUpgradeViewModel = hiltViewModel()
     val autoFlacUpgrade by flacViewModel.autoEnabled.collectAsStateWithLifecycle()
 
@@ -616,6 +617,29 @@ fun SettingsAudioQualityScreen(
                                             color = MaterialTheme.colorScheme.error,
                                         )
                                         SettingsViewModel.EndpointTestState.IDLE -> Unit
+                                    }
+                                }
+
+                                // -- Tidal AAC when a song has no FLAC ---------------
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    com.stash.core.ui.components.StashSwitch(
+                                        checked = tidalAacFallback,
+                                        onCheckedChange = viewModel::onTidalAacFallbackChanged,
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Tidal AAC when no FLAC",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                        )
+                                        Text(
+                                            text = "Plays and downloads Tidal's 320 kbps AAC when a song has " +
+                                                "no lossless version. Off = Tidal is used for FLAC only.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
                                     }
                                 }
 

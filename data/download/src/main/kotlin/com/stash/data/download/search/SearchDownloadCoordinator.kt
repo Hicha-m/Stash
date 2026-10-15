@@ -93,6 +93,7 @@ class SearchDownloadCoordinator @Inject constructor(
      */
     private val losslessPrefs: LosslessSourcePreferences,
     private val jioSaavnResolver: JioSaavnResolver,
+    private val tidalAacResolver: com.stash.data.download.lossless.tidal.TidalAacResolver,
     private val losslessUrlDownloader: LosslessUrlDownloader,
     private val audioDurationExtractor: AudioDurationExtractor,
     private val downloadQueueDao: DownloadQueueDao,
@@ -277,11 +278,39 @@ class SearchDownloadCoordinator @Inject constructor(
             return DownloadJobResult.Deferred
         }
 
-        return finalizeFromLossyFallback(track)
+        return finalizeFromLossyFallback(track, losslessAttempted = true)
     }
 
     /** Resolves the preferred lossy fallback, then preserves YouTube as the last resort. */
-    private suspend fun finalizeFromLossyFallback(track: TrackItem): DownloadJobResult.Resolved {
+    private suspend fun finalizeFromLossyFallback(
+        track: TrackItem,
+        losslessAttempted: Boolean = false,
+    ): DownloadJobResult.Resolved {
+        // Tidal's 320 kbps AAC first, only after the lossless rung ran and missed
+        // (JioSaavn misses many of these tracks). Lossless off = unchanged chain.
+        if (losslessAttempted) {
+            val tidalMatch = runCatching { tidalAacResolver.resolve(track.toQuery()) }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    Log.w(TAG, "Tidal AAC resolve threw for ${track.videoId}: ${error.message}")
+                }.getOrNull()
+            if (tidalMatch != null) {
+                when (val attempt = finalizeFromSource(track, tidalMatch)) {
+                    is SourceFinalizeAttempt.BeforeCommitFailure -> Log.w(
+                        TAG,
+                        "Tidal AAC failed before commit for ${track.videoId}; falling through to JioSaavn: " +
+                            attempt.message,
+                    )
+                    is SourceFinalizeAttempt.AfterCommit -> {
+                        Log.i(TAG, "Tidal AAC search download committed for ${track.videoId}")
+                        return DownloadJobResult.Resolved(
+                            source = SearchDownloadStatus.Source.TIDAL_AAC,
+                            outcome = attempt.outcome,
+                        )
+                    }
+                }
+            }
+        }
         // The Download quality picker sets the JioSaavn variant too.
         val match = runCatching {
             jioSaavnResolver.resolve(track.toQuery(), qualityPrefs.qualityTier.first().toJioSaavnKbps())
@@ -350,7 +379,10 @@ class SearchDownloadCoordinator @Inject constructor(
         )
         runCatching { tempFile.delete() }
 
-        if (match.sourceId == JioSaavnResolver.SOURCE_ID || match.isDash) {
+        // Lossy AAC rungs: fetched by the downloader and checked as AAC, not FLAC.
+        val isLossyAac = match.sourceId == JioSaavnResolver.SOURCE_ID ||
+            match.sourceId == com.stash.data.download.lossless.tidal.TidalAacResolver.SOURCE_ID
+        if (isLossyAac || match.isDash) {
             // Use the shared OkHttp downloader rather than Media3's redirect-
             // following HTTP source. The Jio transport disables redirects so
             // the trusted aac.saavncdn.com URL cannot pivot to another host.
@@ -402,12 +434,12 @@ class SearchDownloadCoordinator @Inject constructor(
             runCatching { dataSource.close() }
         }
 
-        if (match.sourceId == JioSaavnResolver.SOURCE_ID) {
+        if (isLossyAac) {
             val metadata = audioDurationExtractor.extract(tempFile.absolutePath)
             if (!isValidJioSaavnMedia(metadata, track, match.format.bitrateKbps)) {
                 runCatching { tempFile.delete() }
                 return SourceFinalizeAttempt.BeforeCommitFailure(
-                    "JioSaavn media failed AAC quality validation: format=${metadata?.format}, " +
+                    "${match.sourceId} media failed AAC quality validation: format=${metadata?.format}, " +
                         "bitrate=${metadata?.bitrateKbps} (asked ${match.format.bitrateKbps}), " +
                         "duration=${metadata?.durationMs}, " +
                         "expected=${(track.durationSeconds * 1_000).toLong()}",
