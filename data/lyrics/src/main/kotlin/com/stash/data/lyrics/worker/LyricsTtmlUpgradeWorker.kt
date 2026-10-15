@@ -85,13 +85,21 @@ class LyricsTtmlUpgradeWorker @AssistedInject constructor(
         for (trackId in toUpgrade) {
             done++
             val result = lyricsRepository.upgradeToTtml(trackId)
+            // NOT_READY (a timeout) and PAUSED (the skip window) were FAILED before the single-track
+            // upgrade told them apart, so the bulk pass still counts them as failures.
+            val softFailure = result == TtmlUpgradeResult.FAILED ||
+                result == TtmlUpgradeResult.NOT_READY ||
+                result == TtmlUpgradeResult.PAUSED
             when (result) {
                 TtmlUpgradeResult.UPGRADED -> upgraded++
                 TtmlUpgradeResult.NO_TTML -> Unit
-                TtmlUpgradeResult.FAILED, TtmlUpgradeResult.RATE_LIMITED -> failed++
+                TtmlUpgradeResult.FAILED,
+                TtmlUpgradeResult.NOT_READY,
+                TtmlUpgradeResult.PAUSED,
+                TtmlUpgradeResult.RATE_LIMITED -> failed++
                 TtmlUpgradeResult.SKIPPED -> continue          // no network used, no pacing needed
             }
-            consecutiveFailures = if (result == TtmlUpgradeResult.FAILED) consecutiveFailures + 1 else 0
+            consecutiveFailures = if (softFailure) consecutiveFailures + 1 else 0
             if (result == TtmlUpgradeResult.RATE_LIMITED || consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                 Log.w(TAG, "Stopping the lyrics run early: $result, $consecutiveFailures failure(s) in a row")
                 bailed = true
