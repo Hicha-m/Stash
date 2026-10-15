@@ -121,10 +121,18 @@ async function search(url, request, env) {
 }
 
 async function stream(trackId, request, env) {
+  // ?aac=1: when no account can play the track losslessly, answer with Tidal's AAC
+  // stream (labelled codec "aac") instead of lossless_unavailable. Opt-in so the
+  // download path, which must never save AAC as FLAC, keeps the lossless-only answer.
+  const allowAac = new URL(request.url).searchParams.get("aac") === "1";
   let refusedBy = null;
+  let lossyInfo = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     const account = await takeAccount(env, refusedBy);
-    if (!account) return json({ error: refusedBy ? "lossless_unavailable" : "no_account" }, refusedBy ? 404 : 503);
+    if (!account) {
+      if (allowAac && lossyInfo) return aacInfo(lossyInfo);
+      return json({ error: refusedBy ? "lossless_unavailable" : "no_account" }, refusedBy ? 404 : 503);
+    }
     const fresh = await refreshIfNeeded(account, env);
     if (!fresh) {
       await coolAccount(env, account.id, 300);
@@ -144,16 +152,28 @@ async function stream(trackId, request, env) {
     }
     const info = await data.json();
     if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
+      lossyInfo = info;
       if (attempt === 0) { refusedBy = account.id; continue; }
+      if (allowAac) return aacInfo(info);
       return json({ error: "lossless_unavailable" }, 404);
     }
     if (refusedBy) await coolAccount(env, refusedBy, 3600);
-    return await streamInfo(trackId, request, env, info);
+    return await streamInfo(trackId, request, env, info, allowAac);
   }
   return json({ error: refusedBy ? "lossless_unavailable" : "upstream_unavailable" }, refusedBy ? 404 : 503);
 }
 
-async function streamInfo(trackId, request, env, info) {
+/** Tidal's progressive AAC stream from a below-lossless playbackinfo answer, or lossless_unavailable. */
+function aacInfo(info) {
+  if (!String(info.manifestMimeType || "").toLowerCase().includes("bts") || !info.manifest) return json({ error: "lossless_unavailable" }, 404);
+  const bts = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(info.manifest), (c) => c.charCodeAt(0))));
+  const codecs = String(bts.codecs || "").toLowerCase();
+  const audioUrl = bts.urls?.[0];
+  if (!/mp4a|aac/.test(codecs) || !audioUrl?.startsWith("https://")) return json({ error: "lossless_unavailable" }, 404);
+  return json({ url: audioUrl, codec: "aac", codecs, container: "mp4", manifest: "none", audioQuality: info.audioQuality, bitDepth: 0, sampleRate: 44100, bitrate: 320 });
+}
+
+async function streamInfo(trackId, request, env, info, allowAac = false) {
   const encoded = info.manifest;
   if (!encoded) return json({ error: "manifest_missing" }, 404);
   const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
@@ -164,7 +184,10 @@ async function streamInfo(trackId, request, env, info) {
     const bts = JSON.parse(new TextDecoder().decode(bytes));
     const codecs = String(bts.codecs || "").toLowerCase();
     const mtype = String(bts.mimeType || "").toLowerCase();
-    if (/opus|mp4a|aac|mp3|he-aac/.test(codecs) || !(codecs.includes("flac") || mtype.includes("flac") || !codecs)) return json({ error: "lossless_unavailable" }, 404);
+    // Tidal can label a playbackinfo LOSSLESS while the BTS file inside is AAC.
+    if (/opus|mp4a|aac|mp3|he-aac/.test(codecs) || !(codecs.includes("flac") || mtype.includes("flac") || !codecs)) {
+      return allowAac ? aacInfo(info) : json({ error: "lossless_unavailable" }, 404);
+    }
     const audioUrl = bts.urls?.[0];
     if (!audioUrl?.startsWith("https://")) return json({ error: "invalid_media_url" }, 502);
     return json({ url: audioUrl, codec: "flac", container: audioUrl.toLowerCase().includes(".mp4") ? "mp4" : "flac", manifest: "none", bitDepth, sampleRate, bitrate: 1411 });
