@@ -344,6 +344,9 @@ class DownloadManager @Inject constructor(
                             "for '${track.artist} - ${track.title}'",
                     )
                 } else {
+                    // Tidal AAC has its own switch ("Tidal AAC when no FLAC"), so it
+                    // still runs with the YouTube fallback off; nothing else lossy does.
+                    if (losslessPrefs.enabledNow()) tryTidalAacDownload(track)?.let { return it }
                     Log.i(
                         TAG,
                         "deferring '${track.artist} - ${track.title}': lossless unavailable, fallback off",

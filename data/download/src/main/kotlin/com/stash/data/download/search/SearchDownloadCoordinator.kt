@@ -252,6 +252,7 @@ class SearchDownloadCoordinator @Inject constructor(
         // No Stash-Mix exemption: search-tab is always an explicit user
         // action, so the fallback pref governs unconditionally.
         if (!losslessPrefs.youtubeFallbackEnabledNow()) {
+            tryTidalAac(track)?.let { return it }
             Log.i(
                 TAG,
                 "deferring search download '${track.artist} - ${track.title}': lossless unavailable, fallback off",
@@ -281,6 +282,36 @@ class SearchDownloadCoordinator @Inject constructor(
         return finalizeFromLossyFallback(track, losslessAttempted = true)
     }
 
+    /**
+     * Tidal's 320 kbps AAC for a track the lossless rung missed, or null. It has its
+     * own switch ("Tidal AAC when no FLAC", checked by the resolver), so it runs even
+     * with the YouTube fallback off.
+     */
+    private suspend fun tryTidalAac(track: TrackItem): DownloadJobResult.Resolved? {
+        val tidalMatch = runCatching { tidalAacResolver.resolve(track.toQuery()) }
+            .onFailure { error ->
+                if (error is CancellationException) throw error
+                Log.w(TAG, "Tidal AAC resolve threw for ${track.videoId}: ${error.message}")
+            }.getOrNull()
+        if (tidalMatch != null) {
+            when (val attempt = finalizeFromSource(track, tidalMatch)) {
+                is SourceFinalizeAttempt.BeforeCommitFailure -> Log.w(
+                    TAG,
+                    "Tidal AAC failed before commit for ${track.videoId}; moving on: " +
+                        attempt.message,
+                )
+                is SourceFinalizeAttempt.AfterCommit -> {
+                    Log.i(TAG, "Tidal AAC search download committed for ${track.videoId}")
+                    return DownloadJobResult.Resolved(
+                        source = SearchDownloadStatus.Source.TIDAL_AAC,
+                        outcome = attempt.outcome,
+                    )
+                }
+            }
+        }
+        return null
+    }
+
     /** Resolves the preferred lossy fallback, then preserves YouTube as the last resort. */
     private suspend fun finalizeFromLossyFallback(
         track: TrackItem,
@@ -288,29 +319,7 @@ class SearchDownloadCoordinator @Inject constructor(
     ): DownloadJobResult.Resolved {
         // Tidal's 320 kbps AAC first, only after the lossless rung ran and missed
         // (JioSaavn misses many of these tracks). Lossless off = unchanged chain.
-        if (losslessAttempted) {
-            val tidalMatch = runCatching { tidalAacResolver.resolve(track.toQuery()) }
-                .onFailure { error ->
-                    if (error is CancellationException) throw error
-                    Log.w(TAG, "Tidal AAC resolve threw for ${track.videoId}: ${error.message}")
-                }.getOrNull()
-            if (tidalMatch != null) {
-                when (val attempt = finalizeFromSource(track, tidalMatch)) {
-                    is SourceFinalizeAttempt.BeforeCommitFailure -> Log.w(
-                        TAG,
-                        "Tidal AAC failed before commit for ${track.videoId}; falling through to JioSaavn: " +
-                            attempt.message,
-                    )
-                    is SourceFinalizeAttempt.AfterCommit -> {
-                        Log.i(TAG, "Tidal AAC search download committed for ${track.videoId}")
-                        return DownloadJobResult.Resolved(
-                            source = SearchDownloadStatus.Source.TIDAL_AAC,
-                            outcome = attempt.outcome,
-                        )
-                    }
-                }
-            }
-        }
+        if (losslessAttempted) tryTidalAac(track)?.let { return it }
         // The Download quality picker sets the JioSaavn variant too.
         val match = runCatching {
             jioSaavnResolver.resolve(track.toQuery(), qualityPrefs.qualityTier.first().toJioSaavnKbps())
