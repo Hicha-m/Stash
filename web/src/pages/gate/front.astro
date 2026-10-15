@@ -10,6 +10,7 @@ import { Image } from 'astro:assets';
 import GateShell from '../../components/gate/GateShell.astro';
 import GoalBar from '../../components/gate/GoalBar.astro';
 import DonateLinks from '../../components/gate/DonateLinks.astro';
+import { LINKS } from '../../data/site';
 import vinyl from '../../assets/brand/vinyl.png';
 ---
 
@@ -25,7 +26,7 @@ import vinyl from '../../assets/brand/vinyl.png';
   <div class="cards">
     <div class="gate-card glass signin">
       <h2>Sign in</h2>
-      <p data-if="not-open">Supporters are on the list as a thank‑you. Enter the email you supported with, and we'll send you a code.</p>
+      <p data-if="not-open">Supporting with $1 or more on <a href={LINKS.kofi} target="_blank" rel="noopener">Ko-fi</a> gets you on the list. Enter the email you supported with, and we'll send you a code.</p>
       <p data-if="open">Open to everyone until <span data-fill="open-until">the end of the window</span>. Enter your email and we'll send you a code.</p>
       <form method="post" action="/access">
         <input type="hidden" name="next" value="" data-value="next" />
