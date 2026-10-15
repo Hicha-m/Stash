@@ -12,8 +12,6 @@ import com.stash.core.data.prefs.NowPlayingPreference
 import com.stash.core.data.prefs.LyricsSourcePreference
 import com.stash.data.lyrics.TtmlUpgradeResult
 import com.stash.core.data.repository.MusicRepository
-import com.stash.core.data.prefs.LyricsSourcePreference
-import com.stash.data.lyrics.TtmlUpgradeResult
 import com.stash.core.media.PlayerRepository
 import com.stash.core.media.SleepTimerController
 import com.stash.core.model.AlbumNavTarget
