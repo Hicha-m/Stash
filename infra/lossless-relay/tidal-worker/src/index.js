@@ -150,12 +150,23 @@ async function dash(request, trackId, env, isInit) {
   const row = await env.DB.prepare("SELECT manifest_xml,init_url,expires_at FROM tidal_dash_manifests WHERE track_id=? AND expires_at>? LIMIT 1").bind(trackId, now()).first();
   if (!row) return json({ error: "manifest_expired" }, 404);
   if (isInit) {
-    const r = await fetch(row.init_url, { headers: { "User-Agent": UA }, redirect: "follow" });
-    if (!r.ok) return json({ error: "init_unavailable" }, 502);
+    const initUrl = row.init_url.replaceAll("&amp;", "&");
+    const r = await fetch(initUrl, { headers: { "User-Agent": UA }, redirect: "follow" });
+    if (!r.ok) {
+      // Host + status only: the init URL carries Tidal's signed token.
+      console.log(`init_unavailable track=${trackId} host=${new URL(initUrl).host} status=${r.status} body=${(await r.text().catch(() => "")).slice(0, 200)}`);
+      return json({ error: "init_unavailable" }, 502);
+    }
     const raw = new Uint8Array(await r.arrayBuffer());
     const flac = indexOfBytes(raw, [0x66, 0x4c, 0x61, 0x43]);
     if (flac >= 0 && raw.length >= flac + 32 && raw.slice(flac + 28, flac + 32).every((b) => b === 0)) raw.set([0xac, 0x44, 0x00, 0x00], flac + 28);
     return new Response(raw, { headers: { "content-type": "audio/mp4", "content-length": String(raw.length), "cache-control": "private, max-age=300", "access-control-allow-origin": "*" } });
+  }
+  // Tidal's CDN answers 403 to Cloudflare egress, so the Worker cannot proxy the
+  // init segment: keep Tidal's own URL in the MPD and let the player fetch it,
+  // like every media segment. Set PROXY_DASH_INIT=1 to restore the proxied path.
+  if (env.PROXY_DASH_INIT !== "1") {
+    return new Response(row.manifest_xml, { headers: { "content-type": "application/dash+xml", "cache-control": "no-store", "access-control-allow-origin": "*" } });
   }
   const initPath = `/dash/td/${trackId}/init.mp4`;
   const exp = Math.min(row.expires_at, now() + 3600);
