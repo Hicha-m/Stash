@@ -123,7 +123,7 @@ async function search(url, request, env) {
 async function stream(trackId, request, env) {
   let refusedBy = null;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const account = await takeAccount(env);
+    const account = await takeAccount(env, refusedBy);
     if (!account) return json({ error: refusedBy ? "lossless_unavailable" : "no_account" }, refusedBy ? 404 : 503);
     const fresh = await refreshIfNeeded(account, env);
     if (!fresh) {
@@ -145,7 +145,6 @@ async function stream(trackId, request, env) {
     const info = await data.json();
     if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
       if (attempt === 0) { refusedBy = account.id; continue; }
-      if (refusedBy) await coolAccount(env, refusedBy, 3600);
       return json({ error: "lossless_unavailable" }, 404);
     }
     if (refusedBy) await coolAccount(env, refusedBy, 3600);
@@ -236,7 +235,7 @@ async function playbackInfo(trackId, account, env) {
   return fallback || new Response("", { status: 404 });
 }
 
-async function takeAccount(env) {
+async function takeAccount(env, excludeId = null) {
   const hour = new Date().toISOString().slice(0, 13);
   const day = new Date().toISOString().slice(0, 10);
   const hourly = positive(env.TIDAL_ACCOUNT_HOURLY_CAP, 60);
@@ -244,8 +243,8 @@ async function takeAccount(env) {
   return await env.DB.prepare(`UPDATE tidal_accounts SET
       hour_n=CASE WHEN hour_key=?1 THEN hour_n+1 ELSE 1 END,hour_key=?1,
       day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2,last_used_at=?3
-    WHERE id=(SELECT id FROM tidal_accounts WHERE state='live' AND cooling_until<=?3 AND (hour_key!=?1 OR hour_n<?4) AND (day_key!=?2 OR day_n<?5) ORDER BY last_used_at,id LIMIT 1)
-    RETURNING *`).bind(hour, day, now(), hourly, daily).first();
+    WHERE id=(SELECT id FROM tidal_accounts WHERE state='live' AND cooling_until<=?3 AND (hour_key!=?1 OR hour_n<?4) AND (day_key!=?2 OR day_n<?5) AND id IS NOT ?6 ORDER BY last_used_at,id LIMIT 1)
+    RETURNING *`).bind(hour, day, now(), hourly, daily, excludeId).first();
 }
 
 async function coolAccount(env, id, seconds) {

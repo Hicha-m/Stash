@@ -161,6 +161,30 @@ test("stream rejects a Tidal response below lossless quality", async () => {
   });
 });
 
+test("two accounts declining the same track are not cooled", async () => {
+  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
+  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account", access_token: "second-token" }];
+  const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", direct) });
+
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: "lossless_unavailable" });
+    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until")), false);
+  });
+});
+
+test("a single account is not retried or cooled for a track-level quality refusal", async () => {
+  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
+  const f = fixture({ tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", direct) });
+
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    assert.equal(response.status, 404);
+    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until")), false);
+  });
+});
+
 test("stream cross-checks a downgraded account against the next account, then cools the refuser", async () => {
   const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
   const accounts = [liveAccount(), { ...liveAccount(), id: "reserve-account", access_token: "reserve-token" }];
