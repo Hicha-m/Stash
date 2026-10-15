@@ -74,6 +74,8 @@ data class BitchordStream(
     val confidence: Float = 0f,
     /** Server-side id (`td:<n>`), for logs. */
     val trackId: String? = null,
+    /** "flac", or "aac" (320 kbps) only when the caller passed `allowAac`. */
+    val codec: String = "flac",
 )
 
 /**
@@ -144,8 +146,12 @@ class BitchordClient @Inject constructor(
      * Search, pick the best confident `td:` match, then resolve its stream. Null on
      * no server, no confident match, a non-FLAC answer, or any I/O error — the
      * caller just moves to the next rung.
+     *
+     * [allowAac]: streaming only. CD-only tracks never come back lossless with the
+     * relay's Tidal client, so the server can answer with Tidal's 320 kbps AAC
+     * instead (`?aac=1`). Downloads leave it off so AAC is never saved as FLAC.
      */
-    suspend fun resolve(query: TrackQuery): BitchordStream? = withContext(Dispatchers.IO) {
+    suspend fun resolve(query: TrackQuery, allowAac: Boolean = false): BitchordStream? = withContext(Dispatchers.IO) {
         val server = server() ?: return@withContext null
         val base = server.base.toHttpUrlOrNull() ?: return@withContext null
         val token = server.token
@@ -173,9 +179,10 @@ class BitchordClient @Inject constructor(
                 // Hints the server uses if its own Tidal metadata lookup fails.
                 .addQueryParameter("title", track.title)
                 .addQueryParameter("artist", track.artist)
+                .apply { if (allowAac) addQueryParameter("aac", "1") }
                 .build()
             val stream = json.decodeFromString<BitchordStreamResponse>(get(streamUrl, token) ?: return@withContext null)
-            toStream(stream, track, conf)
+            toStream(stream, track, conf, allowAac)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -186,11 +193,12 @@ class BitchordClient @Inject constructor(
         }
     }
 
-    private fun toStream(s: BitchordStreamResponse, track: BitchordTrack, conf: Float): BitchordStream? {
+    private fun toStream(s: BitchordStreamResponse, track: BitchordTrack, conf: Float, allowAac: Boolean): BitchordStream? {
         val url = s.url.toHttpUrlOrNull() ?: return null
         // Defensive: upstream already refuses lossy, but a future server change
         // must not slip AAC into a rung the UI labels lossless.
-        if (!s.codec.equals("flac", ignoreCase = true)) {
+        val aac = allowAac && s.codec.equals("aac", ignoreCase = true)
+        if (!aac && !s.codec.equals("flac", ignoreCase = true)) {
             Log.d(TAG, "non-flac codec '${s.codec}' for ${track.id}; skipping")
             return null
         }
@@ -206,6 +214,7 @@ class BitchordClient @Inject constructor(
             expiresAtMs = expiryFor(url),
             confidence = conf,
             trackId = track.id,
+            codec = if (aac) "aac" else "flac",
         )
     }
 

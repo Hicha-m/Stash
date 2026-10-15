@@ -39,15 +39,17 @@ class TidalStreamResolver @Inject constructor(
             isrc = track.isrc?.takeIf { it.isNotBlank() },
             durationMs = track.durationMs,
         )
-        val s = client.resolve(query) ?: run {
+        // allowAac: a CD-only track streams as Tidal's 320 kbps AAC rather than
+        // falling through to the lossy rungs below (JioSaavn / YouTube).
+        val s = client.resolve(query, allowAac = true) ?: run {
             Log.d(TAG, "no_result id=${track.id}")
             return null
         }
         return StreamUrl(
             url = s.url,
             expiresAtMs = s.expiresAtMs,
-            codec = "flac",
-            bitsPerSample = s.bitDepth.takeIf { it > 0 },
+            codec = s.codec,
+            bitsPerSample = s.bitDepth.takeIf { it > 0 && s.codec == "flac" },
             sampleRateHz = s.sampleRateHz.takeIf { it > 0 },
             bitrateKbps = s.bitrateKbps.takeIf { it > 0 },
             coverArtUrl = s.coverArtUrl,
