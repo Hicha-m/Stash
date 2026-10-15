@@ -9,7 +9,11 @@ if (!origin.startsWith("https://") || !adminToken) {
   process.exit(2);
 }
 const headers = { "X-Access-Token": adminToken, Accept: "application/json" };
-const start = await fetch(`${origin}/admin/device/start`, { method: "POST", headers });
+const accountState = process.argv.includes("--reserve") ? "reserve" : "live";
+const start = await fetch(`${origin}/admin/device/start`, {
+  method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+  body: JSON.stringify({ account_state: accountState }),
+});
 if (!start.ok) throw new Error(`device start failed: HTTP ${start.status}`);
 const device = await start.json();
 console.log(`Approve this Tidal sign-in in your browser:\n${device.verification_uri}\nCode: ${device.user_code}`);
@@ -25,7 +29,7 @@ while (Date.now() < deadline) {
   });
   const result = await response.json().catch(() => ({}));
   if (response.ok && result.status === "authorized") {
-    console.log("Tidal account authorized and token stored in the relay D1 database.");
+    console.log(`Tidal account authorized as ${accountState} and token stored in the relay D1 database.`);
     process.exit(0);
   }
   if (result.status === "expired" || response.status === 410) throw new Error("device code expired; start a new device login");

@@ -143,10 +143,15 @@ Failure is fail-safe by design: bad signature or network failure keeps the
 cached copy; no cache means no relays, and lossless falls back to the user's own
 account or custom endpoint.
 
-### Optional: the Tidal rung (BitChord) — client half BUILT 2026-10-14
+### Optional: the Tidal rung (BitChord)
 
-Two optional top-level keys turn on the Tidal lossless rung (after Qobuz, before
-the lossy sources) with no user setup:
+The client supports an optional Tidal rung after Qobuz and before the lossy
+sources. Its signed-config fields point to the operator-managed relay. The
+Worker rotates a pool of live accounts under per-account hourly and daily caps;
+reserve accounts remain out of rotation until promoted. Keep the shared config
+token limited to this relay, and size the pool/caps for the expected install base.
+
+For a future managed pool, the optional fields are:
 
 ```json
 {
@@ -155,19 +160,20 @@ the lossy sources) with no user setup:
 }
 ```
 
-- `tidal_relay_url` — base of the owner-hosted BitChord Lossless Relay
+- `tidal_relay_url` — base of the managed BitChord Lossless Relay
   (`R1Blmmakan/music_addon`). **https only**; anything else is dropped at parse and
   the rung stays off. A path prefix is kept, so BitChord's own
   `https://host/<ACCESS_TOKEN>` form also works (then omit the token key).
 - `tidal_relay_token` — optional; sent as `X-Access-Token` on `/search` and
   `/stream`. The `/dash/` and `/audio/` URLs the server returns are HMAC-signed
   and need no token.
-- Missing `tidal_relay_url` = rung off. Same signature, cache, rollback floor and
-  rotation story as `relay_key`: publish a new config to move or rotate it.
+- Missing `tidal_relay_url` = shared Tidal rung off. Same signature, cache,
+  rollback floor and rotation story as `relay_key`.
 - A user's own server (Settings › Audio & Quality › Advanced › Custom Tidal
-  server) outranks this, and uses only the user's token.
-- **`publish-config.mjs` / `buildConfig` currently drops unknown keys** — they must
-  be passed through there before these keys can be published.
+  server) uses only that user's token and takes precedence over a managed relay.
+- The shared access token is delivered to every client that fetches this signed
+  config. The relay operator owns the account pool and per-account limits; do not
+  treat the config token as a Tidal account credential.
 
 ---
 

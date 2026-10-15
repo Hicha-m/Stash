@@ -46,8 +46,10 @@ async function startDeviceAuth(request, env) {
   const expiresIn = Number(d.expiresIn || d.expires_in || 300);
   const interval = Math.max(Number(d.interval || 5), 4);
   if (!deviceCode || !userCode) return json({ error: "invalid_device_authorization" }, 502);
-  await env.DB.prepare("INSERT OR REPLACE INTO tidal_device_auth(device_code,user_code,expires_at,poll_interval,next_poll_at) VALUES(?,?,?,?,?)")
-    .bind(deviceCode, userCode, now() + expiresIn, interval, now()).run();
+  const requestedState = await request.clone().json().catch(() => ({}));
+  const accountState = requestedState.account_state === "reserve" ? "reserve" : "live";
+  await env.DB.prepare("INSERT OR REPLACE INTO tidal_device_auth(device_code,user_code,expires_at,poll_interval,next_poll_at,account_state) VALUES(?,?,?,?,?,?)")
+    .bind(deviceCode, userCode, now() + expiresIn, interval, now(), accountState).run();
   return json({ verification_uri: `https://link.tidal.com/${encodeURIComponent(userCode)}`, user_code: userCode, expires_in: expiresIn, interval });
 }
 
@@ -75,9 +77,10 @@ async function pollDeviceAuth(request, env) {
   const userId = String(data.user?.userId || data.user?.id || data.user_id || crypto.randomUUID());
   const lifetime = Number(data.expires_in || 604800);
   await env.DB.prepare(`INSERT INTO tidal_accounts(id,access_token,refresh_token,token_expires_at,state,updated_at)
-    VALUES(?,?,?,?, 'live', ?) ON CONFLICT(id) DO UPDATE SET access_token=excluded.access_token,refresh_token=excluded.refresh_token,
-    token_expires_at=excluded.token_expires_at,state='live',generation=tidal_accounts.generation+1,updated_at=excluded.updated_at`)
-    .bind(userId, data.access_token, data.refresh_token || "", now() + lifetime, now()).run();
+    VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET access_token=excluded.access_token,refresh_token=excluded.refresh_token,
+    token_expires_at=excluded.token_expires_at,state=excluded.state,dead_reason='',cooling_until=0,
+    generation=tidal_accounts.generation+1,updated_at=excluded.updated_at`)
+    .bind(userId, data.access_token, data.refresh_token || "", now() + lifetime, pending.account_state || "live", now()).run();
   await env.DB.prepare("DELETE FROM tidal_device_auth WHERE device_code=?").bind(pending.device_code).run();
   return json({ status: "authorized", account_id: userId });
 }
@@ -85,14 +88,25 @@ async function pollDeviceAuth(request, env) {
 async function search(url, request, env) {
   const query = (url.searchParams.get("q") || "").trim();
   if (!query) return json({ tracks: [] });
-  const selected = await takeAccount(env);
-  const account = selected && await refreshIfNeeded(selected, env);
-  if (!account) return json({ tracks: [] }, 503);
   const cc = env.TIDAL_COUNTRY_CODE || "US";
-  const r = await tidalFetch(`/search/tracks?query=${encodeURIComponent(query)}&limit=30&offset=0&countryCode=${cc}`, account, env);
-  if (r.status === 401) return json({ tracks: [] }, 503);
-  if (!r.ok) return json({ tracks: [] });
-  const data = await r.json();
+  let data;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const selected = await takeAccount(env);
+    if (!selected) return json({ tracks: [] }, 503);
+    const account = await refreshIfNeeded(selected, env);
+    if (!account) { await coolAccount(env, selected.id, 300); continue; }
+    const r = await tidalFetch(`/search/tracks?query=${encodeURIComponent(query)}&limit=30&offset=0&countryCode=${cc}`, account, env);
+    if (r.status === 401) {
+      const denial = await r.clone().json().catch(() => ({}));
+      if (denial.subStatus !== 4005) { await killAccount(env, selected.id, "401"); continue; }
+      return json({ tracks: [] });
+    }
+    if (r.status >= 500) { await coolAccount(env, selected.id, 300); continue; }
+    if (!r.ok) return json({ tracks: [] });
+    data = await r.json();
+    break;
+  }
+  if (!data) return json({ tracks: [] }, 503);
   const tracks = (data.items || []).filter((t) => t && t.id != null && t.type !== "video").map((t) => {
     const tags = t.mediaMetadata?.tags || [];
     const quality = t.audioQuality === "HI_RES_LOSSLESS" || tags.includes("HI_RES_LOSSLESS") ? "HI_RES_LOSSLESS"
@@ -107,13 +121,40 @@ async function search(url, request, env) {
 }
 
 async function stream(trackId, request, env) {
-  const selected = await takeAccount(env);
-  let account = selected && await refreshIfNeeded(selected, env);
-  if (!account) return json({ error: "no_account" }, 404);
-  const data = await playbackInfo(trackId, account, env);
-  if (!data.ok) return json({ error: "not_available" }, data.status === 404 ? 404 : 503);
-  const info = await data.json();
-  if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) return json({ error: "lossless_unavailable" }, 404);
+  let refusedBy = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const account = await takeAccount(env);
+    if (!account) return json({ error: refusedBy ? "lossless_unavailable" : "no_account" }, refusedBy ? 404 : 503);
+    const fresh = await refreshIfNeeded(account, env);
+    if (!fresh) {
+      await coolAccount(env, account.id, 300);
+      continue;
+    }
+    const data = await playbackInfo(trackId, fresh, env);
+    if (data.status === 401) {
+      const denial = await data.clone().json().catch(() => ({}));
+      if (denial.subStatus === 4005) return json({ error: "not_available" }, 404);
+      await killAccount(env, account.id, "401");
+      continue;
+    }
+    if (!data.ok) {
+      if (data.status >= 500) await coolAccount(env, account.id, 300);
+      if (data.status === 404) return json({ error: "not_available" }, 404);
+      continue;
+    }
+    const info = await data.json();
+    if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
+      if (attempt === 0) { refusedBy = account.id; continue; }
+      if (refusedBy) await coolAccount(env, refusedBy, 3600);
+      return json({ error: "lossless_unavailable" }, 404);
+    }
+    if (refusedBy) await coolAccount(env, refusedBy, 3600);
+    return await streamInfo(trackId, request, env, info);
+  }
+  return json({ error: refusedBy ? "lossless_unavailable" : "upstream_unavailable" }, refusedBy ? 404 : 503);
+}
+
+async function streamInfo(trackId, request, env, info) {
   const encoded = info.manifest;
   if (!encoded) return json({ error: "manifest_missing" }, 404);
   const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
@@ -200,12 +241,19 @@ async function takeAccount(env) {
   const day = new Date().toISOString().slice(0, 10);
   const hourly = positive(env.TIDAL_ACCOUNT_HOURLY_CAP, 60);
   const daily = positive(env.TIDAL_ACCOUNT_DAILY_CAP, 1000);
-  const row = await env.DB.prepare(`UPDATE tidal_accounts SET
+  return await env.DB.prepare(`UPDATE tidal_accounts SET
       hour_n=CASE WHEN hour_key=?1 THEN hour_n+1 ELSE 1 END,hour_key=?1,
       day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2,last_used_at=?3
-    WHERE id=(SELECT id FROM tidal_accounts WHERE state='live' AND (hour_key!=?1 OR hour_n<?4) AND (day_key!=?2 OR day_n<?5) ORDER BY last_used_at LIMIT 1)
+    WHERE id=(SELECT id FROM tidal_accounts WHERE state='live' AND cooling_until<=?3 AND (hour_key!=?1 OR hour_n<?4) AND (day_key!=?2 OR day_n<?5) ORDER BY last_used_at,id LIMIT 1)
     RETURNING *`).bind(hour, day, now(), hourly, daily).first();
-  return row || null;
+}
+
+async function coolAccount(env, id, seconds) {
+  await env.DB.prepare("UPDATE tidal_accounts SET cooling_until=? WHERE id=? AND state='live'").bind(now() + seconds, id).run();
+}
+
+async function killAccount(env, id, reason) {
+  await env.DB.prepare("UPDATE tidal_accounts SET state='dead',dead_reason=? WHERE id=?").bind(reason, id).run();
 }
 
 async function refreshAccount(account, env) {
