@@ -350,7 +350,10 @@ test("Keep them all puts the sign-ups on the list as approved via the window, an
         assert.equal(rec.source, "approved");
         assert.equal(rec.via, "open");
         assert.equal(rec.by, "owner@example.com");
-        assert.equal(e.ACCESS_KV.map.get(`access:${h[n]}`).opts.metadata, undefined, "no longer tagged as a sign-up");
+        const meta = e.ACCESS_KV.map.get(`access:${h[n]}`).opts.metadata;
+        assert.equal(meta.source, "approved", "no longer tagged as a sign-up");
+        assert.equal(meta.via, "open");
+        assert.equal(typeof meta.at, "string");
         assert.equal(await e.ACCESS_KV.get(`open:${h[n]}`), null);
     }
     assert.deepEqual(e.ACCESS_KV.json(`access:${h.b}`), { source: "kofi" });
@@ -403,4 +406,95 @@ test("Remove access takes someone off both lists", async () => {
     assert.equal(await e.ACCESS_KV.get(`open:${h.b}`), null);
     assert.match((await adminPost({ action: "remove", email: "x@example.com" }, e)).headers.get("location"), /done=removed/);
     assert.equal(await e.ACCESS_KV.get(`open:${h.x}`), null);
+});
+
+/** Moves the clock past the two-minute gap between clashing bulk buttons. */
+async function afterTheGap(fn) {
+    const { clock } = await import("../crypto.js");
+    const realNow = clock.now;
+    clock.now = () => realNow() + 3 * 60 * 1000;
+    try {
+        return await fn();
+    } finally {
+        clock.now = realNow;
+    }
+}
+
+test("Remove everyone kept removes only the people kept from the window; supporters and hand-added people stay", async () => {
+    const { e, h } = await listWithOpenSignups();
+    const m = await hashEmail("m@example.com");
+    const p = await hashEmail("p@example.com");
+    const old = await hashEmail("old@example.com");
+    e.ACCESS_KV.map.set(`access:${m}`, { value: JSON.stringify({ source: "manual", by: "owner@example.com", at: "x" }), opts: {} });
+    e.ACCESS_KV.map.set(`access:${p}`, { value: JSON.stringify({ source: "approved", by: "owner@example.com", at: "x" }), opts: {} });
+    // Kept before keeps wrote metadata: only the value says it came from the window.
+    e.ACCESS_KV.map.set(`access:${old}`, { value: JSON.stringify({ source: "approved", by: "owner@example.com", at: "x", via: "open" }), opts: {} });
+    assert.match((await adminPost({ action: "keep-open" }, e)).headers.get("location"), /done=open-kept/);
+    let page = await (await adminGet(await jwt(), e)).text();
+    assert.match(page, /4 kept from the open window/);
+    assert.match(page, /KEPT BUTTON/);
+
+    const res = await afterTheGap(() => adminPost({ action: "remove-kept-open" }, e));
+    assert.match(res.headers.get("location"), /done=kept-open-removed/);
+    for (const n of ["x", "y", "z"]) assert.equal(await e.ACCESS_KV.get(`access:${h[n]}`), null);
+    assert.equal(await e.ACCESS_KV.get(`access:${old}`), null, "an older keep without metadata is removed too");
+    assert.deepEqual(e.ACCESS_KV.json(`access:${h.a}`), { source: "kofi" });
+    assert.deepEqual(e.ACCESS_KV.json(`access:${h.b}`), { source: "kofi" }, "a supporter who signed up in the window keeps their entry");
+    assert.equal(e.ACCESS_KV.json(`access:${m}`).source, "manual");
+    assert.equal(e.ACCESS_KV.json(`access:${p}`).source, "approved");
+    assert.equal(await hasAccess(e, h.x), false, "this instance forgets them at once");
+    forgetAllAccess();
+    assert.equal(await hasAccess(e, h.b), true);
+    assert.equal(await hasAccess(e, h.z), false);
+    page = await (await adminGet(await jwt(), e)).text();
+    assert.doesNotMatch(page, /KEPT BUTTON/);
+});
+
+test("Remove everyone kept never touches pending sign-ups, old format or new (that's Remove them all)", async () => {
+    const { e, h } = await listWithOpenSignups();
+    assert.doesNotMatch((await (await adminGet(await jwt(), e)).text()), /KEPT BUTTON/);
+    assert.match((await adminPost({ action: "remove-kept-open" }, e)).headers.get("location"), /done=kept-open-removed/);
+    assert.equal(e.ACCESS_KV.json(`access:${h.z}`).source, "open");
+    for (const n of ["b", "x", "y"]) assert.notEqual(await e.ACCESS_KV.get(`open:${h[n]}`), null);
+});
+
+test("an entry that stopped being a keep since the listing (a supporter now) is re-read and left alone", async () => {
+    const { e, h } = await listWithOpenSignups();
+    await adminPost({ action: "keep-open" }, e);
+    // Ko-fi overwrote x's entry, but the listing still shows the old metadata.
+    const realList = e.ACCESS_KV.list.bind(e.ACCESS_KV);
+    e.ACCESS_KV.list = async (opts) => {
+        const res = await realList(opts);
+        for (const k of res.keys) if (k.name === `access:${h.x}`) k.metadata = { source: "approved", via: "open", at: "x" };
+        return res;
+    };
+    e.ACCESS_KV.map.set(`access:${h.x}`, { value: JSON.stringify({ source: "kofi" }), opts: {} });
+    await afterTheGap(() => adminPost({ action: "remove-kept-open" }, e));
+    assert.deepEqual(e.ACCESS_KV.json(`access:${h.x}`), { source: "kofi" });
+    assert.equal(await e.ACCESS_KV.get(`access:${h.y}`), null);
+});
+
+test("Remove everyone kept right after Keep them all (or the other way round) is refused for two minutes", async () => {
+    const { e, h } = await listWithOpenSignups();
+    await adminPost({ action: "keep-open" }, e);
+    assert.match((await adminPost({ action: "remove-kept-open" }, e)).headers.get("location"), /done=open-wait/);
+    assert.equal(e.ACCESS_KV.json(`access:${h.x}`).via, "open", "nothing was removed");
+
+    const second = await listWithOpenSignups();
+    assert.match((await adminPost({ action: "remove-kept-open" }, second.e)).headers.get("location"), /done=kept-open-removed/);
+    assert.match((await adminPost({ action: "keep-open" }, second.e)).headers.get("location"), /done=open-wait/);
+    // Remove them all doesn't clash with it.
+    assert.match((await adminPost({ action: "remove-open" }, second.e)).headers.get("location"), /done=open-removed/);
+});
+
+test("more people kept than one batch: the first press does a batch and says so, the next finishes", async () => {
+    const entries = {};
+    for (let i = 0; i < 160; i++) {
+        entries[`access:${String(i).padStart(64, "0")}`] = { value: JSON.stringify({ source: "approved", via: "open", at: "x" }), metadata: { source: "approved", via: "open", at: "x" } };
+    }
+    entries[`access:${"f".repeat(64)}`] = { source: "kofi" };
+    const e = env({ ACCESS_KV: fakeKV(entries) });
+    assert.match((await adminPost({ action: "remove-kept-open" }, e)).headers.get("location"), /done=open-more/);
+    assert.match((await adminPost({ action: "remove-kept-open" }, e)).headers.get("location"), /done=kept-open-removed/);
+    assert.deepEqual([...e.ACCESS_KV.map.keys()].filter((k) => k.startsWith("access:")), [`access:${"f".repeat(64)}`]);
 });

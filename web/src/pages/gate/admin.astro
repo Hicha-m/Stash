@@ -73,6 +73,15 @@ import GoalBar from '../../components/gate/GoalBar.astro';
           <button type="submit" class="button button-secondary button-small">Remove them all</button>
         </form>
       </div>
+      <div data-if="has-kept-open">
+        <p><span data-fill="kept-open-count">0 kept from the open window</span>. You can remove them all at any time; supporters and people you added yourself stay.</p>
+        <div class="admin-actions">
+          <form method="post" action="/admin">
+            <input type="hidden" name="action" value="remove-kept-open" />
+            <button type="submit" class="button button-secondary button-small">Remove everyone kept from the open window</button>
+          </form>
+        </div>
+      </div>
       <p class="gate-small">To remove just one person, use Remove access with their email.</p>
     </section>
 

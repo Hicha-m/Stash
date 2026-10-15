@@ -28,6 +28,26 @@ const OPEN_CHUNK = 50;
  * people just kept.
  */
 const OPEN_ACTION_GAP_MS = 2 * 60 * 1000;
+/**
+ * Which bulk buttons undo each other, so one is refused for OPEN_ACTION_GAP_MS after the other. "Remove everyone
+ * kept" and "Keep them all" clash (a lagging list could remove people just kept, or keep people just removed);
+ * the two removals don't.
+ */
+const OPEN_CONFLICTS = {
+    "keep-open": ["remove-open", "remove-kept-open"],
+    "remove-open": ["keep-open"],
+    "remove-kept-open": ["keep-open"],
+};
+/**
+ * People kept from the open window removed per click. Each is up to ~4 KV calls (a read, the delete, and listing
+ * and deleting their sign-in codes), plus the listing's own reads, so this stays well under 1,000 per request.
+ */
+const KEPT_BATCH = 150;
+/**
+ * Access entries without metadata (Ko-fi's, and keeps from before metadata was written) need their value read to
+ * tell whether they came from the open window. At most this many are read per request; past it, counts say "N+".
+ */
+const MAX_KEPT_READS = 300;
 
 /** What each ?done= says. Anything not listed shows nothing. */
 const DONE = {
@@ -49,6 +69,7 @@ const DONE = {
     "open-kept": "Kept: everyone who signed up in the open window is on the list for good. The count takes a minute to catch up.",
     "open-removed": "Removed everyone who signed up in the open window (supporters among them keep their access). Their sign-in stops working within a few minutes; the count takes a minute to catch up.",
     "open-more": "Done with a batch. Some are left: wait a minute (the list takes that long to catch up), then press it again.",
+    "kept-open-removed": "Removed everyone you kept from the open window. Supporters and people you added yourself keep their access. Their sign-in stops working within a few minutes; the count takes a minute to catch up.",
     "open-wait": "The other button ran less than two minutes ago. Wait a couple of minutes, so the list has caught up, then try again.",
     "no-pepper": "EMAIL_PEPPER isn't set on this Worker, so emails can't be added or removed (they'd be hashed differently from the tip jar's).",
 };
@@ -113,12 +134,13 @@ async function adminPage(env, url, admin) {
     const kv = env.ACCESS_KV;
     const month = monthKey(new Date(clock.now()));
     const page = Number.parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
-    const [requests, goal, tipjarCheck, ourCheck, openKeys] = await Promise.all([
+    const [requests, goal, tipjarCheck, ourCheck, openKeys, kept] = await Promise.all([
         pendingRequests(kv, page),
         readGoal(kv, month),
         kv.get(KEYS.hashCheck),
         hashEmail(HASHCHECK_EMAIL, env.EMAIL_PEPPER),
         openSignups(kv),
+        keptFromOpen(kv),
     ]);
     const until = openUntilText(env);
     const openStatus = isOpen(env) ? `Open to everyone until ${until}.` : until ? `Closed (it ran until ${until}).` : "Not set (OPEN_UNTIL in wrangler.jsonc).";
@@ -137,6 +159,7 @@ async function adminPage(env, url, admin) {
             "request-count": `${requests.total}${requests.more ? "+" : ""} waiting`,
             "open-status": openStatus,
             "open-count": `${openKeys.length} signed up in the open window`,
+            "kept-open-count": `${kept.hs.length}${kept.more ? "+" : ""} kept from the open window`,
         },
         html: {
             requests: requests.rows.map(requestItem).join(""),
@@ -151,6 +174,7 @@ async function adminPage(env, url, admin) {
             "no-entries": goal.entries.length === 0,
             "has-entries": goal.entries.length > 0,
             "has-open-signups": openKeys.length > 0,
+            "has-kept-open": kept.hs.length > 0,
         },
         goal: goalView(goal, target),
     });
@@ -174,13 +198,15 @@ async function welcome(env, url, email) {
  */
 async function keepSignup(kv, { h, legacy }, by, at) {
     const kept = JSON.stringify({ source: "approved", by, at, via: "open" });
+    // The metadata lets keptFromOpen find them from key listings alone, without reading every value.
+    const opts = { metadata: { source: "approved", via: "open", at } };
     if (legacy) {
         const { metadata } = await kv.getWithMetadata(KEYS.access(h));
-        if (metadata?.source === OPEN_SOURCE) await kv.put(KEYS.access(h), kept);
+        if (metadata?.source === OPEN_SOURCE) await kv.put(KEYS.access(h), kept, opts);
         return;
     }
     if ((await kv.get(KEYS.open(h))) === null) return; // already kept or removed
-    if ((await kv.get(KEYS.access(h))) === null) await kv.put(KEYS.access(h), kept);
+    if ((await kv.get(KEYS.access(h))) === null) await kv.put(KEYS.access(h), kept, opts);
     await kv.delete(KEYS.open(h));
 }
 
@@ -196,6 +222,60 @@ async function removeSignup(kv, { h, legacy }) {
         await kv.delete(KEYS.open(h));
     }
     rememberAccess(h, undefined);
+}
+
+/** True for an access entry's value written by keepSignup: approved, via the open window. */
+const isKeptFromOpen = (rec) => rec?.source === "approved" && rec?.via === "open";
+
+/**
+ * Everyone kept from the open window, as hashes: access:<h> entries tagged via "open" in their metadata, plus
+ * entries without metadata whose value says so (keeps from before the metadata was written). Entries with other
+ * metadata (a pending older-format sign-up, tagged source "open") are never read or counted. Returns at most
+ * `limit` hashes; `more` is true when there were more, or it ran out of reads (MAX_KEPT_READS).
+ */
+async function keptFromOpen(kv, limit = Infinity) {
+    const hs = [];
+    let reads = 0;
+    let cursor;
+    for (;;) {
+        const res = await kv.list({ prefix: KEYS.accessPrefix, cursor });
+        const unknown = [];
+        for (const { name, metadata } of res.keys) {
+            const h = name.slice(KEYS.accessPrefix.length);
+            if (!metadata) unknown.push({ name, h });
+            else if (metadata.source === "approved" && metadata.via === "open") hs.push(h);
+        }
+        for (let i = 0; i < unknown.length && hs.length <= limit; i += OPEN_CHUNK) {
+            const chunk = unknown.slice(i, i + OPEN_CHUNK);
+            if (reads + chunk.length > MAX_KEPT_READS) return { hs: hs.slice(0, limit), more: true };
+            reads += chunk.length;
+            const recs = await Promise.all(chunk.map(({ name }) => kv.get(name, "json").catch(() => null)));
+            chunk.forEach(({ h }, j) => isKeptFromOpen(recs[j]) && hs.push(h));
+        }
+        if (hs.length > limit) return { hs: hs.slice(0, limit), more: true };
+        if (res.list_complete || !res.cursor) return { hs, more: false };
+        cursor = res.cursor;
+    }
+}
+
+/**
+ * Removes one person kept from the open window, after reading their entry again (a listing can be a minute out of
+ * date): if it has since become a supporter's or a hand-added entry, it stays. Sign-in stops like Remove access.
+ */
+async function removeKept(env, h) {
+    const kv = env.ACCESS_KV;
+    if (!isKeptFromOpen(await kv.get(KEYS.access(h), "json").catch(() => null))) return;
+    await kv.delete(KEYS.access(h));
+    await clearCodes(env, h);
+    rememberAccess(h, false);
+}
+
+/** Refuses a bulk button that would undo one pressed less than OPEN_ACTION_GAP_MS ago; otherwise records it. */
+async function bulkGuard(kv, action, at) {
+    const last = await kv.get(KEYS.openAction, "json");
+    if (last && OPEN_CONFLICTS[action]?.includes(last.action) && clock.now() - Date.parse(last.at) < OPEN_ACTION_GAP_MS) return false;
+    await kv.put(KEYS.openAction, JSON.stringify({ action, at }), { expirationTtl: 600 });
+    return true;
 }
 
 async function act(request, env, url, admin) {
@@ -250,9 +330,7 @@ async function act(request, env, url, admin) {
         case "keep-open":
         case "remove-open": {
             const keep = form.action === "keep-open";
-            const last = await kv.get(KEYS.openAction, "json");
-            if (last && last.action !== form.action && clock.now() - Date.parse(last.at) < OPEN_ACTION_GAP_MS) return back(url, "open-wait");
-            await kv.put(KEYS.openAction, JSON.stringify({ action: form.action, at }), { expirationTtl: 600 });
+            if (!(await bulkGuard(kv, form.action, at))) return back(url, "open-wait");
             const all = await openSignups(kv);
             const batch = all.slice(0, OPEN_BATCH);
             for (let i = 0; i < batch.length; i += OPEN_CHUNK) {
@@ -260,6 +338,12 @@ async function act(request, env, url, admin) {
             }
             if (all.length > OPEN_BATCH) return back(url, "open-more");
             return back(url, keep ? "open-kept" : "open-removed");
+        }
+        case "remove-kept-open": {
+            if (!(await bulkGuard(kv, form.action, at))) return back(url, "open-wait");
+            const { hs, more } = await keptFromOpen(kv, KEPT_BATCH);
+            for (let i = 0; i < hs.length; i += OPEN_CHUNK) await Promise.all(hs.slice(i, i + OPEN_CHUNK).map((h) => removeKept(env, h)));
+            return back(url, more ? "open-more" : "kept-open-removed");
         }
         case "donation": {
             const cents = parseDollars(form.amount);
