@@ -86,6 +86,7 @@ class LibraryViewModelRemoveDownloadUndoTest {
     // ── harness (mirrors LibraryViewModelSourceFilterTest) ────────────────
     private fun musicRepoMock(allTracks: List<Track>): MusicRepository = mock {
         on { getAllTracks() } doReturn flowOf(allTracks)
+        on { getLibraryTracksIncludingOnline() } doReturn flowOf(allTracks)
         on { getAllPlaylists() } doReturn flowOf(emptyList())
         on { getAllArtists() } doReturn flowOf(emptyList())
         on { getAllAlbums() } doReturn flowOf(emptyList())

@@ -78,6 +78,7 @@ class LibraryViewModelMixTest {
         )
         val musicRepo: MusicRepository = mock {
             on { getAllTracks() } doReturn flowOf(emptyList())
+            on { getLibraryTracksIncludingOnline() } doReturn flowOf(emptyList())
             on { getAllPlaylists() } doReturn flowOf(emptyList())
             on { getAllArtists() } doReturn flowOf(emptyList())
             on { getAllAlbums() } doReturn flowOf(emptyList())
@@ -114,6 +115,7 @@ class LibraryViewModelMixTest {
 
     private fun musicRepoMock(playlists: List<Playlist>): MusicRepository = mock {
         on { getAllTracks() } doReturn flowOf(emptyList())
+        on { getLibraryTracksIncludingOnline() } doReturn flowOf(emptyList())
         on { getAllPlaylists() } doReturn flowOf(playlists)
         on { getAllArtists() } doReturn flowOf(emptyList())
         on { getAllAlbums() } doReturn flowOf(emptyList())

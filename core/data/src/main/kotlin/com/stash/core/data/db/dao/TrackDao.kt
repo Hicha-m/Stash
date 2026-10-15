@@ -286,6 +286,20 @@ private const val RESTORABLE_DOWNLOAD = """
     )
 """
 
+/** Column list shared by the Library feeds (see [LibraryTrackRow]). */
+private const val LIBRARY_ROW_COLUMNS = """
+    t.id, t.title, t.artist, t.album, t.album_artist, t.duration_ms,
+    t.file_path, t.file_format, t.quality_kbps, t.file_size_bytes,
+    t.source, t.spotify_uri, t.youtube_id, t.album_art_url,
+    t.album_art_path, t.date_added, t.last_played, t.play_count,
+    (t.is_downloaded = 1 OR t.file_path IS NOT NULL) AS is_downloaded,
+    t.match_confidence, t.match_dismissed, t.isrc,
+    t.explicit, t.bits_per_sample, t.sample_rate_hz,
+    t.spotify_saved_at, t.ytmusic_saved_at, t.lastfm_loved_at,
+    t.stash_liked_at, t.is_streamable, t.is_streamable_checked_at,
+    t.metadata_embedded_at, t.lyrics_fetched_at
+"""
+
 /**
  * Data-access object for [TrackEntity].
  *
@@ -582,6 +596,40 @@ interface TrackDao {
         """
     )
     fun getLibraryByDateAdded(): Flow<List<LibraryTrackRow>>
+
+    /**
+     * Songs feed with online tracks: everything downloaded, plus not-downloaded
+     * tracks that sit in an active, non-mix playlist.
+     */
+    @Transaction
+    @Query(
+        "SELECT " + LIBRARY_ROW_COLUMNS + """
+        FROM tracks t
+        LEFT JOIN track_blocklist bl
+            ON bl.canonical_key = (t.canonical_artist || '|' || t.canonical_title)
+            OR (bl.spotify_uri IS NOT NULL AND bl.spotify_uri = t.spotify_uri)
+            OR (bl.youtube_id  IS NOT NULL AND bl.youtube_id  = t.youtube_id)
+        WHERE bl.canonical_key IS NULL
+          AND (
+              (t.is_downloaded = 1 OR t.file_path IS NOT NULL)
+              OR (
+                  t.match_dismissed = 0
+                  AND EXISTS (
+                      SELECT 1 FROM playlist_tracks pt
+                      INNER JOIN playlists p ON p.id = pt.playlist_id
+                      WHERE pt.track_id = t.id
+                        AND pt.removed_at IS NULL
+                        AND p.is_active = 1
+                        AND p.type NOT IN ('STASH_MIX', 'DAILY_MIX')
+                        AND (p.source_id IS NULL OR p.source_id NOT LIKE 'share:%')
+                        AND (p.sync_enabled = 1 OR p.keep_offline = 1)
+                  )
+              )
+          )
+        ORDER BY t.date_added DESC
+        """
+    )
+    fun getLibraryWithOnlineByDateAdded(): Flow<List<LibraryTrackRow>>
 
     /**
      * Candidate tracks for a "by artist" query.
