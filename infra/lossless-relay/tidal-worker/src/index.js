@@ -124,7 +124,11 @@ async function stream(trackId, request, env) {
   // ?aac=1: when no account can play the track losslessly, answer with Tidal's AAC
   // stream (labelled codec "aac") instead of lossless_unavailable. Opt-in so the
   // download path, which must never save AAC as FLAC, keeps the lossless-only answer.
-  const allowAac = new URL(request.url).searchParams.get("aac") === "1";
+  // ?aac=only (the web player): ask Tidal for its 320 kbps AAC straight away, for any
+  // track. A browser can only play Tidal's progressive file; Hi-Res comes as DASH.
+  const aacMode = new URL(request.url).searchParams.get("aac");
+  const aacOnly = aacMode === "only";
+  const allowAac = aacMode === "1" || aacOnly;
   let refusedBy = null;
   let lossyInfo = null;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -138,7 +142,7 @@ async function stream(trackId, request, env) {
       await coolAccount(env, account.id, 300);
       continue;
     }
-    const data = await playbackInfo(trackId, fresh, env);
+    const data = await playbackInfo(trackId, fresh, env, aacOnly ? ["HIGH"] : undefined);
     if (data.status === 401) {
       const denial = await data.clone().json().catch(() => ({}));
       if (denial.subStatus === 4005) return json({ error: "not_available" }, 404);
@@ -151,6 +155,7 @@ async function stream(trackId, request, env) {
       continue;
     }
     const info = await data.json();
+    if (aacOnly) return aacInfo(info);
     if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
       lossyInfo = info;
       if (attempt === 0) { refusedBy = account.id; continue; }
@@ -239,14 +244,15 @@ async function dash(request, trackId, env, isInit) {
   return new Response(xml, { headers: { "content-type": "application/dash+xml", "cache-control": "no-store", "access-control-allow-origin": "*" } });
 }
 
-async function playbackInfo(trackId, account, env) {
+async function playbackInfo(trackId, account, env, qualities = ["HI_RES_LOSSLESS", "LOSSLESS"]) {
   let fallback = null;
-  for (const quality of ["HI_RES_LOSSLESS", "LOSSLESS"]) {
+  for (const quality of qualities) {
     for (const cc of unique([env.TIDAL_COUNTRY_CODE || "US", "ID", "GB", "US"])) {
       const p = new URLSearchParams({ countryCode: cc, audioquality: quality, playbackmode: "STREAM", assetpresentation: "FULL" });
       const r = await tidalFetch(`/tracks/${trackId}/playbackinfopostpaywall?${p}`, account, env);
       if (r.status === 401) return r;
       if (!r.ok) continue;
+      if (quality === "HIGH") return r; // AAC asked for: the first answer is the one
       // Some Tidal regions return HTTP 200 with a lower quality than requested.
       // Keep searching for FLAC before giving up; otherwise a successful HIGH
       // response to HI_RES_LOSSLESS prevents the explicit LOSSLESS request.
