@@ -350,16 +350,18 @@ class SearchDownloadCoordinator @Inject constructor(
         )
         runCatching { tempFile.delete() }
 
-        if (match.sourceId == JioSaavnResolver.SOURCE_ID) {
+        if (match.sourceId == JioSaavnResolver.SOURCE_ID || match.isDash) {
             // Use the shared OkHttp downloader rather than Media3's redirect-
             // following HTTP source. The Jio transport disables redirects so
             // the trusted aac.saavncdn.com URL cannot pivot to another host.
+            // A DASH match (Tidal) is a manifest, not the file: only the
+            // downloader knows to fetch its segments and remux them to FLAC.
             val fetched = losslessUrlDownloader.download(match, tempFile)
             fetched.exceptionOrNull()?.let { error ->
                 if (error is CancellationException) throw error
                 runCatching { tempFile.delete() }
                 return SourceFinalizeAttempt.BeforeCommitFailure(
-                    "JioSaavn fetch failed: ${error.message}",
+                    "${match.sourceId} fetch failed: ${error.message}",
                 )
             }
         } else {

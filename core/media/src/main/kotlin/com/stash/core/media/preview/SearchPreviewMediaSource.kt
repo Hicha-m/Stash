@@ -35,7 +35,8 @@ class SearchPreviewMediaSource @Inject constructor(
 ) {
     suspend fun create(track: TrackItem): MediaSource {
         val match = prefetcher.lookup(track)
-        return if (match != null && match.confidence >= MIN_SEARCH_CONFIDENCE) {
+        // A DASH match (Tidal) is a manifest this progressive cached source cannot play.
+        return if (match != null && !match.isDash && match.confidence >= MIN_SEARCH_CONFIDENCE) {
             Log.d(
                 TAG,
                 "preview lossless ${track.videoId} via ${match.sourceId} " +
