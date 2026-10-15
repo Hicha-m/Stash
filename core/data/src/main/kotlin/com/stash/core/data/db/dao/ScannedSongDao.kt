@@ -19,6 +19,12 @@ data class ScannedSongStamp(
     @ColumnInfo(name = "date_added") val dateAdded: Long,
 )
 
+/** A row and the cover file name it points at. */
+data class ScannedSongArtRef(
+    @ColumnInfo(name = "id") val id: Long,
+    @ColumnInfo(name = "art") val art: String,
+)
+
 /** A row whose cover hasn't been looked for yet (see ScannedSongEntity.albumArtPath). */
 data class ScannedSongArtTarget(
     @ColumnInfo(name = "id") val id: Long,
@@ -69,7 +75,14 @@ interface ScannedSongDao {
     @Query("UPDATE scanned_songs SET album_art_path = :path WHERE id = :id")
     suspend fun setAlbumArtPath(id: Long, path: String)
 
-    /** Every cover file a row still points at (for the sweep). */
+    @Query("SELECT id, album_art_path AS art FROM scanned_songs WHERE folder_id = :folderId AND album_art_path IS NOT NULL AND album_art_path != ''")
+    suspend fun getArtRefs(folderId: Long): List<ScannedSongArtRef>
+
+    /** Back to "not looked at yet": the cover file is gone. */
+    @Query("UPDATE scanned_songs SET album_art_path = NULL WHERE id IN (:ids)")
+    suspend fun clearAlbumArt(ids: List<Long>)
+
+    /** Every cover file name a row still points at (for the sweep). */
     @Query("SELECT album_art_path FROM scanned_songs WHERE album_art_path IS NOT NULL AND album_art_path != ''")
     suspend fun getArtPaths(): List<String>
 }

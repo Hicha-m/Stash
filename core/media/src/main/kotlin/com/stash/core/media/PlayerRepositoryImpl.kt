@@ -2155,6 +2155,32 @@ class PlayerRepositoryImpl @Inject constructor(
         if (!removedFromTimeline) updateState(controller)
     }
 
+    override fun evictFromQueue(trackIds: Set<Long>) {
+        if (trackIds.isEmpty()) return
+        val controller = controllerDeferred ?: return
+        currentQueueTracks = currentQueueTracks.filterNot { it.id in trackIds }
+        fun hit(i: Int): Boolean {
+            val item = controller.getMediaItemAt(i)
+            val id = item.mediaMetadata.extras?.getLong(EXTRA_TRACK_ID) ?: item.mediaId.toLongOrNull()
+            return id != null && id in trackIds
+        }
+        var removed = false
+        var i = controller.mediaItemCount - 1
+        while (i >= 0) {
+            if (hit(i)) {
+                var start = i
+                while (start > 0 && hit(start - 1)) start--
+                controller.removeMediaItems(start, i + 1) // a run at once: one command, not one per song
+                removed = true
+                i = start - 1
+            } else {
+                i--
+            }
+        }
+        // A logical-only eviction fires no controller event: refresh the published queue ourselves.
+        if (!removed) updateState(controller)
+    }
+
     // ---- Streaming routing ----
 
     override suspend fun playTrack(track: Track): StreamRoutingResult {

@@ -3,7 +3,6 @@ package com.stash.feature.library.allsongs
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.provider.DocumentsContract
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -33,7 +32,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.io.FileNotFoundException
 import javax.inject.Inject
 
 @HiltViewModel
@@ -42,6 +40,7 @@ class AllSongsViewModel @Inject constructor(
     private val dao: ScannedSongDao,
     private val scanner: AllSongsScanner,
     private val player: PlayerRepository,
+    private val covers: ScannedCoverStore,
 ) : ViewModel() {
 
     val folders: StateFlow<List<ScanFolderEntity>> = dao.observeFolders()
@@ -56,7 +55,7 @@ class AllSongsViewModel @Inject constructor(
 
     /** The list as shown: searched, then sorted. Play, shuffle and selection all act on this. */
     val songs: StateFlow<List<Track>> = combine(dao.observeSongs(), _sortOrder, _query) { rows, order, q ->
-        sortAndFilter(rows, order, q).map { it.toTrack() }
+        sortAndFilter(rows, order, q).map { it.toTrack(covers) }
     }
         .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -84,6 +83,11 @@ class AllSongsViewModel @Inject constructor(
 
     fun setQuery(query: String) {
         _query.value = query
+    }
+
+    /** A line for the status text (the screen's own messages, like a capped Share). */
+    fun say(message: String) {
+        _status.value = message
     }
 
     fun rescan() {
@@ -197,8 +201,8 @@ class AllSongsViewModel @Inject constructor(
     fun playNext(tracks: List<Track>) {
         if (tracks.isEmpty()) return
         viewModelScope.launch {
-            tracks.asReversed().forEach { player.addNext(it) }
-            _status.value = "Playing ${tracks.size} next"
+            val queued = tracks.asReversed().count { player.addNext(it) }
+            if (queued > 0) _status.value = "Playing $queued next"
         }
     }
 
@@ -210,36 +214,40 @@ class AllSongsViewModel @Inject constructor(
     }
 
     /**
-     * Deletes the files themselves, then their rows. A file that is already gone loses its row too;
-     * one that can't be deleted (no write access) keeps it and is counted in the status.
+     * Deletes the files themselves, then their rows, then takes them out of the queue. A file that is
+     * already gone loses its row too; one that can't be deleted (no write access) keeps it and is
+     * counted in the status. The files and rows go under the scan lock: a scan that listed a file
+     * before it was deleted must not insert its row afterwards.
      */
     fun deleteSongs(tracks: List<Track>) {
+        if (tracks.isEmpty()) return
         viewModelScope.launch {
-            val deleted = ArrayList<String>()
+            _status.value = "Deleting ${tracks.size}..."
+            val gone = ArrayList<Track>()
             var failed = 0
-            withContext(Dispatchers.IO) {
-                for (track in tracks) {
-                    val uri = track.filePath?.let(Uri::parse) ?: continue
-                    try {
-                        if (DocumentsContract.deleteDocument(context.contentResolver, uri)) {
-                            deleted.add(uri.toString())
-                        } else {
+            scanMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    for (track in tracks) {
+                        val path = track.filePath
+                        if (path == null) {
                             failed++
+                            continue
                         }
-                    } catch (e: FileNotFoundException) {
-                        deleted.add(uri.toString())
-                    } catch (e: Exception) {
-                        failed++
+                        when (scanner.deleteFile(path)) {
+                            FileDeletion.DELETED, FileDeletion.GONE -> gone.add(track)
+                            FileDeletion.FAILED -> failed++
+                        }
                     }
                 }
+                gone.mapNotNull { it.filePath }.chunked(500).forEach { dao.deleteByUrisAnyFolder(it) }
             }
-            deleted.chunked(500).forEach { dao.deleteByUrisAnyFolder(it) }
-            scanMutex.withLock { scanner.sweepArt() }
+            player.evictFromQueue(gone.mapTo(HashSet()) { it.id })
             _status.value = if (failed > 0) {
-                "Couldn't delete $failed file(s). Add the folder again to allow deleting."
+                "Deleted ${gone.size}. Couldn't delete $failed (add the folder again to allow deleting)."
             } else {
-                "Deleted ${deleted.size} file(s)"
+                "Deleted ${gone.size}"
             }
+            scanMutex.withLock { scanner.sweepArt() }
         }
     }
 
@@ -286,7 +294,7 @@ class AllSongsViewModel @Inject constructor(
  * Search matches title, artist or album. "Recently added" is by the file's modified time (what
  * "new on this phone" means for files that were already there), else the day it was first found.
  */
-private fun sortAndFilter(rows: List<ScannedSongEntity>, order: SortOrder, query: String): List<ScannedSongEntity> {
+internal fun sortAndFilter(rows: List<ScannedSongEntity>, order: SortOrder, query: String): List<ScannedSongEntity> {
     val q = query.trim()
     val matched = if (q.isEmpty()) {
         rows
@@ -306,7 +314,7 @@ private fun sortAndFilter(rows: List<ScannedSongEntity>, order: SortOrder, query
 }
 
 /** A scanned row as the player's Track: an id in the scanned range ([scannedTrackId]), local and on disk. */
-internal fun ScannedSongEntity.toTrack(): Track = Track(
+internal fun ScannedSongEntity.toTrack(covers: ScannedCoverStore): Track = Track(
     id = scannedTrackId(id),
     title = title,
     artist = artist,
@@ -315,7 +323,7 @@ internal fun ScannedSongEntity.toTrack(): Track = Track(
     filePath = uri,
     fileFormat = fileFormat,
     fileSizeBytes = fileSizeBytes,
-    albumArtPath = albumArtPath?.takeIf { it.isNotEmpty() },
+    albumArtPath = albumArtPath?.takeIf { it.isNotEmpty() }?.let { covers.file(it).absolutePath },
     dateAdded = dateAdded,
     source = MusicSource.LOCAL,
     isDownloaded = true,

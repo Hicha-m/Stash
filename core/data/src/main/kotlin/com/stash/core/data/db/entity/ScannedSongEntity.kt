@@ -42,8 +42,9 @@ data class ScannedSongEntity(
     @ColumnInfo(name = "last_modified") val lastModified: Long,
     @ColumnInfo(name = "date_added") val dateAdded: Long,
     /**
-     * The embedded cover, saved under filesDir/scanned_art (songs with the same image share one file).
-     * NULL = not looked at yet (rows from before v57; the next scan fills it), "" = looked, none embedded.
+     * The embedded cover's file NAME in the scanned_art directory (songs with the same image share
+     * one file; a name, not a path, so it survives a restore or a move of the app's files).
+     * NULL = not looked at yet, or the last try failed (the next scan retries); "" = none embedded.
      */
     @ColumnInfo(name = "album_art_path") val albumArtPath: String? = null,
 )

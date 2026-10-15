@@ -21,9 +21,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import java.io.File
+import java.io.FileNotFoundException
 import java.io.IOException
-import java.security.MessageDigest
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.coroutineContext
@@ -35,6 +34,9 @@ import kotlin.coroutines.coroutineContext
  */
 data class ScanResult(val added: Int, val updated: Int, val removed: Int, val incomplete: Boolean)
 
+/** What deleting a song's file came to: [GONE] was already missing, [FAILED] (typically no write access) is still there. */
+enum class FileDeletion { DELETED, GONE, FAILED }
+
 /**
  * Walks a user-chosen SAF tree for playable audio files and syncs `scanned_songs` with it.
  * One ContentResolver query per directory (no per-file DocumentFile IPC); tag reads bounded by
@@ -45,6 +47,7 @@ class AllSongsScanner @Inject constructor(
     @ApplicationContext private val context: Context,
     private val dao: ScannedSongDao,
     private val storagePreference: StoragePreference,
+    private val covers: ScannedCoverStore,
 ) {
 
     /** The folder's name as the provider shows it. A provider query, so off the main thread. */
@@ -58,6 +61,19 @@ class AllSongsScanner @Inject constructor(
             null
         }
         name ?: tree.lastPathSegment ?: "Folder"
+    }
+
+    /** Deletes the document behind [uri]. Takes the string so callers (and their tests) need no Uri. */
+    fun deleteFile(uri: String): FileDeletion = try {
+        if (DocumentsContract.deleteDocument(context.contentResolver, Uri.parse(uri))) {
+            FileDeletion.DELETED
+        } else {
+            FileDeletion.FAILED
+        }
+    } catch (e: FileNotFoundException) {
+        FileDeletion.GONE
+    } catch (e: Exception) {
+        FileDeletion.FAILED
     }
 
     /** Stash's download folder when the user picked one (null: downloads stay in app storage). */
@@ -169,9 +185,11 @@ class AllSongsScanner @Inject constructor(
         var album: String? = null
         var duration = 0L
         var art: ByteArray? = null
+        var readOk = false
         val r = MediaMetadataRetriever()
         try {
             r.setDataSource(context, Uri.parse(f.uri))
+            readOk = true
             title = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
             artist = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
                 ?: r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST)
@@ -194,44 +212,33 @@ class AllSongsScanner @Inject constructor(
             fileSizeBytes = f.size,
             lastModified = f.lastModified,
             dateAdded = dateAdded,
-            albumArtPath = saveArt(art) ?: "",
+            // "" = no cover embedded. NULL (unreadable file, or the cover couldn't be saved) is retried next scan.
+            albumArtPath = if (readOk) covers.save(art) else null,
         )
-    }
-
-    private val artDir: File get() = File(context.filesDir, ART_DIR).also { it.mkdirs() }
-
-    /**
-     * Saves [bytes] as a cover file named by its content, so songs of one album share one file.
-     * Returns its path, or null when there is no art or it couldn't be written.
-     */
-    private fun saveArt(bytes: ByteArray?): String? {
-        if (bytes == null || bytes.isEmpty()) return null
-        return try {
-            val hash = MessageDigest.getInstance("SHA-1").digest(bytes).joinToString("") { "%02x".format(it) }
-            val file = File(artDir, "$ART_PREFIX$hash.jpg")
-            if (!file.exists()) file.writeBytes(bytes)
-            file.absolutePath
-        } catch (e: Exception) {
-            null
-        }
     }
 
     /** Rows from before covers were scanned (album_art_path NULL): look for each one's cover, once. */
     private suspend fun fillMissingArt(folderId: Long) {
+        // A row whose cover file is gone (a restore, the app's files moved) goes back to NULL.
+        val present = covers.names()
+        dao.getArtRefs(folderId).filter { it.art !in present }.map { it.id }
+            .chunked(500).forEach { dao.clearAlbumArt(it) }
+
         val sem = Semaphore(4)
         coroutineScope {
             dao.getUnarted(folderId).map { row ->
                 async {
                     sem.withPermit {
                         coroutineContext.ensureActive()
-                        val path = try {
+                        val art = try {
                             readArt(row.uri)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
-                            return@withPermit // unreadable right now: stays NULL, tried again next scan
+                            null
                         }
-                        dao.setAlbumArtPath(row.id, path ?: "")
+                        // null: unreadable right now, or the cover couldn't be saved. Stays NULL, retried next scan.
+                        if (art != null) dao.setAlbumArtPath(row.id, art)
                     }
                 }
             }.awaitAll()
@@ -242,7 +249,7 @@ class AllSongsScanner @Inject constructor(
         val r = MediaMetadataRetriever()
         try {
             r.setDataSource(context, Uri.parse(uri))
-            return saveArt(r.embeddedPicture)
+            return covers.save(r.embeddedPicture)
         } finally {
             runCatching { r.release() }
         }
@@ -254,16 +261,11 @@ class AllSongsScanner @Inject constructor(
      */
     suspend fun sweepArt() {
         withContext(Dispatchers.IO) {
-            val keep = dao.getArtPaths().toHashSet()
-            artDir.listFiles()?.forEach { f ->
-                if (f.name.startsWith(ART_PREFIX) && f.absolutePath !in keep) f.delete()
-            }
+            covers.sweep(dao.getArtPaths().toHashSet())
         }
     }
 
     private companion object {
-        const val ART_DIR = "scanned_art"
-        const val ART_PREFIX = "scanned_"
 
         val COLUMNS = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,

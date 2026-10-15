@@ -49,6 +49,7 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -110,7 +111,9 @@ fun AllSongsScreen(
     // A search that hides selected songs must not leave them selected: Delete acts on what is shown.
     LaunchedEffect(query) { selection.clear() }
     BackHandler(enabled = selection.isActive) { selection.clear() }
-    val selected = songs.filter { it.id in selection.selectedIds }
+    // derivedStateOf, not remember keyed on the ids: it re-runs when the selection changes
+    // whatever type selectedIds is.
+    val selected by remember(songs) { derivedStateOf { songs.filter { it.id in selection.selectedIds } } }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) viewModel.addFolder(uri)
@@ -243,7 +246,10 @@ fun AllSongsScreen(
                 viewModel.addToQueue(selected); selection.clear()
             }.takeIf { canQueue },
             SelectionAction("share", "Share", Icons.Default.Share) {
-                shareSongs(context, selected); selection.clear()
+                val toShare = selected.take(MAX_SHARE)
+                if (selected.size > MAX_SHARE) viewModel.say("Sharing the first $MAX_SHARE of ${selected.size}")
+                if (!shareSongs(context, toShare)) viewModel.say("Couldn't open the share sheet")
+                selection.clear()
             },
             SelectionAction("delete", "Delete", Icons.Default.Delete) {
                 confirmDelete = true
@@ -334,10 +340,16 @@ private fun titleSectionLabel(songs: List<Track>): (Int) -> String? = { index ->
     songs.getOrNull(index)?.let { fastScrollSectionLetter(it.title) }
 }
 
-/** The system share sheet with the song files themselves (a read grant rides along for the receiver). */
-private fun shareSongs(context: Context, tracks: List<Track>) {
+/** Most files one share carries: every uri rides in the intent, which the system caps at about 1 MB. */
+private const val MAX_SHARE = 500
+
+/**
+ * The system share sheet with the song files themselves (a read grant rides along for the
+ * receiver). False when there was nothing to share or no share sheet opened.
+ */
+private fun shareSongs(context: Context, tracks: List<Track>): Boolean {
     val uris = tracks.mapNotNull { it.filePath?.let(Uri::parse) }
-    if (uris.isEmpty()) return
+    if (uris.isEmpty()) return false
     val intent = if (uris.size == 1) {
         Intent(Intent.ACTION_SEND).putExtra(Intent.EXTRA_STREAM, uris[0])
     } else {
@@ -348,7 +360,7 @@ private fun shareSongs(context: Context, tracks: List<Track>) {
         uris.drop(1).forEach { clip.addItem(ClipData.Item(it)) }
     }
     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    runCatching { context.startActivity(Intent.createChooser(intent, "Share")) }
+    return runCatching { context.startActivity(Intent.createChooser(intent, "Share")) }.isSuccess
 }
 
 @Composable
