@@ -308,6 +308,16 @@ fun SettingsAudioQualityScreen(
                             onCheckedChange = flacViewModel::setAutoEnabled,
                         )
 
+                        // -- Tidal AAC when a song has no FLAC ----------------
+                        Spacer(modifier = Modifier.height(8.dp))
+                        SettingsToggleRow(
+                            title = "Tidal AAC when no FLAC",
+                            subtitle = "Plays and downloads Tidal's 320 kbps AAC when a song has " +
+                                "no lossless version. Off = Tidal is used for FLAC only.",
+                            checked = tidalAacFallback,
+                            onCheckedChange = viewModel::onTidalAacFallbackChanged,
+                        )
+
                         // -- Streaming quality block --------------------------
                         // Per-network tier for *streaming* playback (distinct
                         // from the download tier above). Save Data is the master
@@ -620,28 +630,6 @@ fun SettingsAudioQualityScreen(
                                     }
                                 }
 
-                                // -- Tidal AAC when a song has no FLAC ---------------
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    com.stash.core.ui.components.StashSwitch(
-                                        checked = tidalAacFallback,
-                                        onCheckedChange = viewModel::onTidalAacFallbackChanged,
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = "Tidal AAC when no FLAC",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                        )
-                                        Text(
-                                            text = "Plays and downloads Tidal's 320 kbps AAC when a song has " +
-                                                "no lossless version. Off = Tidal is used for FLAC only.",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
-                                }
 
                                 // -- Tidal via the user's own BitChord server -----
                                 // The second lossless rung (after Qobuz). Same
