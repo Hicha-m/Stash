@@ -497,9 +497,8 @@ class LibraryViewModel @Inject constructor(
         libraryState.copy(
             currentlyPlayingTrackId = playerState.currentTrack?.id,
         )
-    .combine(streamingPreference.enabled) { libraryState, streaming ->
+    }.combine(streamingPreference.enabled) { libraryState, streaming ->
         libraryState.copy(streamingMode = streaming)
-    }
     }.combine(artistImageDao.observeAll()) { libraryState, images ->
         // Overlay real artist photos (ArtistImageBackfillWorker output) keyed
         // by the SAME primary-artist name the Artists tab groups by. Artists

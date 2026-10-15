@@ -52,19 +52,17 @@ fun LibrarySortFilterSheet(
         add(SortOrder.MOST_PLAYED to "Most played")
         if (showDuration) add(SortOrder.DURATION to "Duration")
     }
-    val filters = listOf(
-        "All" to SourceFilter.ALL,
-        "YouTube" to SourceFilter.YOUTUBE,
-        "Spotify" to SourceFilter.SPOTIFY,
-        "FLAC" to SourceFilter.FLAC,
-        "Non-FLAC" to SourceFilter.NON_FLAC,
-        "Downloaded" to SourceFilter.DOWNLOADED,
-        "Online" to SourceFilter.ONLINE,
+    val filters = buildList {
+        add("All" to SourceFilter.ALL)
+        add("YouTube" to SourceFilter.YOUTUBE)
+        add("Spotify" to SourceFilter.SPOTIFY)
+        add("FLAC" to SourceFilter.FLAC)
+        add("Non-FLAC" to SourceFilter.NON_FLAC)
         if (showAvailabilityFilter) {
             add("Downloaded" to SourceFilter.DOWNLOADED)
             add("Online" to SourceFilter.ONLINE)
         }
-    )
+    }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Column(modifier = Modifier.padding(bottom = 28.dp)) {
