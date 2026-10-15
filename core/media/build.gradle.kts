@@ -41,6 +41,7 @@ dependencies {
 
     // Media3
     implementation(libs.media3.exoplayer)
+    implementation(libs.media3.exoplayer.dash)
     implementation(libs.media3.session)
     implementation(libs.media3.datasource)
     implementation(libs.media3.datasource.okhttp)

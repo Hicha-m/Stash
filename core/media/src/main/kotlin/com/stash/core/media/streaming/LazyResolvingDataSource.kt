@@ -156,6 +156,14 @@ class LazyResolvingDataSource(
             val next = (if (overridesRow(uri)) null else urlCache.get(trackId))
                 ?: resolveBlocking(trackId, uri)
                 ?: throw IOException("stream resolve failed for track $trackId")
+            // A DASH MPD (Tidal Hi-Res) cannot be byte-piped into the progressive
+            // extractor this source feeds. ResolveFirstMediaSource routes those to a
+            // DASH source up front; reaching here means it was bypassed (an override
+            // item, or a server configured after this item was built). The URL is
+            // cached, so the player's retry of this item builds the DASH source.
+            if (next.isDash) {
+                throw IOException("track $trackId resolved to a DASH manifest; needs a DASH media source")
+            }
             if (pin != null && !next.isSameFileAs(pin)) {
                 throw IOException(
                     "track $trackId re-resolved to another file " +
@@ -210,10 +218,7 @@ class LazyResolvingDataSource(
                 // id) falls back to the resolver inputs carried in the URI's
                 // query params — see [stashResolveUri]. An override item's
                 // params win over its row ([withRowOverride]).
-                val row = trackDao.getById(trackId)
-                val entity = (if (row != null && overridesRow(uri)) row.withIdsFrom(uri) else row)
-                    ?: entityFromUri(trackId, uri)
-                    ?: return@withTimeout null
+                val entity = placeholderEntity(trackDao, trackId, uri) ?: return@withTimeout null
                 resolver.resolve(entity, allowYouTube = true, allowYtDlp = true)
             }
         }?.also { if (!overridesRow(uri)) urlCache.put(trackId, it) }
@@ -221,36 +226,7 @@ class LazyResolvingDataSource(
         throw IOException("stream resolve deadline (${resolveDeadlineMs}ms) for track $trackId", e)
     }
 
-    private fun overridesRow(uri: Uri): Boolean = uri.getQueryParameter(ROW_OVERRIDE_PARAM) == "1"
-
-    /** The row, with the recording ids and length the override URI names. */
-    private fun TrackEntity.withIdsFrom(uri: Uri): TrackEntity = copy(
-        youtubeId = uri.getQueryParameter("yt") ?: youtubeId,
-        isrc = uri.getQueryParameter("isrc") ?: isrc,
-        durationMs = uri.getQueryParameter("d")?.toLongOrNull() ?: durationMs,
-    )
-
-    /**
-     * Rebuilds a resolver-input [TrackEntity] from the placeholder URI's query
-     * params. Null when the URI carries neither a youtubeId nor a
-     * title+artist pair — nothing the resolver chain could look up.
-     */
-    private fun entityFromUri(trackId: Long, uri: Uri): TrackEntity? {
-        val youtubeId = uri.getQueryParameter("yt")
-        val title = uri.getQueryParameter("t").orEmpty()
-        val artist = uri.getQueryParameter("a").orEmpty()
-        if (youtubeId == null && (title.isBlank() || artist.isBlank())) return null
-        return TrackEntity(
-            id = trackId,
-            title = title,
-            artist = artist,
-            album = uri.getQueryParameter("al").orEmpty(),
-            durationMs = uri.getQueryParameter("d")?.toLongOrNull() ?: 0L,
-            isrc = uri.getQueryParameter("isrc"),
-            youtubeId = youtubeId,
-            isStreamable = true,
-        )
-    }
+    private fun overridesRow(uri: Uri): Boolean = isRowOverride(uri)
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
         active?.read(buffer, offset, length) ?: throw IOException("read before open")
@@ -270,4 +246,47 @@ class LazyResolvingDataSource(
          */
         const val RESOLVE_DEADLINE_MS = 45_000L
     }
+}
+
+/** True for a [withRowOverride] placeholder. */
+internal fun isRowOverride(uri: Uri): Boolean = uri.getQueryParameter(ROW_OVERRIDE_PARAM) == "1"
+
+/**
+ * The resolver input for placeholder [uri]: the Room row (with an override's ids
+ * applied, [withRowOverride]), else an entity rebuilt from the URI's query params.
+ * Shared by [LazyResolvingDataSource] and [ResolveFirstMediaSource].
+ */
+internal suspend fun placeholderEntity(trackDao: TrackDao, trackId: Long, uri: Uri): TrackEntity? {
+    val row = trackDao.getById(trackId)
+    return (if (row != null && isRowOverride(uri)) row.withIdsFrom(uri) else row)
+        ?: entityFromUri(trackId, uri)
+}
+
+/** The row, with the recording ids and length the override URI names. */
+private fun TrackEntity.withIdsFrom(uri: Uri): TrackEntity = copy(
+    youtubeId = uri.getQueryParameter("yt") ?: youtubeId,
+    isrc = uri.getQueryParameter("isrc") ?: isrc,
+    durationMs = uri.getQueryParameter("d")?.toLongOrNull() ?: durationMs,
+)
+
+/**
+ * Rebuilds a resolver-input [TrackEntity] from the placeholder URI's query
+ * params. Null when the URI carries neither a youtubeId nor a
+ * title+artist pair — nothing the resolver chain could look up.
+ */
+private fun entityFromUri(trackId: Long, uri: Uri): TrackEntity? {
+    val youtubeId = uri.getQueryParameter("yt")
+    val title = uri.getQueryParameter("t").orEmpty()
+    val artist = uri.getQueryParameter("a").orEmpty()
+    if (youtubeId == null && (title.isBlank() || artist.isBlank())) return null
+    return TrackEntity(
+        id = trackId,
+        title = title,
+        artist = artist,
+        album = uri.getQueryParameter("al").orEmpty(),
+        durationMs = uri.getQueryParameter("d")?.toLongOrNull() ?: 0L,
+        isrc = uri.getQueryParameter("isrc"),
+        youtubeId = youtubeId,
+        isStreamable = true,
+    )
 }

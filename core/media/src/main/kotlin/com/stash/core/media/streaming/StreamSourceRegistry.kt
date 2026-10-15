@@ -31,6 +31,9 @@ import javax.inject.Singleton
  *      in for one). Primary lossless source: plain Range-seekable FLAC, no proxy
  *      operator and no client-side decrypt, so it's the fastest path.
  *      Foreground-only (allowYtDlp) since it spends that account's quota.
+ *   1b. [TidalStreamResolver]  — Tidal lossless through the user's self-hosted
+ *      BitChord server (progressive FLAC or a DASH MPD). Same gates as qbdlx;
+ *      inert until a server is set in Settings.
  *   PARKED (2026-07-01, hosts down for us — commented out of the chain in
  *   [resolve], kept for re-enablement): [KennyyStreamResolver] (`kennyy.com.br`),
  *   [QobuzStreamResolver] (`qobuz.squid.wtf`).
@@ -69,6 +72,8 @@ class StreamSourceRegistry internal constructor(
     resolveDispatcher: CoroutineDispatcher,
     /** The diagnostics bundle's "Recent resolves". A fresh, unshared one in hand-built tests. */
     private val diagnosticsLog: PlaybackDiagnosticsLog = PlaybackDiagnosticsLog(),
+    /** Tidal via the user's BitChord server; null in hand-built tests (rung absent). */
+    private val tidal: TidalStreamResolver? = null,
 ) {
     @Inject
     constructor(
@@ -81,9 +86,10 @@ class StreamSourceRegistry internal constructor(
         losslessSourceHealth: LosslessSourceHealth,
         losslessPrefs: LosslessSourcePreferences,
         diagnosticsLog: PlaybackDiagnosticsLog,
+        tidal: TidalStreamResolver,
     ) : this(
         kennyy, qobuz, qbdlx, jiosaavn, youtube, streamingPreference,
-        losslessSourceHealth, losslessPrefs, Dispatchers.IO, diagnosticsLog,
+        losslessSourceHealth, losslessPrefs, Dispatchers.IO, diagnosticsLog, tidal,
     )
     /**
      * Try each resolver in priority order; return the first non-null
@@ -244,6 +250,14 @@ class StreamSourceRegistry internal constructor(
                 // / relay); no build gate.
                 if (allowYtDlp && lossless) {
                     add("qbdlx" to qbdlx::resolve)
+                }
+                // Tidal via the user's own BitChord server — the second lossless
+                // rung, for what Qobuz misses. Same gates as qbdlx (foreground only,
+                // Lossless switch on): it spends one person's Tidal account. Off
+                // (returns null at once) when no server is configured.
+                val tidalRung = tidal
+                if (allowYtDlp && lossless && tidalRung != null) {
+                    add("tidal" to { t: TrackEntity -> tidalRung.resolve(t) })
                 }
                 // AAC 320 fallback (96 under Save Data). Foreground/next-up only: a
                 // speculative full-queue fill must not turn into one metadata

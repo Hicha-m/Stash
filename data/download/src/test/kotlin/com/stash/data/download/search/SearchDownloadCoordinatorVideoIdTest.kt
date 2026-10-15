@@ -83,6 +83,7 @@ class SearchDownloadCoordinatorVideoIdTest {
         context = context,
         losslessPrefs = losslessPrefs,
         jioSaavnResolver = jioSaavnResolver,
+        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any()) } returns null },
         losslessUrlDownloader = losslessUrlDownloader,
         audioDurationExtractor = audioDurationExtractor,
         downloadQueueDao = downloadQueueDao,

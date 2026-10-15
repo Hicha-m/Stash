@@ -100,6 +100,7 @@ class StashPlaybackService : MediaLibraryService() {
     /** Deps for the full-timeline lazy-resolve chain (LazyResolvingDataSource). */
     @Inject lateinit var streamResolver: com.stash.core.media.streaming.StreamSourceRegistry
     @Inject lateinit var streamUrlCache: com.stash.core.media.streaming.StreamUrlCache
+    @Inject lateinit var tidalStreamResolver: com.stash.core.media.streaming.TidalStreamResolver
 
 
     /**
@@ -577,6 +578,9 @@ class StashPlaybackService : MediaLibraryService() {
             resolver = streamResolver,
             urlCache = streamUrlCache,
             trackDao = trackDao,
+            // Tidal may answer with a DASH MPD, so with a server set placeholders
+            // resolve before their media source is chosen.
+            resolveBeforeSourcePick = tidalStreamResolver::enabledHint,
         )
         this.mediaSourceFactory = mediaSourceFactory
 

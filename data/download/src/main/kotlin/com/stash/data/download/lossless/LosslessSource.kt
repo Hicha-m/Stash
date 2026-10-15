@@ -219,6 +219,12 @@ data class SourceResult(
      * client-side as needed.
      */
     val coverArtUrl: String? = null,
+
+    /**
+     * True when [downloadUrl] is a DASH manifest (Tidal) rather than the file
+     * itself; [LosslessUrlDownloader] then fetches the segments and remuxes.
+     */
+    val isDash: Boolean = false,
 )
 
 /**

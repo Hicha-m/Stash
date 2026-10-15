@@ -93,6 +93,10 @@ fun SettingsAudioQualityScreen(
     val customEndpoint by viewModel.customEndpoint.collectAsStateWithLifecycle()
     val customEndpointError by viewModel.customEndpointError.collectAsStateWithLifecycle()
     val customEndpointTest by viewModel.customEndpointTest.collectAsStateWithLifecycle()
+    val bitchordEndpoint by viewModel.bitchordEndpoint.collectAsStateWithLifecycle()
+    val bitchordEndpointError by viewModel.bitchordEndpointError.collectAsStateWithLifecycle()
+    val bitchordHasToken by viewModel.bitchordHasToken.collectAsStateWithLifecycle()
+    val tidalAacFallback by viewModel.tidalAacFallback.collectAsStateWithLifecycle()
     val flacViewModel: FlacUpgradeViewModel = hiltViewModel()
     val autoFlacUpgrade by flacViewModel.autoEnabled.collectAsStateWithLifecycle()
 
@@ -302,6 +306,16 @@ fun SettingsAudioQualityScreen(
                                 "Library Health.",
                             checked = autoFlacUpgrade,
                             onCheckedChange = flacViewModel::setAutoEnabled,
+                        )
+
+                        // -- Tidal AAC when a song has no FLAC ----------------
+                        Spacer(modifier = Modifier.height(8.dp))
+                        SettingsToggleRow(
+                            title = "Tidal AAC when no FLAC",
+                            subtitle = "Plays and downloads Tidal's 320 kbps AAC when a song has " +
+                                "no lossless version. Off = Tidal is used for FLAC only.",
+                            checked = tidalAacFallback,
+                            onCheckedChange = viewModel::onTidalAacFallbackChanged,
                         )
 
                         // -- Streaming quality block --------------------------
@@ -615,6 +629,91 @@ fun SettingsAudioQualityScreen(
                                         SettingsViewModel.EndpointTestState.IDLE -> Unit
                                     }
                                 }
+
+
+                                // -- Tidal via the user's own BitChord server -----
+                                // The second lossless rung (after Qobuz). Same
+                                // commit-on-Done / focus-loss rule as the endpoint
+                                // above: a half-typed base must never be stored.
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    text = "Optional: use your own BitChord server for Tidal " +
+                                        "instead of Stash's. Leave blank otherwise.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                var bitchordDraft by rememberSaveable(bitchordEndpoint) {
+                                    mutableStateOf(bitchordEndpoint.orEmpty())
+                                }
+                                LaunchedEffect(Unit) { viewModel.onBitchordEndpointEdited() }
+                                var bitchordWasFocused by remember { mutableStateOf(false) }
+                                val commitBitchord = {
+                                    val draft = bitchordDraft.trim()
+                                    if (draft != bitchordEndpoint.orEmpty()) {
+                                        viewModel.onBitchordEndpointCommitted(draft)
+                                    }
+                                }
+                                OutlinedTextField(
+                                    value = bitchordDraft,
+                                    onValueChange = {
+                                        bitchordDraft = it
+                                        viewModel.onBitchordEndpointEdited()
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .onFocusChanged { state ->
+                                            if (bitchordWasFocused && !state.isFocused) commitBitchord()
+                                            bitchordWasFocused = state.isFocused
+                                        },
+                                    label = { Text("Custom Tidal server (optional)") },
+                                    singleLine = true,
+                                    isError = bitchordEndpointError != null,
+                                    placeholder = { Text("https://…") },
+                                    keyboardOptions = KeyboardOptions(
+                                        keyboardType = KeyboardType.Uri,
+                                        imeAction = ImeAction.Done,
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onDone = {
+                                            commitBitchord()
+                                            focusManager.clearFocus()
+                                        },
+                                    ),
+                                )
+                                bitchordEndpointError?.let { err ->
+                                    Text(
+                                        text = err,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                // Write-only: a stored token is never shown back,
+                                // only that one is set. Blank + Done clears it.
+                                var tokenDraft by remember { mutableStateOf("") }
+                                OutlinedTextField(
+                                    value = tokenDraft,
+                                    onValueChange = { tokenDraft = it },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    label = { Text("Access token (optional)") },
+                                    supportingText = {
+                                        Text(if (bitchordHasToken) "A token is saved" else "Only if your own server sets ACCESS_TOKEN")
+                                    },
+                                    singleLine = true,
+                                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                    keyboardOptions = KeyboardOptions(
+                                        keyboardType = KeyboardType.Password,
+                                        imeAction = ImeAction.Done,
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onDone = {
+                                            viewModel.onBitchordTokenCommitted(tokenDraft)
+                                            tokenDraft = ""
+                                            focusManager.clearFocus()
+                                        },
+                                    ),
+                                )
 
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Text(

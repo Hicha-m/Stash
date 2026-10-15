@@ -117,6 +117,7 @@ class DownloadManager @Inject constructor(
     private val losslessUrlDownloader: LosslessUrlDownloader,
     private val losslessPrefs: LosslessSourcePreferences,
     private val jioSaavnResolver: JioSaavnResolver,
+    private val tidalAacResolver: com.stash.data.download.lossless.tidal.TidalAacResolver,
     private val trackFinalizer: TrackFinalizer,
     private val loudnessMeasurer: com.stash.core.data.audio.LoudnessMeasurer,
     private val metadataEmbedder: MetadataEmbedder,
@@ -343,6 +344,9 @@ class DownloadManager @Inject constructor(
                             "for '${track.artist} - ${track.title}'",
                     )
                 } else {
+                    // Tidal AAC has its own switch ("Tidal AAC when no FLAC"), so it
+                    // still runs with the YouTube fallback off; nothing else lossy does.
+                    if (losslessPrefs.enabledNow()) tryTidalAacDownload(track)?.let { return it }
                     Log.i(
                         TAG,
                         "deferring '${track.artist} - ${track.title}': lossless unavailable, fallback off",
@@ -356,6 +360,13 @@ class DownloadManager @Inject constructor(
         // deliberately outside the lossless registry: AAC is lossy, and must
         // never satisfy a strict-lossless request. If strict fallback is off,
         // the branch above already returned Deferred before reaching here.
+        // Step 0: Tidal's 320 kbps AAC, only once the lossless rung ran and missed
+        // (lossless on); JioSaavn misses many of these tracks. Lossless off =
+        // unchanged chain. The resolver itself checks the user's switch.
+        if (losslessPrefs.enabledNow()) {
+            val tidalAacResult = tryTidalAacDownload(track)
+            if (tidalAacResult != null) return tidalAacResult
+        }
         val jioSaavnResult = tryJioSaavnDownload(track)
         if (jioSaavnResult != null) return jioSaavnResult
 
@@ -569,8 +580,43 @@ class DownloadManager @Inject constructor(
             null
         } ?: return null
 
+        return downloadLossyAac(track, match, label = "JioSaavn", tempPrefix = "jiosaavn")
+    }
+
+    /** Tidal's 320 kbps AAC ([TidalAacResolver]); fetched and checked exactly like JioSaavn. */
+    internal suspend fun tryTidalAacDownload(track: Track): TrackDownloadResult? {
+        val query = TrackQuery(
+            artist = track.artist,
+            title = track.title,
+            album = track.album.takeIf { it.isNotBlank() },
+            isrc = track.isrc,
+            durationMs = track.durationMs.takeIf { it > 0 },
+            explicit = track.explicit,
+            trackId = track.id,
+        )
+        val match = try {
+            tidalAacResolver.resolve(query)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Log.w(TAG, "Tidal AAC resolve failed for '${track.artist} - ${track.title}'", error)
+            null
+        } ?: return null
+        return downloadLossyAac(track, match, label = "Tidal", tempPrefix = "tidalaac")
+    }
+
+    /**
+     * Fetches an AAC [match] to a temp .m4a, checks codec/bitrate/duration, and
+     * finalizes it. Shared by JioSaavn and Tidal AAC; null = try the next rung.
+     */
+    private suspend fun downloadLossyAac(
+        track: Track,
+        match: SourceResult,
+        label: String,
+        tempPrefix: String,
+    ): TrackDownloadResult? {
         emitProgress(track.id, 0.1f, DownloadStatus.DOWNLOADING)
-        val tempFile = File(fileOrganizer.getTempDir(), "jiosaavn_${track.id}_${attemptTag()}.m4a")
+        val tempFile = File(fileOrganizer.getTempDir(), "${tempPrefix}_${track.id}_${attemptTag()}.m4a")
         val fetched = losslessUrlDownloader.download(
             source = match,
             destination = tempFile,
@@ -580,11 +626,11 @@ class DownloadManager @Inject constructor(
             },
         ).getOrElse { error ->
             if (error is kotlinx.coroutines.CancellationException) throw error
-            Log.w(TAG, "JioSaavn fetch failed for '${track.artist} - ${track.title}': ${error.message}")
+            Log.w(TAG, "$label fetch failed for '${track.artist} - ${track.title}': ${error.message}")
             runCatching { tempFile.delete() }
             return null
         }
-        if (!acceptBeforeCommit(fetched, track, "JioSaavn")) return null
+        if (!acceptBeforeCommit(fetched, track, label)) return null
 
         val metadata = audioDurationExtractor.extract(fetched.absolutePath)
         val durationTolerance = maxOf(
@@ -599,7 +645,7 @@ class DownloadManager @Inject constructor(
         if (!codecValid || !bitrateValid || !durationValid) {
             Log.w(
                 TAG,
-                "JioSaavn media rejected for '${track.artist} - ${track.title}': " +
+                "$label media rejected for '${track.artist} - ${track.title}': " +
                     "format=${metadata?.format}, bitrate=${metadata?.bitrateKbps} " +
                     "(asked ${match.format.bitrateKbps}), " +
                     "duration=${metadata?.durationMs}, expected=${track.durationMs}",
@@ -620,7 +666,7 @@ class DownloadManager @Inject constructor(
             is TrackFinalizer.FinalizeResult.Success -> {
                 Log.i(
                     TAG,
-                    "JioSaavn AAC downloaded: ${effectiveTrack.artist} - ${effectiveTrack.title} " +
+                    "$label AAC downloaded: ${effectiveTrack.artist} - ${effectiveTrack.title} " +
                         "-> ${finalized.committed.filePath}",
                 )
                 match.coverArtUrl?.let { url ->
@@ -632,7 +678,7 @@ class DownloadManager @Inject constructor(
                             trackDao.updateAlbumArtUrl(effectiveTrack.id, url)
                         }
                     }.onFailure { error ->
-                        Log.w(TAG, "JioSaavn album-art update failed for ${effectiveTrack.id}: ${error.message}")
+                        Log.w(TAG, "$label album-art update failed for ${effectiveTrack.id}: ${error.message}")
                     }
                 }
                 loudnessMeasurer.measureAndPersistInBackground(
@@ -646,7 +692,7 @@ class DownloadManager @Inject constructor(
                 TrackDownloadResult.Success(finalized.committed.filePath)
             }
             is TrackFinalizer.FinalizeResult.Failed -> {
-                Log.w(TAG, "JioSaavn finalize failed for ${track.id}: ${finalized.message}")
+                Log.w(TAG, "$label finalize failed for ${track.id}: ${finalized.message}")
                 runCatching { fetched.delete() }
                 null
             }
