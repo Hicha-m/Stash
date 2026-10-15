@@ -49,13 +49,10 @@ internal fun lyricsBodyFor(state: LyricsViewState): LyricsBody = when (state) {
 
 /** The lyrics menu's items for the current state (the "Live line" switch is always there). */
 internal data class LyricsMenuItems(
-    /**
-     * Offset: synced lyrics with somewhere to keep an offset: the song's lyrics row, or the output
-     * playing now (so a stream, which has no row, can still calibrate the headphones).
-     */
     val offset: Boolean,
-    /** Save with song file: a downloaded track with lyrics on screen. */
     val saveToFile: Boolean,
+    /** Get word-synced lyrics: stored lyrics that aren't word-synced yet. */
+    val wordSynced: Boolean = false,
 )
 
 internal fun lyricsMenuItemsFor(
@@ -63,9 +60,13 @@ internal fun lyricsMenuItemsFor(
     offsetMs: Long?,
     canSaveToFile: Boolean,
     outputKnown: Boolean = false,
+    /** A library track (a stream has no row to upgrade) with Apple in the source chain. */
+    canGetWordSynced: Boolean = false,
 ): LyricsMenuItems = LyricsMenuItems(
     offset = state is LyricsViewState.Synced && (offsetMs != null || outputKnown),
     saveToFile = canSaveToFile && (state is LyricsViewState.Synced || state is LyricsViewState.Plain),
+    wordSynced = canGetWordSynced &&
+        ((state is LyricsViewState.Synced && state.syllables == null) || state is LyricsViewState.Plain),
 )
 
 /** Side padding of the lyric column, the same 24dp margin the rest of Now Playing keeps. */

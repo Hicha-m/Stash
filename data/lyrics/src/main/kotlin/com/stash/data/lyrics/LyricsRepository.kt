@@ -28,11 +28,16 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import java.io.InterruptedIOException
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** Outcome of [LyricsRepository.upgradeToTtml]. Only UPGRADED changes stored lyrics. */
-enum class TtmlUpgradeResult { UPGRADED, NO_TTML, FAILED, RATE_LIMITED, SKIPPED }
+/**
+ * Outcome of [LyricsRepository.upgradeToTtml]. Only UPGRADED changes stored lyrics.
+ * NOT_READY: the live lookup timed out (the server keeps working and caches, so a retry
+ * shortly after usually hits the cache). PAUSED: the skip window is open.
+ */
+enum class TtmlUpgradeResult { UPGRADED, NO_TTML, FAILED, RATE_LIMITED, SKIPPED, NOT_READY, PAUSED }
 
 /** Outcome of [LyricsRepository.fetchLyricsNow] (manual "fetch lyrics" run). */
 enum class ManualFetchResult { FETCHED, NOT_FOUND, FAILED, SKIPPED }
@@ -349,16 +354,22 @@ class LyricsRepository @Inject constructor(
      * - source threw -> NOTHING written, stays pending -> FAILED (RATE_LIMITED for an HTTP 429)
      * - no row / already TTML / instrumental / source not in chain -> SKIPPED
      */
-    suspend fun upgradeToTtml(trackId: Long): TtmlUpgradeResult {
+    suspend fun upgradeToTtml(
+        trackId: Long,
+        /** False for a single-track tap: only the library-wide pass moves its own resume point. */
+        moveCursor: Boolean = true,
+        /** True when someone is watching: 4s timeout, no retry (see AppleTtmlLyricsSource). */
+        interactive: Boolean = false,
+    ): TtmlUpgradeResult {
         // First, before the network, so a kill mid-request still moves the next run on.
-        lyricsPreference.setTtmlUpgradeCursor(trackId)
+        if (moveCursor) lyricsPreference.setTtmlUpgradeCursor(trackId)
         if (lyricsPreference.sourcePreference.first() == LyricsSourcePreference.LRC_ONLY) {
             return TtmlUpgradeResult.SKIPPED
         }
         val apple = sources.firstOrNull { it.id == AppleTtmlLyricsSource.SOURCE_ID }
             ?: return TtmlUpgradeResult.SKIPPED
-        val existing = lyricsDao.get(trackId) ?: return TtmlUpgradeResult.SKIPPED
-        if (existing.ttml != null || existing.instrumental) return TtmlUpgradeResult.SKIPPED
+        val before = lyricsDao.get(trackId) ?: return TtmlUpgradeResult.SKIPPED
+        if (before.ttml != null || before.instrumental) return TtmlUpgradeResult.SKIPPED
         val track = trackDao.getById(trackId) ?: return TtmlUpgradeResult.SKIPPED
 
         val query = LyricsQuery(
@@ -369,44 +380,57 @@ class LyricsRepository @Inject constructor(
             albumArtist = track.albumArtist.ifBlank { null },
             durationMs = track.durationMs.takeIf { it > 0 },
             youtubeVideoId = track.youtubeId,
+            interactive = interactive,
         )
         val result = try {
             apple.resolve(query)
         } catch (e: CancellationException) {
             throw e
+        } catch (e: AppleTtmlLyricsSource.AppleSkippedException) {
+            return TtmlUpgradeResult.PAUSED
         } catch (e: Exception) {
             Log.w(TAG, "TTML upgrade failed for trackId=$trackId", e)
-            val rateLimited = (e as? AppleTtmlLyricsSource.HttpStatusException)?.code == 429
-            return if (rateLimited) TtmlUpgradeResult.RATE_LIMITED else TtmlUpgradeResult.FAILED
+            return when {
+                (e as? AppleTtmlLyricsSource.HttpStatusException)?.code == 429 -> TtmlUpgradeResult.RATE_LIMITED
+                e is InterruptedIOException -> TtmlUpgradeResult.NOT_READY
+                else -> TtmlUpgradeResult.FAILED
+            }
         }
 
-        val now = clock.now()
-        if (result == null) {
-            lyricsDao.markTtmlChecked(trackId, now)
-            return TtmlUpgradeResult.NO_TTML
+        // The lookup can take a while: re-read the row under the per-track write lock and write
+        // from THAT, so an offset (or anything else) changed meanwhile is kept, and a concurrent
+        // writer that already stored TTML wins. Not cancellable half-way, as in resolveAndStore.
+        return withContext(NonCancellable) {
+            writeLock(trackId).withLock {
+                val current = lyricsDao.get(trackId) ?: return@withLock TtmlUpgradeResult.SKIPPED
+                if (current.ttml != null || current.instrumental) return@withLock TtmlUpgradeResult.SKIPPED
+                val now = clock.now()
+                if (result == null) {
+                    lyricsDao.markTtmlChecked(trackId, now)
+                    return@withLock TtmlUpgradeResult.NO_TTML
+                }
+                val entity = LyricsEntity(
+                    trackId = trackId,
+                    plainText = result.plainText,
+                    syncedLrc = result.syncedLrc,
+                    instrumental = false,
+                    language = result.language ?: current.language,
+                    source = result.sourceId,
+                    sourceLyricsId = result.sourceLyricsId,
+                    fetchedAt = now,
+                    ttml = result.ttml,
+                    ttmlCheckedAt = now,
+                    syncOffsetMs = current.syncOffsetMs,
+                )
+                lyricsDao.upsert(entity)
+                trackDao.setLyricsFetchedAt(trackId, now)
+                if (track.filePath != null) {
+                    runCatching { sidecarWriter.write(trackId, entity) }
+                        .onFailure { e -> Log.w(TAG, "Sidecar rewrite failed for trackId=$trackId", e) }
+                }
+                TtmlUpgradeResult.UPGRADED
+            }
         }
-        val entity = LyricsEntity(
-            trackId = trackId,
-            plainText = result.plainText,
-            syncedLrc = result.syncedLrc,
-            instrumental = false,
-            language = result.language ?: existing.language,
-            source = result.sourceId,
-            sourceLyricsId = result.sourceLyricsId,
-            fetchedAt = now,
-            ttml = result.ttml,
-            ttmlCheckedAt = now,
-            syncOffsetMs = existing.syncOffsetMs,
-        )
-        lyricsDao.upsert(entity)
-        trackDao.setLyricsFetchedAt(trackId, now)
-        if (track.filePath != null) {
-            // existing != null above means this is never a "new" fetch — the writer keeps whatever
-            // .lrc was already there and adds/refreshes the .ttml beside it.
-            runCatching { sidecarWriter.write(trackId, entity) }
-                .onFailure { e -> Log.w(TAG, "Sidecar rewrite failed for trackId=$trackId", e) }
-        }
-        return TtmlUpgradeResult.UPGRADED
     }
 
     /** Null when no row exists yet (never fetched) — callers treat that as "no offset set". */

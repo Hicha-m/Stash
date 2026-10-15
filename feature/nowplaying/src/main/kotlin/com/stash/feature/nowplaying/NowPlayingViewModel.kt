@@ -9,6 +9,8 @@ import androidx.palette.graphics.Palette
 import com.stash.core.data.lossless.LosslessUpgrader
 import com.stash.core.data.prefs.NowPlayingAction
 import com.stash.core.data.prefs.NowPlayingPreference
+import com.stash.core.data.prefs.LyricsSourcePreference
+import com.stash.data.lyrics.TtmlUpgradeResult
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.media.PlayerRepository
 import com.stash.core.media.SleepTimerController
@@ -1255,6 +1257,58 @@ class NowPlayingViewModel @Inject constructor(
             true -> fetchLibraryLyrics(track, force = true)
             false -> fetchStreamingLyrics(track, fresh = true)
             null -> Unit // Room hasn't answered for this track yet (a few ms): the trigger will
+        }
+    }
+
+    /** Track id with a word-synced lookup in flight: the double-tap guard, and the menu row's "Looking…". */
+    private val _upgradingLyricsTrackId = MutableStateFlow<Long?>(null)
+    val upgradingLyricsTrackId: StateFlow<Long?> = _upgradingLyricsTrackId.asStateFlow()
+
+    /** False under the LRC-only setting: Apple is never asked, so the menu hides the action. */
+    val appleLyricsEnabled: StateFlow<Boolean> = lyricsPreference.sourcePreference
+        .map { it != LyricsSourcePreference.LRC_ONLY }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), true)
+
+    /**
+    * Get Apple's word-synced version of the playing track's stored lyrics: the library-wide
+    * upgrade, for this one song. Library tracks only. One lookup at a time: each live timeout
+    * counts toward the source's app-wide skip window.
+    */
+    fun getWordSyncedLyricsForCurrentTrack() {
+        val state = _uiState.value
+        val track = state.currentTrack ?: return
+        if (state.currentTrackStored != true) return
+        if (!_upgradingLyricsTrackId.compareAndSet(expect = null, update = track.id)) return
+        launchUserAction {
+            try {
+                _userMessages.tryEmit("Looking for word-synced lyrics\u2026")
+                val message = if (lyricsRepository.get(track.id) == null) {
+                    // No row: a miss stamps 0, anything else is "not fetched yet".
+                    if (lyricsRepository.observeFetchedAt(track.id).first() == 0L) {
+                        "No lyrics found for this song"
+                    } else {
+                        "Lyrics aren't loaded yet, try again from the lyrics view"
+                    }
+                } else {
+                    when (lyricsRepository.upgradeToTtml(track.id, moveCursor = false, interactive = true)) {
+                        TtmlUpgradeResult.UPGRADED -> "Word-synced lyrics added"
+                        TtmlUpgradeResult.NO_TTML -> "No word-synced lyrics available for this song"
+                        TtmlUpgradeResult.NOT_READY -> "Word-synced lyrics aren't ready yet. Try again in a minute"
+                        TtmlUpgradeResult.PAUSED -> "Word-synced lyrics are paused for a few minutes after repeated timeouts"
+                        TtmlUpgradeResult.RATE_LIMITED -> "Apple lyrics are rate-limiting, try again later"
+                        TtmlUpgradeResult.FAILED -> "Couldn't get word-synced lyrics"
+                        TtmlUpgradeResult.SKIPPED -> "Nothing to upgrade for this song"
+                    }
+                }
+                val suffix = if (_uiState.value.currentTrack?.id != track.id) " for '${track.title}'" else ""
+                _userMessages.emit("$message$suffix.")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _userMessages.emit("Couldn't get word-synced lyrics.")
+            } finally {
+                _upgradingLyricsTrackId.compareAndSet(expect = track.id, update = null)
+            }
         }
     }
 

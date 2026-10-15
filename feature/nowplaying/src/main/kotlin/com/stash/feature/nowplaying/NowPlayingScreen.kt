@@ -332,6 +332,8 @@ fun NowPlayingScreen(
     val liveLyricsEnabled by viewModel.liveLyricsBarEnabled.collectAsStateWithLifecycle()
     val lyricsSyncOffsetMs by viewModel.lyricsSyncOffsetMs.collectAsStateWithLifecycle()
     val lyricsOutputOffset by viewModel.lyricsOutputOffset.collectAsStateWithLifecycle()
+    val appleLyricsEnabled by viewModel.appleLyricsEnabled.collectAsStateWithLifecycle()
+    val upgradingLyricsTrackId by viewModel.upgradingLyricsTrackId.collectAsStateWithLifecycle()
     val reading = lyricsMode && track != null
     androidx.activity.compose.BackHandler(enabled = reading) { viewModel.onDismissLyrics() }
 
@@ -983,7 +985,13 @@ fun NowPlayingScreen(
                             val headerInk = npInk()
                             val headerAccent = npAccent(uiState.vibrantColor)
                             val headerLiked = uiState.currentTrack?.stashLikedAt != null
-                            val lyricsMenuItems = lyricsMenuItemsFor(lyricsState, lyricsSyncOffsetMs, canSaveToFile = track?.isDownloaded == true, outputKnown = lyricsOutputOffset != null)
+                            val lyricsMenuItems = lyricsMenuItemsFor(
+                                    lyricsState,
+                                    lyricsSyncOffsetMs,
+                                    canSaveToFile = track?.isDownloaded == true,
+                                    outputKnown = lyricsOutputOffset != null,
+                                    canGetWordSynced = uiState.currentTrackStored == true && appleLyricsEnabled,
+                                )
                             val savingLyrics = exportingLyricsTrackId != null
                             val rise = with(LocalDensity.current) { RiseDistance.roundToPx() }
                             val headerTextEnter = remember(this@AnimatedContent, rise) {
@@ -1042,6 +1050,8 @@ fun NowPlayingScreen(
                                     onOutputOffsetChange = { viewModel.setLyricsOutputOffsetMs(it) },
                                     savingToFile = savingLyrics,
                                     onSaveToFile = { viewModel.exportLyricsForCurrentTrack() },
+                                    gettingWordSynced = upgradingLyricsTrackId != null,           // new
+                                    onGetWordSynced = { viewModel.getWordSyncedLyricsForCurrentTrack() }, // new
                                     ink = headerInk,
                                 )
                             }
