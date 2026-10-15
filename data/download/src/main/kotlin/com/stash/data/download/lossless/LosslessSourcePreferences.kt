@@ -403,6 +403,7 @@ class LosslessSourcePreferences @Inject constructor(
          */
         val DEFAULT_PRIORITY: List<String> = listOf(
             "qbdlx_qobuz",
+            "tidal_bitchord",
             "squid_qobuz",
             "kennyy_qobuz",
         )

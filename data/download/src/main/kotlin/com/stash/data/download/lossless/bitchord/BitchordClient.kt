@@ -70,6 +70,10 @@ data class BitchordStream(
     val coverArtUrl: String?,
     /** Absolute wall-clock expiry of [url], epoch-ms. */
     val expiresAtMs: Long,
+    /** Match confidence from [QobuzCandidateMatcher]; the download chain ranks on it. */
+    val confidence: Float = 0f,
+    /** Server-side id (`td:<n>`), for logs. */
+    val trackId: String? = null,
 )
 
 /**
@@ -200,6 +204,8 @@ class BitchordClient @Inject constructor(
             bitrateKbps = s.bitrate,
             coverArtUrl = track.artwork?.takeIf { it.isNotBlank() },
             expiresAtMs = expiryFor(url),
+            confidence = conf,
+            trackId = track.id,
         )
     }
 
