@@ -339,3 +339,65 @@ test("DASH manifest route passes Tidal's init URL through unchanged", async () =
     assert.equal(f.calls.length, 1); // serving the MPD does not proxy the CDN init segment
   });
 });
+
+const EDGE = { EDGE_SECRET: "e".repeat(64), EDGE_BASE: "https://tidal-edge.example.deno.net" };
+const decodeToken = (url) => JSON.parse(Buffer.from(new URL(url).pathname.split("/")[2].split(".")[0], "base64url").toString());
+
+test("?web=1 answers a DASH track with signed edge URLs and writes nothing to D1", async () => {
+  const f = fixture({ tidalResponse: async () => playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", MPD) });
+  Object.assign(f.env, EDGE);
+  await withFetch(null, f.fetchTidal, async () => {
+    const r = await worker.fetch(authorizedRequest("/stream/td:654?web=1"), f.env);
+    assert.equal(r.status, 200);
+    const b = await r.json();
+    assert.equal(b.edge, true);
+    assert.equal(b.manifest, "dash");
+    assert.match(b.url, /^https:\/\/tidal-edge\.example\.deno\.net\/t\/[\w-]+\.[\w-]+\/manifest\.mpd$/);
+    assert.match(b.download, /\/file\.flac$/);
+    assert.equal(b.sampleRate, 96000);
+    const p = decodeToken(b.download);
+    assert.equal(p.k, "d");
+    assert.equal(p.x, MPD);
+    assert.ok(p.exp > Date.now() / 1000 && p.exp <= Date.now() / 1000 + 3500);
+    assert.equal(b.expiresAt, p.exp);
+    assert.equal(f.dbWrites.filter(({ sql }) => sql.includes("tidal_dash_manifests")).length, 0);
+  });
+});
+
+test("?web=1 token signature is what the edge verifies (HMAC-SHA256 over the base64url body)", async () => {
+  const { edgeToken } = await import("../src/index.js");
+  const t = await edgeToken(EDGE.EDGE_SECRET, { v: 1, k: "p", exp: 1, u: "https://x.audio.tidal.com/a.flac" });
+  const [body, sig] = t.split(".");
+  const { createHmac } = await import("node:crypto");
+  assert.equal(sig, createHmac("sha256", EDGE.EDGE_SECRET).update(body).digest("base64url"));
+});
+
+test("?web=1 progressive FLAC uses stream.flac; a progressive .mp4 FLAC is refused", async () => {
+  const flac = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://sp-pr-cf.audio.tidal.com/a.flac?token=1~x"] });
+  const f = fixture({ tidalResponse: async () => playbackInfo("LOSSLESS", "application/vnd.tidal.bts", flac) });
+  Object.assign(f.env, EDGE);
+  await withFetch(null, f.fetchTidal, async () => {
+    const b = await (await worker.fetch(authorizedRequest("/stream/td:7?web=1"), f.env)).json();
+    assert.match(b.url, /\/stream\.flac$/);
+    assert.equal(decodeToken(b.url).u, "https://sp-pr-cf.audio.tidal.com/a.flac?token=1~x");
+  });
+  const mp4 = JSON.stringify({ mimeType: "audio/mp4", codecs: "flac", urls: ["https://sp-pr-cf.audio.tidal.com/a.mp4"] });
+  const g = fixture({ tidalResponse: async () => playbackInfo("LOSSLESS", "application/vnd.tidal.bts", mp4) });
+  Object.assign(g.env, EDGE);
+  await withFetch(null, g.fetchTidal, async () => {
+    assert.equal((await worker.fetch(authorizedRequest("/stream/td:7?web=1"), g.env)).status, 404);
+  });
+});
+
+test("?web=1 without an edge configured keeps the normal answer; no ?web keeps it too", async () => {
+  const cases = [[{}, "/stream/td:654?web=1"], [EDGE, "/stream/td:654"], [{ EDGE_SECRET: "short", EDGE_BASE: EDGE.EDGE_BASE }, "/stream/td:654?web=1"], [{ ...EDGE, EDGE_BASE: "http://evil.example" }, "/stream/td:654?web=1"]];
+  for (const [env, path] of cases) {
+    const f = fixture({ tidalResponse: async () => playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", MPD) });
+    Object.assign(f.env, env);
+    await withFetch(null, f.fetchTidal, async () => {
+      const b = await (await worker.fetch(authorizedRequest(path), f.env)).json();
+      assert.equal(b.edge, undefined);
+      assert.match(b.url, /^https:\/\/relay\.example\/dash\/td\/654\.mpd/);
+    });
+  }
+});

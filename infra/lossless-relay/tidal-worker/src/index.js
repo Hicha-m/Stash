@@ -178,6 +178,8 @@ async function stream(trackId, request, env) {
       return json({ error: "lossless_unavailable" }, 404);
     }
     if (refusedBy) await coolAccount(env, refusedBy, 3600);
+    const web = webEdge(request, env);
+    if (web) return await edgeInfo(trackId, info, env, web);
     return await streamInfo(trackId, request, env, info, allowAac);
   }
   return json({ error: refusedBy ? "lossless_unavailable" : "upstream_unavailable" }, refusedBy ? 404 : 503);
@@ -225,6 +227,78 @@ async function streamInfo(trackId, request, env, info, allowAac = false) {
     return json({ url: signedMpd, codec: "flac", container: "fmp4", manifest: "dash", bitDepth, sampleRate, bitrate: Math.max(1411, Math.floor(sampleRate * bitDepth * 2 / 1000)) });
   }
   return json({ error: "unsupported_manifest" }, 404);
+}
+
+// ?web=1 (the web player's FLAC lane): Tidal's CDN refuses Cloudflare egress and browsers with a foreign Origin, so the
+// web gets the FLAC through the tidal-edge service (Deno Deploy), which Tidal does serve. The relay signs an HMAC token
+// (EDGE_SECRET, shared with the edge) naming exactly the Tidal URLs it would otherwise hand out; the edge only fetches
+// those. No D1 write: the token carries the MPD. Without EDGE_SECRET/EDGE_BASE, ?web=1 is ignored (normal answer).
+const EDGE_TTL_S = 3500;
+
+/** The edge origin when ?web=1 is asked for and the edge is configured, else null. */
+function webEdge(request, env) {
+  if (new URL(request.url).searchParams.get("web") !== "1") return null;
+  if (!env.EDGE_SECRET || env.EDGE_SECRET.length < 32 || !env.EDGE_BASE) return null;
+  try {
+    const u = new URL(env.EDGE_BASE);
+    const local = u.hostname === "127.0.0.1" || u.hostname === "localhost";
+    if (u.protocol !== "https:" && !(local && u.protocol === "http:")) return null;
+    return u.origin;
+  } catch { return null; }
+}
+
+/** Earliest of now+EDGE_TTL_S and the expiry in Tidal's own signed URL (token=<unix>~...), when readable. */
+function edgeExpiry(tidalUrl) {
+  let exp = now() + EDGE_TTL_S;
+  try {
+    const m = /^(\d{10})~/.exec(new URL(tidalUrl).searchParams.get("token") || "");
+    if (m && Number(m[1]) > now() + 60) exp = Math.min(exp, Number(m[1]) - 30);
+  } catch { /* keep the default */ }
+  return exp;
+}
+
+function b64url(bytes) { let s = ""; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, ""); }
+
+/** Same format the edge verifies: base64url(JSON) "." base64url(HMAC-SHA256(secret, base64url(JSON))). */
+export async function edgeToken(secret, payload) {
+  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return `${body}.${b64url(new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body))))}`;
+}
+
+/** A lossless playbackinfo answer as edge URLs: DASH -> manifest.mpd + file.flac; progressive native FLAC -> stream.flac + file.flac. */
+async function edgeInfo(trackId, info, env, edge) {
+  if (!info.manifest) return json({ error: "manifest_missing" }, 404);
+  const text = new TextDecoder().decode(Uint8Array.from(atob(info.manifest), (c) => c.charCodeAt(0)));
+  const mime = String(info.manifestMimeType || "").toLowerCase();
+  const bitDepth = Number(info.bitDepth) || 16;
+  const sampleRate = Number(info.sampleRate) || 44100;
+  const fn = `td-${trackId}`;
+  let payload, kind;
+  if (mime.includes("dash")) {
+    const init = /initialization="([^"]+)"/.exec(text)?.[1];
+    if (!init?.startsWith("https://")) return json({ error: "invalid_dash_manifest" }, 502);
+    payload = { v: 1, k: "d", exp: edgeExpiry(init.replaceAll("&amp;", "&")), x: text, fn };
+    kind = "dash";
+  } else if (mime.includes("bts")) {
+    const bts = JSON.parse(text);
+    const codecs = String(bts.codecs || "").toLowerCase();
+    const audioUrl = bts.urls?.[0];
+    if (/opus|mp4a|aac|mp3/.test(codecs) || !audioUrl?.startsWith("https://")) return json({ error: "lossless_unavailable" }, 404);
+    // The edge's file.flac / stream.flac pass the file through as FLAC: only a native .flac file qualifies.
+    if (new URL(audioUrl).pathname.toLowerCase().includes(".mp4")) return json({ error: "lossless_unavailable" }, 404);
+    payload = { v: 1, k: "p", exp: edgeExpiry(audioUrl), u: audioUrl, fn };
+    kind = "none";
+  } else return json({ error: "unsupported_manifest" }, 404);
+  const token = await edgeToken(env.EDGE_SECRET, payload);
+  const t = `${edge}/t/${token}`;
+  return json({
+    url: kind === "dash" ? `${t}/manifest.mpd` : `${t}/stream.flac`,
+    download: `${t}/file.flac`,
+    codec: "flac", container: kind === "dash" ? "fmp4" : "flac", manifest: kind, edge: true,
+    expiresAt: payload.exp, audioQuality: info.audioQuality, bitDepth, sampleRate,
+    bitrate: Math.max(1411, Math.floor(sampleRate * bitDepth * 2 / 1000)),
+  });
 }
 
 async function dash(request, trackId, env, isInit) {

@@ -28,3 +28,12 @@ npx wrangler d1 migrations apply stash-tidal-relay --remote
 Set a long random `ACCESS_TOKEN`, an unrelated private `ADMIN_TOKEN`, `TIDAL_CLIENT_SECRET`, and random private `IP_SALT` as Wrangler secrets. The Tidal client ID and secret come from the selected [BitChord community implementation](https://github.com/R1Blmmakan/music_addon/blob/main/.env.example), not the TIDAL Developer Portal. Keep these values out of `wrangler.toml` and source control. Apply D1 migrations with `npm run db:migrate`, then deploy and note the `workers.dev` origin, or configure a custom HTTPS hostname and set `PUBLIC_HOST` to that exact origin.
 
 After deploying, set `TIDAL_RELAY_URL` and `TIDAL_ADMIN_TOKEN` in a local shell and run `npm run tidal:login` (append `-- --reserve` to hold an account in reserve). The script prints the verification URL and code, waits while the user approves in Tidal, then polls until authorization completes. It never reads or prints a password or OAuth token. Then verify `/health`, `/search`, and `/stream` with the app access token. Publish `tidal_relay_url` and `tidal_relay_token` using the signed-config publisher only after those checks pass.
+
+## Web FLAC lane (`?web=1`)
+
+`GET /stream/td:<id>?web=1` answers lossless tracks with URLs on the **tidal-edge** service (Deno Deploy; Tidal's CDN
+refuses Cloudflare egress and browser Origins): `{ url: <edge>/t/<token>/manifest.mpd | stream.flac, download:
+<edge>/t/<token>/file.flac, codec: "flac", manifest: "dash" | "none", edge: true, expiresAt, bitDepth, sampleRate }`.
+The token is base64url(JSON) "." base64url(HMAC-SHA256(EDGE_SECRET, body)) and carries the Tidal URLs / MPD itself
+(no D1 write). Needs `wrangler secret put EDGE_SECRET` (same value as the edge) and the var `EDGE_BASE`
+(e.g. `https://tidal-edge.<org>.deno.net`). Without both, `?web=1` is ignored and the normal answer is returned.
