@@ -1,0 +1,15 @@
+{
+  "name": "stash-tidal-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tidal:login": "node scripts/device-login.mjs",
+    "db:create": "wrangler d1 create stash-tidal-relay",
+    "db:migrate": "wrangler d1 migrations apply stash-tidal-relay --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.147.0"
+  }
+}

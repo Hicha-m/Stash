@@ -53,6 +53,12 @@ data class StreamUrl(
      *  - `"youtube"`             — yt-dlp/InnerTube extraction (lossy)
      */
     val origin: String? = null,
+    /**
+     * [url] is a DASH MPD, not a progressive file (Tidal via BitChord — see
+     * [TidalStreamResolver]). Must be played by a DASH media source: the
+     * progressive byte-pipe [LazyResolvingDataSource] refuses it.
+     */
+    val isDash: Boolean = false,
 )
 
 /**

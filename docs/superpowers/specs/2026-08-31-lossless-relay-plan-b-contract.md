@@ -143,6 +143,32 @@ Failure is fail-safe by design: bad signature or network failure keeps the
 cached copy; no cache means no relays, and lossless falls back to the user's own
 account or custom endpoint.
 
+### Optional: the Tidal rung (BitChord) — client half BUILT 2026-10-14
+
+Two optional top-level keys turn on the Tidal lossless rung (after Qobuz, before
+the lossy sources) with no user setup:
+
+```json
+{
+  "tidal_relay_url": "https://tidal.example",
+  "tidal_relay_token": "<that server's ACCESS_TOKEN>"
+}
+```
+
+- `tidal_relay_url` — base of the owner-hosted BitChord Lossless Relay
+  (`R1Blmmakan/music_addon`). **https only**; anything else is dropped at parse and
+  the rung stays off. A path prefix is kept, so BitChord's own
+  `https://host/<ACCESS_TOKEN>` form also works (then omit the token key).
+- `tidal_relay_token` — optional; sent as `X-Access-Token` on `/search` and
+  `/stream`. The `/dash/` and `/audio/` URLs the server returns are HMAC-signed
+  and need no token.
+- Missing `tidal_relay_url` = rung off. Same signature, cache, rollback floor and
+  rotation story as `relay_key`: publish a new config to move or rotate it.
+- A user's own server (Settings › Audio & Quality › Advanced › Custom Tidal
+  server) outranks this, and uses only the user's token.
+- **`publish-config.mjs` / `buildConfig` currently drops unknown keys** — they must
+  be passed through there before these keys can be published.
+
 ---
 
 ## 4. The non-negotiable architectural constraint

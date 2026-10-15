@@ -51,6 +51,8 @@ class LosslessSourcePreferences @Inject constructor(
     private val minQualityKey = stringPreferencesKey("min_quality")
     private val enabledKey = booleanPreferencesKey("enabled")
     private val customLosslessEndpointKey = stringPreferencesKey("custom_lossless_endpoint")
+    private val bitchordEndpointKey = stringPreferencesKey("bitchord_endpoint")
+    private val bitchordAccessTokenKey = stringPreferencesKey("bitchord_access_token")
     private val captchaCookieKey = stringPreferencesKey("squid_wtf_captcha_verified_at")
     private val captchaCookieSetAtKey = longPreferencesKey("squid_wtf_captcha_set_at_ms")
     private val bannerDismissedKey = booleanPreferencesKey("home_banner_dismissed")
@@ -115,6 +117,45 @@ class LosslessSourcePreferences @Inject constructor(
         val v = normaliseEndpoint(raw)
         context.losslessDataStore.edit { prefs ->
             if (v == null) prefs.remove(customLosslessEndpointKey) else prefs[customLosslessEndpointKey] = v
+        }
+    }
+
+    /**
+     * The user's own self-hosted BitChord Lossless Relay (Tidal), or null = the Tidal
+     * rung is off. Same normalisation as [customLosslessEndpoint] (https only, no
+     * query, no trailing slash), so a path prefix survives: BitChord's own
+     * `https://host/<ACCESS_TOKEN>` form works as-is. The APK ships no default —
+     * a BitChord server spends ONE person's Tidal account, so it is never shared
+     * through the signed runtime config. Deduped and fail-closed.
+     */
+    val bitchordEndpoint: Flow<String?> = context.losslessDataStore.data.map { prefs ->
+        prefs[bitchordEndpointKey]?.takeIf { it.isNotBlank() }
+    }.distinctUntilChanged().catch { emit(null) }
+
+    suspend fun bitchordEndpointNow(): String? = bitchordEndpoint.first()
+
+    suspend fun setBitchordEndpoint(raw: String?) {
+        val v = normaliseEndpoint(raw)
+        context.losslessDataStore.edit { prefs ->
+            if (v == null) prefs.remove(bitchordEndpointKey) else prefs[bitchordEndpointKey] = v
+        }
+    }
+
+    /**
+     * The server's `ACCESS_TOKEN`, sent as `X-Access-Token` — or null when the
+     * server runs open, or the token is already the endpoint's path prefix. A
+     * secret: never logged, never in the diagnostics bundle.
+     */
+    val bitchordAccessToken: Flow<String?> = context.losslessDataStore.data.map { prefs ->
+        prefs[bitchordAccessTokenKey]?.takeIf { it.isNotBlank() }
+    }.distinctUntilChanged().catch { emit(null) }
+
+    suspend fun bitchordAccessTokenNow(): String? = bitchordAccessToken.first()
+
+    suspend fun setBitchordAccessToken(raw: String?) {
+        val v = raw?.trim()?.takeIf { it.isNotEmpty() }
+        context.losslessDataStore.edit { prefs ->
+            if (v == null) prefs.remove(bitchordAccessTokenKey) else prefs[bitchordAccessTokenKey] = v
         }
     }
 

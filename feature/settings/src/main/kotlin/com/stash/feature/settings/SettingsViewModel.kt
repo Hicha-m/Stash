@@ -482,6 +482,40 @@ class SettingsViewModel @Inject constructor(
     /** Typing clears the rejection — it described text that is no longer in the field. */
     fun onCustomEndpointEdited() { _customEndpointError.value = null }
 
+    // -- Tidal via a self-hosted BitChord server ------------------------------
+
+    /** The user's BitChord base (normalised), or null = the Tidal rung is off. */
+    val bitchordEndpoint: StateFlow<String?> =
+        losslessPrefs.bitchordEndpoint
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** Whether an access token is stored. The token itself never reaches the UI. */
+    val bitchordHasToken: StateFlow<Boolean> =
+        losslessPrefs.bitchordAccessToken.map { it != null }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    private val _bitchordEndpointError = MutableStateFlow<String?>(null)
+    val bitchordEndpointError: StateFlow<String?> = _bitchordEndpointError
+
+    /** Commit-on-Done, same rules as [onCustomEndpointCommitted]; blank clears it. */
+    fun onBitchordEndpointCommitted(raw: String) {
+        val trimmed = raw.trim()
+        val normalised = LosslessSourcePreferences.normaliseEndpoint(trimmed)
+        if (trimmed.isNotEmpty() && normalised == null) {
+            _bitchordEndpointError.value = "Must be an https:// URL"
+            return
+        }
+        _bitchordEndpointError.value = null
+        viewModelScope.launch { losslessPrefs.setBitchordEndpoint(normalised) }
+    }
+
+    fun onBitchordEndpointEdited() { _bitchordEndpointError.value = null }
+
+    /** Blank clears the stored token. */
+    fun onBitchordTokenCommitted(raw: String) {
+        viewModelScope.launch { losslessPrefs.setBitchordAccessToken(raw) }
+    }
+
     /** The in-flight probe, so a second Test cannot be answered by the first. */
     private var testJob: Job? = null
 

@@ -45,7 +45,22 @@ class StashMediaSourceFactory(
     resolver: StreamSourceRegistry,
     urlCache: StreamUrlCache,
     trackDao: TrackDao,
+    /**
+     * True while a Tidal (BitChord) server is configured: placeholders then
+     * resolve BEFORE choosing a media source ([ResolveFirstMediaSource]), since
+     * Tidal may answer with a DASH MPD. False keeps the lazy path exactly as it was.
+     */
+    private val resolveBeforeSourcePick: () -> Boolean = { false },
 ) : MediaSource.Factory {
+
+    private val resolver = resolver
+    private val urlCache = urlCache
+    private val trackDao = trackDao
+
+    /** Where [ResolveFirstMediaSource] resolves; outlives any one source. */
+    private val resolveScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO,
+    )
 
     private val localDataSourceFactory = DefaultDataSource.Factory(context)
     private val localFactory = DefaultMediaSourceFactory(localDataSourceFactory)
@@ -119,8 +134,34 @@ class StashMediaSourceFactory(
         // Placeholder items (full-timeline queue) resolve in the DataSource
         // layer — checked first because they carry no http(s) scheme for the
         // predicates below to match.
-        if (mediaItem.localConfiguration?.uri?.scheme == STASH_RESOLVE_SCHEME) {
+        val uri = mediaItem.localConfiguration?.uri
+        if (uri?.scheme == STASH_RESOLVE_SCHEME) {
+            val trackId = uri.lastPathSegment?.toLongOrNull()
+            if (trackId != null && !isRowOverride(uri) && resolveBeforeSourcePick()) {
+                return ResolveFirstMediaSource(
+                    mediaItem = mediaItem,
+                    scope = resolveScope,
+                    resolve = {
+                        urlCache.get(trackId) ?: placeholderEntity(trackDao, trackId, uri)
+                            ?.let { resolver.resolve(it, allowYouTube = true, allowYtDlp = true) }
+                            ?.also { urlCache.put(trackId, it) }
+                    },
+                    childFor = { resolved ->
+                        if (resolved?.isDash == true) {
+                            streamingFactory.createDashMediaSource(mediaItem, resolved.url)
+                        } else {
+                            lazyFactory.createMediaSource(mediaItem)
+                        }
+                    },
+                )
+            }
             return lazyFactory.createMediaSource(mediaItem)
+        }
+        // A resolved Tidal MPD (prefetch / foreground tap set the item's URI to it).
+        // Keyed on the path, not an extra: the session strips local configuration,
+        // and upstream serves every MPD at `/dash/td/<id>.mpd`.
+        if ((uri?.scheme == "https" || uri?.scheme == "http") && uri.path?.endsWith(".mpd") == true) {
+            return streamingFactory.createDashMediaSource(mediaItem, uri.toString())
         }
         // Order matches existing precedence: YouTube-trackId refresh chain first,
         // then JioSaavn authed-HTTP, then local/default.
