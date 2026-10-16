@@ -105,6 +105,12 @@ data class TrackQuery(
      * to antra after a Spotify search. Null when there is no backing DB row.
      */
     val trackId: Long? = null,
+    /**
+     * False when [durationMs] may not be the song's own length: a YouTube Music library row,
+     * whose length is often the music video's (intro, skit, outro) or a fan upload's. The
+     * matcher then eases its length penalty and never treats a matching length as proof.
+     */
+    val durationReliable: Boolean = true,
 )
 
 /**

@@ -2,6 +2,7 @@ package com.stash.core.media.streaming
 
 import android.util.Log
 import com.stash.core.data.db.entity.TrackEntity
+import com.stash.core.model.MusicSource
 import com.stash.data.download.lossless.TrackQuery
 import com.stash.data.download.lossless.bitchord.BitchordClient
 import javax.inject.Inject
@@ -46,6 +47,7 @@ class TidalStreamResolver @Inject constructor(
         album = album.takeIf { it.isNotBlank() },
         isrc = isrc?.takeIf { it.isNotBlank() },
         durationMs = durationMs,
+        durationReliable = source != MusicSource.YOUTUBE,
     )
 
     suspend fun resolve(track: TrackEntity): StreamUrl? {

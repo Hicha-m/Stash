@@ -60,13 +60,14 @@ class MatcherCorpusTest {
         Json { ignoreUnknownKeys = true }.decodeFromString(text)
     }
 
-    private fun score(q: Query, c: Candidate): Float = QobuzCandidateMatcher.confidence(
+    private fun score(q: Query, c: Candidate, source: String): Float = QobuzCandidateMatcher.confidence(
         query = TrackQuery(
             artist = q.artist,
             title = q.title,
             album = q.album?.takeIf { it.isNotBlank() },
             isrc = q.isrc?.takeIf { it.isNotBlank() },
             durationMs = q.durationMs?.takeIf { it > 0 },
+            durationReliable = source != "YOUTUBE",
         ),
         candTitle = c.title,
         candArtist = c.artist,
@@ -79,7 +80,7 @@ class MatcherCorpusTest {
 
     private fun outcome(item: Item): Pair<Outcome, Candidate?> {
         val best = item.candidates
-            .map { it to score(item.query, it) }
+            .map { it to score(item.query, it, item.source) }
             .filter { it.second >= QobuzCandidateMatcher.MIN_CONFIDENCE }
             .maxByOrNull { it.second }
             ?.first
@@ -120,8 +121,8 @@ class MatcherCorpusTest {
 
     private companion object {
         /** Ratchet: today's counts on corpus v1. Lower them when the matcher improves. */
-        const val BASELINE_WRONG_ACCEPTS = 9
-        const val BASELINE_MISSES = 28
+        const val BASELINE_WRONG_ACCEPTS = 10
+        const val BASELINE_MISSES = 19
         const val REPORT_LIMIT = 60
     }
 }

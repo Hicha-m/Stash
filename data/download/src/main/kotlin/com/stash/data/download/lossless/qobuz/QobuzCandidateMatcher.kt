@@ -83,6 +83,10 @@ object QobuzCandidateMatcher {
             val drift = abs(queryMs - candidateMs).toDouble() / queryMs.toDouble()
             when {
                 drift < 0.05 -> 1.0f      // <5% off — same recording almost certainly
+                // A YouTube row's length is often the video's: only a gross gap (a 12-minute
+                // jam for a 4-minute song) still counts against it. Versions are left to the
+                // version words below.
+                !query.durationReliable -> if (drift < VIDEO_DRIFT_OK) 1.0f else 0.3f
                 drift < 0.10 -> 0.85f     // 5-10% — typical compression-vs-original variance
                 drift < 0.20 -> 0.6f      // 10-20% — possibly different cut
                 else -> 0.3f              // dramatic mismatch (live vs studio etc.)
@@ -107,7 +111,8 @@ object QobuzCandidateMatcher {
         // A length within 5% on the query's own album says it's the recording the user has
         // (a live album whose titles don't say "live"), so the version only breaks ties. On
         // another album the same length proves nothing: a live take often runs like the studio cut.
-        val durationConfirms = (query.durationMs ?: 0L) > 0 && candDurationSec > 0 && durationFactor == 1.0f
+        val durationConfirms = query.durationReliable && (query.durationMs ?: 0L) > 0 && candDurationSec > 0 &&
+            durationFactor == 1.0f
         val versionFactor = when {
             extraVersion.isEmpty() && missingVersion.isEmpty() -> 1.0f
             durationConfirms && sameAlbum(query.album, candAlbum) -> VERSION_TIEBREAK
@@ -124,6 +129,9 @@ object QobuzCandidateMatcher {
         }
         return base * versionFactor
     }
+
+    /** Largest length gap a [TrackQuery.durationReliable]=false query tolerates before the 0.3 factor. */
+    private const val VIDEO_DRIFT_OK = 0.40
 
     /** Scales a candidate that names a version the query doesn't. 1.0 x 0.4 falls under [MIN_CONFIDENCE]. */
     private const val VERSION_PENALTY = 0.4f

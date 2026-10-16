@@ -566,6 +566,7 @@ class DownloadManager @Inject constructor(
             title = track.title,
             album = track.album.takeIf { it.isNotBlank() },
             durationMs = track.durationMs.takeIf { it > 0 },
+            durationReliable = track.source != MusicSource.YOUTUBE,
             explicit = track.explicit,
             trackId = track.id,
         )
@@ -591,6 +592,7 @@ class DownloadManager @Inject constructor(
             album = track.album.takeIf { it.isNotBlank() },
             isrc = track.isrc,
             durationMs = track.durationMs.takeIf { it > 0 },
+            durationReliable = track.source != MusicSource.YOUTUBE,
             explicit = track.explicit,
             trackId = track.id,
         )
@@ -706,6 +708,7 @@ class DownloadManager @Inject constructor(
             album = track.album.takeIf { it.isNotBlank() },
             isrc = track.isrc,
             durationMs = track.durationMs.takeIf { it > 0 },
+            durationReliable = track.source != MusicSource.YOUTUBE,
             explicit = track.explicit,
             spotifyUri = track.spotifyUri,
             trackId = track.id,

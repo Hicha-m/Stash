@@ -248,6 +248,21 @@ class QobuzCandidateMatcherTest {
         assertThat(score("Song (Live)", "Song", queryDurationMs = 200_000, candDurationSec = 200)).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
     }
 
+    @Test fun `a YouTube row's video length does not reject the album cut`() {
+        // "She Talks to Angels": the library row is the video (~23% longer than the album cut).
+        fun yt(querySec: Long, candSec: Int, version: String? = null, reliable: Boolean = false) = QobuzCandidateMatcher.confidence(
+            query = TrackQuery(artist = "The Black Crowes", title = "She Talks to Angels", durationMs = querySec * 1000, durationReliable = reliable),
+            candTitle = "She Talks To Angels", candArtist = "The Black Crowes", candIsrc = null,
+            candDurationSec = candSec, candStreamable = true, candVersion = version,
+        )
+        assertThat(yt(390, 300)).isEqualTo(1.0f)
+        assertThat(yt(390, 300, reliable = true)).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE) // Spotify rows keep the strict rule
+        // A gross gap still counts: a 12-minute jam is not the 4-minute song.
+        assertThat(yt(240, 720)).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        // And a matching YouTube length never confirms a version the query doesn't name.
+        assertThat(yt(325, 326, version = "Live")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+    }
+
     @Test fun `accents fold on both sides, including decomposed catalog text`() {
         val decomposed = "Molécules" // e + combining acute, as some catalogs store it
         assertThat(score("Molécules", decomposed)).isEqualTo(1.0f)
