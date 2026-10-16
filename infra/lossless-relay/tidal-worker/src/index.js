@@ -6,6 +6,9 @@ const UA = "okhttp/5.3.2";
 const SCOPE = "r_usr+w_usr+w_sub";
 const HIRES_TTL = 30 * 86400; // a track's master quality rarely changes; recheck monthly
 const RESPONSE_CACHE_TTL = 5 * 86400;
+// not_available (Tidal 404 / 4005) is kept short: during a 429 storm Tidal answered these for
+// tracks it does have, and a 5-day answer hid them from every install.
+const NOT_AVAILABLE_TTL = 6 * 3600;
 const STREAM_CACHE_SAFETY = 60;
 
 export default {
@@ -63,12 +66,17 @@ function paused() {
 }
 /**
  * 503 busy. Same body for every cause so clients need no change; only Retry-After differs:
- * 300 s when seats are capped/cooling, a short value when seats are only playback-paced.
+ * 300 s when seats are capped/cooling, a short value when seats are only waiting out their gap.
  */
 function busy(retryAfter = 300) {
   return json({ error: "busy" }, 503, { "Retry-After": String(retryAfter) });
 }
 const PACING_RETRY_AFTER = 15;
+
+/** The busy answer for "takeAccount found no seat". */
+async function noSeat(env) {
+  return busy(await onlyPacingBlocks(env) ? PACING_RETRY_AFTER : 300);
+}
 
 async function startDeviceAuth(request, env) {
   if (!authorized(request, env.ADMIN_TOKEN)) return unauthorized();
@@ -137,22 +145,23 @@ async function searchUncached(query, cc, request, env) {
   let data;
   for (let attempt = 0; attempt < 2; attempt++) {
     const selected = await takeAccount(env);
-    if (!selected) return busy();
+    if (!selected) return noSeat(env);
     const account = await refreshIfNeeded(selected, env);
     if (!account) { await coolAccount(env, selected.id, 300); continue; }
     const r = await tidalFetch(`/search/tracks?query=${encodeURIComponent(query)}&limit=30&offset=0&countryCode=${cc}`, account, env);
     if (r.status === 429) {
-      await recordUpstream429(env, selected, "search");
-      await coolAccount(env, selected.id, positive(env.TIDAL_CROSSCHECK_COOLDOWN_SECONDS, 900));
+      await onUpstream429(env, selected, "search");
       return busy();
     }
     if (r.status === 401) {
       const denial = await r.clone().json().catch(() => ({}));
       if (denial.subStatus !== 4005) { await killAccount(env, selected.id, "401"); continue; }
-      return json({ tracks: [] });
+      return searchError();
     }
     if (r.status >= 500) { await coolAccount(env, selected.id, 300); continue; }
-    if (!r.ok) return json({ tracks: [] });
+    // Never a 200: search() caches 200s for 5 days and the app files an empty answer as
+    // "not on Tidal" for 14, so an upstream refusal must not read as "no results".
+    if (!r.ok) return searchError();
     data = await r.json();
     break;
   }
@@ -170,6 +179,9 @@ async function searchUncached(query, cc, request, env) {
   return json({ tracks });
 }
 
+/** An upstream search refusal: uncached here, and a transient error (not a miss) to the app. */
+function searchError() { return json({ error: "upstream_error" }, 502); }
+
 async function stream(trackId, request, env) {
   const url = new URL(request.url);
   const aac = url.searchParams.get("aac") || "";
@@ -181,8 +193,10 @@ async function stream(trackId, request, env) {
   const response = await streamUncached(trackId, request, env);
   let body;
   try { body = await response.clone().json(); } catch { return response; }
-  if (response.status === 404 && ["lossless_unavailable", "not_available"].includes(body.error)) {
+  if (response.status === 404 && body.error === "lossless_unavailable") {
     await cacheJson(env, key, response, RESPONSE_CACHE_TTL);
+  } else if (response.status === 404 && body.error === "not_available") {
+    await cacheJson(env, key, response, NOT_AVAILABLE_TTL);
   } else if (response.status === 200) {
     const expiresAt = streamAnswerExpiry(body);
     const ttl = expiresAt - now() - STREAM_CACHE_SAFETY;
@@ -205,8 +219,8 @@ async function streamUncached(trackId, request, env) {
   // track-level answer: with this client ID CD-only tracks always come back HIGH (AAC),
   // and a 4005 is a track/rights refusal, so asking another seat just burns budget.
   for (let attempt = 0; attempt < 2; attempt++) {
-    const account = await takeAccount(env, { playback: true });
-    if (!account) return busy(await onlyPacingBlocks(env) ? PACING_RETRY_AFTER : 300);
+    const account = await takeAccount(env);
+    if (!account) return noSeat(env);
     const fresh = await refreshIfNeeded(account, env);
     if (!fresh) {
       await coolAccount(env, account.id, 300);
@@ -221,7 +235,7 @@ async function streamUncached(trackId, request, env) {
     }
     if (!data.ok) {
       if (data.status === 429) {
-        await coolAccount(env, account.id, positive(env.TIDAL_CROSSCHECK_COOLDOWN_SECONDS, 900));
+        await onUpstream429(env, account, "playbackinfo");
         return busy();
       }
       if (data.status >= 500) await coolAccount(env, account.id, 300);
@@ -229,7 +243,7 @@ async function streamUncached(trackId, request, env) {
       continue;
     }
     const info = await data.json();
-    if (aacOnly) return aacInfo(info, await trackHires(trackId, fresh, env));
+    if (aacOnly) return aacInfo(info, await trackHires(trackId, env));
     if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
       // The normal answer for a CD-only track with this client, not a seat problem.
       return allowAac ? aacInfo(info) : json({ error: "lossless_unavailable" }, 404);
@@ -242,8 +256,8 @@ async function streamUncached(trackId, request, env) {
 }
 
 /**
- * After a playback takeAccount found no seat: true when some seat is free under its
- * caps and cooling but was refused only by playback pacing, so a short retry will work.
+ * After takeAccount found no seat: true when some seat is free under its caps and
+ * cooling but was refused only by its pacing gap, so a short retry will work.
  */
 async function onlyPacingBlocks(env) {
   try {
@@ -292,6 +306,24 @@ async function softOpenBlocks(env) {
   } catch { return false; }
 }
 
+/**
+ * A Tidal 429 on a seat: log it and cool the seat for an escalating spell. Tidal's 429 is a
+ * short burst limit with no Retry-After, so the first strike rests the seat
+ * TIDAL_429_COOLDOWN_SECONDS (default 120); each strike while still "hot" doubles it, up to
+ * TIDAL_429_COOLDOWN_MAX_SECONDS (default 960). A seat whose last cooldown ended more than
+ * TIDAL_429_FORGIVE_SECONDS (default 1800) ago starts again at the first strike.
+ */
+async function onUpstream429(env, account, endpoint) {
+  await recordUpstream429(env, account, endpoint);
+  const t = now();
+  await env.DB.prepare(`UPDATE tidal_accounts SET
+      strikes=CASE WHEN cooling_until<?1-?4 THEN 1 ELSE strikes+1 END,
+      cooling_until=?1+MIN(?2*(1<<CASE WHEN cooling_until<?1-?4 THEN 0 ELSE MIN(strikes,8) END),?3)
+    WHERE id=?5 AND state='live'`)
+    .bind(t, positive(env.TIDAL_429_COOLDOWN_SECONDS, 120), positive(env.TIDAL_429_COOLDOWN_MAX_SECONDS, 960),
+      positive(env.TIDAL_429_FORGIVE_SECONDS, 1800), account.id).run();
+}
+
 async function recordUpstream429(env, account, endpoint) {
   const event = {
     account: String(account.id).slice(-4),
@@ -333,18 +365,26 @@ function earliestTidalExpiry(manifest) {
 /**
  * Whether a Tidal track has a Hi-Res lossless master: the only kind this client can
  * actually fetch as FLAC (CD-quality tracks come back as AAC). Cached in D1 for 30 days.
- * Uses the account already taken for this stream: no extra account/hourly/daily slot is
- * spent, and the daily stream quota is untouched. A cache miss costs one metadata call.
+ * A cache miss costs one metadata call on a seat of its own (paced like any call; never
+ * straight after the playback call on the same seat, which is a burst). The daily stream
+ * quota is untouched. No free seat → unknown, and the next play asks again.
  * @returns {Promise<boolean|undefined>} undefined when unknown; never throws.
  */
-async function trackHires(trackId, account, env) {
+async function trackHires(trackId, env) {
   try {
     const row = await env.DB.prepare("SELECT hires FROM tidal_hires_cache WHERE track_id=? AND checked_at>? LIMIT 1")
       .bind(String(trackId), now() - HIRES_TTL).first();
     if (row) return row.hires === 1;
+    const seat = await takeAccount(env);
+    if (!seat) return undefined;
+    const account = await refreshIfNeeded(seat, env);
+    if (!account) return undefined;
     const cc = encodeURIComponent(env.TIDAL_COUNTRY_CODE || "US");
-    await bumpSeat(env, account.id); // the metadata call is a second upstream call on this seat
     const r = await tidalFetch(`/tracks/${trackId}?countryCode=${cc}`, account, env);
+    if (r.status === 429) {
+      await onUpstream429(env, seat, "metadata");
+      return undefined;
+    }
     if (!r.ok) return undefined;
     const track = await r.json();
     const tags = track?.mediaMetadata?.tags;
@@ -519,11 +559,7 @@ async function dash(request, trackId, env, isInit) {
 async function playbackInfo(trackId, account, env, quality) {
   const p = new URLSearchParams({ countryCode: env.TIDAL_COUNTRY_CODE || "US", audioquality: quality, playbackmode: "STREAM", assetpresentation: "FULL" });
   const r = await tidalFetch(`/tracks/${trackId}/playbackinfopostpaywall?${p}`, account, env);
-  if (r.status === 429) {
-    await recordUpstream429(env, account, "playbackinfo");
-    return r;
-  }
-  if (!r.ok) {
+  if (!r.ok && r.status !== 429) { // a 429 is logged by the caller's onUpstream429
     // Redacted: last 4 of the seat id, status and Tidal's user message only.
     const details = await r.clone().json().catch(() => ({}));
     const userMessage = typeof details.userMessage === "string" ? details.userMessage.replace(/[\r\n]/g, " ").slice(0, 240) : null;
@@ -543,34 +579,34 @@ function capWindow(env) {
 
 /**
  * Takes the least-recently-used live seat under its caps and counts one upstream call
- * against it. With `playback: true` the seat must also have had no playback lookup in
- * the last TIDAL_PLAYBACK_MIN_INTERVAL_SECONDS (default 12), and last_playback_at is
- * stamped. Searches and metadata lookups pass no option: never paced, never stamped.
+ * against it. Every caller (search, playback, metadata) is paced alike: the seat must have
+ * made no call in the last TIDAL_SEAT_MIN_GAP_SECONDS (default 20), and last_call_at is
+ * stamped. Tidal's 429 is a burst limit (5 calls in 14 s tripped an idle seat), so the gap,
+ * not the hourly/daily caps, is what keeps a seat under it.
  */
-async function takeAccount(env, { playback = false } = {}) {
+async function takeAccount(env) {
   const { hour, day, hourly, daily } = capWindow(env);
   const t = now();
-  const paceCutoff = t - positive(env.TIDAL_PLAYBACK_MIN_INTERVAL_SECONDS, 12);
+  const gapCutoff = t - positive(env.TIDAL_SEAT_MIN_GAP_SECONDS, 20);
   return await env.DB.prepare(`UPDATE tidal_accounts SET
       hour_n=CASE WHEN hour_key=?1 THEN hour_n+1 ELSE 1 END,hour_key=?1,
-      day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2,last_used_at=?3,
-      last_playback_at=CASE WHEN ?6=1 THEN ?3 ELSE last_playback_at END
+      day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2,last_used_at=?3,last_call_at=?3
     WHERE id=(SELECT id FROM tidal_accounts WHERE state='live' AND cooling_until<=?3 AND (hour_key!=?1 OR hour_n<?4) AND (day_key!=?2 OR day_n<?5)
-      AND (?6=0 OR last_playback_at<=?7) ORDER BY last_used_at,id LIMIT 1)
-    RETURNING *`).bind(hour, day, t, hourly, daily, playback ? 1 : 0, paceCutoff).first();
+      AND last_call_at<=?6 ORDER BY last_used_at,id LIMIT 1)
+    RETURNING *`).bind(hour, day, t, hourly, daily, gapCutoff).first();
 }
 
 /**
  * Counts one extra upstream Tidal call against a seat already taken (takeAccount counts
- * the first): the hires metadata lookup and the post-refresh retry in tidalFetch. Keeps
- * hour_n/day_n equal to real upstream load. Never throws.
+ * the first): the post-refresh retry in tidalFetch. Keeps hour_n/day_n equal to real
+ * upstream load and restarts the seat's gap. Never throws.
  */
 async function bumpSeat(env, id) {
   const { hour, day } = capWindow(env);
   await env.DB.prepare(`UPDATE tidal_accounts SET
       hour_n=CASE WHEN hour_key=?1 THEN hour_n+1 ELSE 1 END,hour_key=?1,
-      day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2
-    WHERE id=?3`).bind(hour, day, id).run().catch(() => {});
+      day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2,last_call_at=?4
+    WHERE id=?3`).bind(hour, day, id, now()).run().catch(() => {});
 }
 
 async function admitStream(request, env) {

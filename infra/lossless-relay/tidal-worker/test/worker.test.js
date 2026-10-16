@@ -6,7 +6,7 @@ const ACCESS_TOKEN = "test-access-token";
 const MPD = '<MPD><SegmentTemplate initialization="https://sp-ad-fa.audio.tidal.com/init.mp4?token=test" media="https://audio.tidal.com/$Number$" /></MPD>';
 
 /**
- * `pool: true` simulates tidal_accounts selection (caps, cooling, playback pacing, LRU)
+ * `pool: true` simulates tidal_accounts selection (caps, cooling, per-seat call gap, LRU)
  * and mutates `accounts` in place; otherwise takeAccount hands out `accounts` in order.
  */
 function fixture({ tidalResponse, account = liveAccount(), accounts = [account], pool = false } = {}) {
@@ -40,14 +40,14 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account],
             if (sql.includes("hour_n=CASE") && sql.includes("RETURNING *")) {
               accountCaps.push({ hourly: this.args[3], daily: this.args[4] });
               if (!pool) return accounts[nextAccount++] || null;
-              const [hour, day, t, , , playback, paceCutoff] = this.args;
+              const [hour, day, t, , , gapCutoff] = this.args;
               const pick = accounts
-                .filter((a) => eligible(a, this.args) && (playback === 0 || (a.last_playback_at || 0) <= paceCutoff))
+                .filter((a) => eligible(a, this.args) && (a.last_call_at || 0) <= gapCutoff)
                 .sort((x, y) => (x.last_used_at || 0) - (y.last_used_at || 0))[0];
               if (!pick) return null;
               bump(pick, hour, day);
               pick.last_used_at = t;
-              if (playback === 1) pick.last_playback_at = t;
+              pick.last_call_at = t;
               return { ...pick };
             }
             if (sql.includes("COUNT(*) AS n FROM tidal_accounts")) {
@@ -256,7 +256,7 @@ test("Tidal search 429 cools that account and returns busy without caching an em
   });
   assert.equal(f.calls.length, 1);
   assert.equal(f.responseCache.size, 0);
-  assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("SET cooling_until") && args[0] >= Math.floor(Date.now() / 1000) + 899));
+  assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("strikes=") && args[1] === 120 && args[2] === 960), "first strike: 120 s, capped at 960");
   assert.deepEqual(f.upstream429Events.map(({ endpoint, hour_n, day_n }) => ({ endpoint, hour_n, day_n })), [{ endpoint: "search", hour_n: 1, day_n: 1 }]);
 });
 
@@ -270,7 +270,7 @@ test("Tidal playback-info 429 cools that account and returns busy without cachin
   });
   assert.equal(f.calls.length, 1, "a 429 is not retried across qualities or regions");
   assert.equal(f.responseCache.size, 0);
-  assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("SET cooling_until") && args[0] >= Math.floor(Date.now() / 1000) + 899));
+  assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("strikes=") && args[1] === 120 && args[2] === 960), "first strike: 120 s, capped at 960");
   assert.deepEqual(f.upstream429Events.map(({ endpoint, hour_n, day_n }) => ({ endpoint, hour_n, day_n })), [{ endpoint: "playbackinfo", hour_n: 1, day_n: 1 }]);
 });
 
@@ -481,38 +481,40 @@ test("Tidal subStatus 4005 is a track-level not_available: no second seat, accou
   assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
 });
 
-test("playback pacing blocks a second lookup on the same seat but never blocks search", async () => {
+test("the seat gap paces every upstream call: a search right after a stream waits too", async () => {
   const f = fixture({ pool: true, accounts: [liveAccount()], tidalResponse: async (url) => (url.includes("/search/")
     ? new Response(JSON.stringify({ items: [] }), { status: 200 })
     : playbackInfo("LOSSLESS", "application/vnd.tidal.bts", FLAC_BTS)) });
   await withFetch(null, f.fetchTidal, async () => {
     assert.equal((await worker.fetch(authorizedRequest("/stream/td:1"), f.env)).status, 200);
-    const paced = await worker.fetch(authorizedRequest("/stream/td:2"), f.env);
-    assert.equal(paced.status, 503);
-    assert.deepEqual(await paced.json(), { error: "busy" });
-    assert.equal(paced.headers.get("retry-after"), "15", "pacing-busy asks for a short retry");
-    const stampedAt = f.accounts[0].last_playback_at;
+    const stampedAt = f.accounts[0].last_call_at;
     assert.ok(stampedAt > 0);
+    for (const path of ["/stream/td:2", "/search?q=anything"]) {
+      const paced = await worker.fetch(authorizedRequest(path), f.env);
+      assert.equal(paced.status, 503, path);
+      assert.deepEqual(await paced.json(), { error: "busy" });
+      assert.equal(paced.headers.get("retry-after"), "15", "gap-busy asks for a short retry");
+    }
+    f.accounts[0].last_call_at = stampedAt - 21;
     assert.equal((await worker.fetch(authorizedRequest("/search?q=anything"), f.env)).status, 200);
-    assert.equal(f.accounts[0].last_playback_at, stampedAt, "search does not stamp last_playback_at");
+    assert.ok(f.accounts[0].last_call_at >= stampedAt, "search stamps the gap too");
   });
-  assert.equal(playbackCalls(f).length, 1);
   assert.equal(f.calls.length, 2);
 });
 
-test("pacing lets a lookup through once the interval has passed, and busy when every seat is paced", async () => {
-  const old = Math.floor(Date.now() / 1000) - 13;
-  const accounts = [{ ...liveAccount(), id: "a", last_playback_at: old }, { ...liveAccount(), id: "b", last_playback_at: old }];
+test("the gap lets a call through once it has passed, and busy when every seat is inside it", async () => {
+  const old = Math.floor(Date.now() / 1000) - 21;
+  const accounts = [{ ...liveAccount(), id: "a", last_call_at: old }, { ...liveAccount(), id: "b", last_call_at: old }];
   const f = fixture({ pool: true, accounts, tidalResponse: async () => playbackInfo("LOSSLESS", "application/vnd.tidal.bts", FLAC_BTS) });
   await withFetch(null, f.fetchTidal, async () => {
     assert.equal((await worker.fetch(authorizedRequest("/stream/td:1"), f.env)).status, 200);
     assert.equal((await worker.fetch(authorizedRequest("/stream/td:2"), f.env)).status, 200);
     const third = await worker.fetch(authorizedRequest("/stream/td:3"), f.env);
-    assert.equal(third.status, 503, "both seats paced");
+    assert.equal(third.status, 503, "both seats inside their gap");
     assert.deepEqual(await third.json(), { error: "busy" });
     assert.equal(third.headers.get("retry-after"), "15");
   });
-  assert.ok(f.accounts.every((a) => a.last_playback_at > old));
+  assert.ok(f.accounts.every((a) => a.last_call_at > old));
   assert.equal(f.calls.length, 2);
 });
 
@@ -527,8 +529,9 @@ test("capped seats keep the five-minute busy, not the pacing retry", async () =>
   assert.equal(f.calls.length, 0);
 });
 
-test("seat counters reflect every upstream call, including the hires metadata lookup", async () => {
-  const f = fixture({ pool: true, accounts: [{ ...liveAccount(), hour_n: 0, day_n: 0 }], tidalResponse: (url) => (url.includes("/playbackinfopostpaywall")
+test("the hires metadata lookup takes its own paced seat, never a second call on the playback seat", async () => {
+  const seats = [{ ...liveAccount(), id: "a", hour_n: 0, day_n: 0 }, { ...liveAccount(), id: "b", hour_n: 0, day_n: 0 }];
+  const f = fixture({ pool: true, accounts: seats, tidalResponse: (url) => (url.includes("/playbackinfopostpaywall")
     ? playbackInfo("HIGH", "application/vnd.tidal.bts", AAC_BTS)
     : new Response(JSON.stringify({ mediaMetadata: { tags: ["HIRES_LOSSLESS"] } }), { status: 200 })) });
   await withFetch(null, f.fetchTidal, async () => {
@@ -537,9 +540,44 @@ test("seat counters reflect every upstream call, including the hires metadata lo
     assert.equal(body.hires, true);
   });
   assert.equal(f.calls.length, 2);
-  assert.equal(f.accounts[0].hour_n, 2);
-  assert.equal(f.accounts[0].day_n, 2);
+  assert.deepEqual(f.accounts.map((a) => a.hour_n), [1, 1], "one call per seat");
   assert.equal(new URL(playbackCalls(f)[0].url).searchParams.get("audioquality"), "HIGH");
+});
+
+test("with no free seat for the hires lookup, playback still answers and hires is omitted", async () => {
+  const f = fixture({ pool: true, accounts: [liveAccount()], tidalResponse: aacWithMeta(() => new Response("{}", { status: 200 })) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const body = await (await worker.fetch(authorizedRequest("/stream/td:43?aac=only"), f.env)).json();
+    assert.equal(body.codec, "aac");
+    assert.equal("hires" in body, false);
+  });
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.hiresCache.size, 0);
+});
+
+test("an upstream search refusal is a 502 and is never cached as an empty result", async () => {
+  for (const tidal of [() => new Response("{}", { status: 403 }), () => new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 })]) {
+    const f = fixture({ tidalResponse: async () => tidal() });
+    await withFetch(null, f.fetchTidal, async () => {
+      const response = await worker.fetch(authorizedRequest("/search?q=example"), f.env);
+      assert.equal(response.status, 502);
+    });
+    assert.equal(f.responseCache.size, 0);
+  }
+});
+
+test("not_available is cached for hours, lossless_unavailable for days", async () => {
+  const t = Math.floor(Date.now() / 1000);
+  const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: async (url) => (url.includes("/tracks/1/")
+    ? new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 })
+    : playbackInfo("HIGH", "application/vnd.tidal.bts", AAC_BTS)) });
+  await withFetch(null, f.fetchTidal, async () => {
+    assert.equal((await worker.fetch(authorizedRequest("/stream/td:1"), f.env)).status, 404);
+    assert.equal((await worker.fetch(authorizedRequest("/stream/td:2"), f.env)).status, 404);
+  });
+  const ttl = (id) => [...f.responseCache.entries()].find(([k]) => k.includes(`:${id}:`))[1].expires_at - t;
+  assert.ok(ttl(1) <= 6 * 3600 + 2 && ttl(1) > 6 * 3600 - 5, "not_available: 6 h");
+  assert.ok(ttl(2) > 4 * 86400, "lossless_unavailable: 5 days");
 });
 
 test("DASH manifest route passes Tidal's init URL through unchanged", async () => {
@@ -648,7 +686,7 @@ function aacWithMeta(meta) {
 const metaCalls = (f) => f.calls.filter((c) => /\/tracks\/\d+\?/.test(c.url));
 
 test("?aac=only reports hires=true from mediaMetadata HIRES_LOSSLESS, then serves it from the cache", async () => {
-  const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "LOSSLESS", mediaMetadata: { tags: ["LOSSLESS", "HIRES_LOSSLESS"] } }), { status: 200 })) });
+  const f = fixture({ accounts: [liveAccount(), liveAccount(), liveAccount()], tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "LOSSLESS", mediaMetadata: { tags: ["LOSSLESS", "HIRES_LOSSLESS"] } }), { status: 200 })) });
   await withFetch(null, f.fetchTidal, async () => {
     const first = await (await worker.fetch(authorizedRequest("/stream/42?aac=only"), f.env)).json();
     assert.equal(first.codec, "aac");
@@ -665,7 +703,7 @@ test("?aac=only reports hires=true from mediaMetadata HIRES_LOSSLESS, then serve
 });
 
 test("?aac=only accepts audioQuality HI_RES_LOSSLESS as hires", async () => {
-  const f = fixture({ tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "HI_RES_LOSSLESS" }), { status: 200 })) });
+  const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "HI_RES_LOSSLESS" }), { status: 200 })) });
   await withFetch(null, f.fetchTidal, async () => {
     const body = await (await worker.fetch(authorizedRequest("/stream/7?aac=only"), f.env)).json();
     assert.equal(body.hires, true);
@@ -673,7 +711,7 @@ test("?aac=only accepts audioQuality HI_RES_LOSSLESS as hires", async () => {
 });
 
 test("?aac=only reports hires=false for a CD-quality track and caches the false", async () => {
-  const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "LOSSLESS", mediaMetadata: { tags: ["LOSSLESS"] } }), { status: 200 })) });
+  const f = fixture({ accounts: [liveAccount(), liveAccount(), liveAccount()], tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "LOSSLESS", mediaMetadata: { tags: ["LOSSLESS"] } }), { status: 200 })) });
   await withFetch(null, f.fetchTidal, async () => {
     assert.equal((await (await worker.fetch(authorizedRequest("/stream/8?aac=only"), f.env)).json()).hires, false);
     assert.equal((await (await worker.fetch(authorizedRequest("/stream/8?aac=only"), f.env)).json()).hires, false);
@@ -689,7 +727,7 @@ test("?aac=only omits hires when metadata fails, is unparseable, or throws; play
     () => new Response(JSON.stringify({ title: "no quality fields" }), { status: 200 }),
     () => { throw new TypeError("network down"); },
   ]) {
-    const f = fixture({ tidalResponse: aacWithMeta(meta) });
+    const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: aacWithMeta(meta) });
     await withFetch(null, f.fetchTidal, async () => {
       const res = await worker.fetch(authorizedRequest("/stream/9?aac=only"), f.env);
       assert.equal(res.status, 200);
