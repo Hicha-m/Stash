@@ -16,4 +16,5 @@ Builds `data/download/src/test/resources/matcher/corpus-v1.json`, the labelled s
 
 The labelling rules are the `SYSTEM` prompt in `label.mjs`. An edit of clearly different length
 (single, radio, extended, album cut ~20 s / 10% apart) is a wrong version: the owner wants the cut
-they know or nothing. v1 (2026-10-16): 777 songs, 2,095 pairs, under $1 of API use.
+they know or nothing. v1 (2026-10-16): 777 songs, 2,095 pairs (~$3 batch + ~$3 to relabel the YouTube rows after the video-length rule).
+YouTube library lengths are often the music video's, so for those rows a length gap alone is not a wrong version.

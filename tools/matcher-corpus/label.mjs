@@ -30,6 +30,10 @@ Verdicts:
   versions that run noticeably shorter or longer than the library song (roughly 20+ seconds, or 10%+,
   apart). The user wants the cut they know. An edit within a few seconds of the library length is
   the same cut, so it is a "match".
+  Exception, YouTube Music library songs: their duration is often a music video's (intro, skit,
+  outro), so a length gap ALONE never makes a candidate a wrong version for them. For a YouTube
+  library song, the standard studio cut of the same song is a "match" unless the title, version
+  field or album names a different performance.
   If the LIBRARY song itself is that version (e.g. its title or album says "Live"), the matching
   version is a "match" and the studio cut is the "wrong_version".
 - "wrong_song": a different song, a cover or tribute by another artist, or the right title by an
@@ -155,7 +159,27 @@ if (mode === "trial") {
   }
   writeFileSync(out, JSON.stringify(results, null, 1));
   console.log(`${results.length} results, ${results.filter((r) => r.error).length} errors`);
+} else if (mode === "relabel") {
+  // Re-label one library source in place (direct calls, 8 at a time): node label.mjs relabel labelled.json YOUTUBE
+  const [path, source] = args;
+  const results = load(path);
+  const todo = results.filter((r) => r.query.source === source && r.candidates?.length);
+  const c = client();
+  let next = 0, cost = 0, failed = 0;
+  await Promise.all(Array.from({ length: 8 }, async () => {
+    while (next < todo.length) {
+      const r = todo[next++];
+      try {
+        const msg = await c.messages.create(params(r.query, r.candidates));
+        cost += (msg.usage.input_tokens * 4 + msg.usage.output_tokens * 20) / 1e6;
+        const parsed = parse(msg, r.candidates);
+        if (parsed.labels) { r.labels = parsed.labels; delete r.error; } else failed++;
+      } catch { failed++; }
+    }
+  }));
+  writeFileSync(path, JSON.stringify(results, null, 1));
+  console.log(`relabelled ${todo.length - failed}/${todo.length} ${source} songs; ~$${cost.toFixed(2)}; ${failed} kept their old labels`);
 } else {
-  console.error("usage: label.mjs trial|batch|collect ...");
+  console.error("usage: label.mjs trial|batch|collect|relabel ...");
   process.exit(1);
 }
