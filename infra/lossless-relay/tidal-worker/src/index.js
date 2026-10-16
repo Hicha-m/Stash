@@ -16,6 +16,7 @@ export default {
       env.DB.prepare("DELETE FROM tidal_dash_manifests WHERE expires_at <= ?").bind(now()),
       env.DB.prepare("DELETE FROM tidal_hires_cache WHERE checked_at <= ?").bind(now() - HIRES_TTL),
       env.DB.prepare("DELETE FROM tidal_response_cache WHERE expires_at <= ?").bind(now()),
+      env.DB.prepare("DELETE FROM tidal_upstream_429_events WHERE occurred_at < ?").bind(now() - 30 * 86400),
     ]);
   },
   async fetch(request, env) {
@@ -121,6 +122,7 @@ async function search(url, request, env) {
   const key = `search:${country}:${await cacheDigest(query)}`;
   const cached = await cachedJson(env, key);
   if (cached) return cached;
+  if (await softOpenBlocks(env)) return busy();
   const response = await searchUncached(query, country, request, env);
   if (response.status === 200) await cacheJson(env, key, response, RESPONSE_CACHE_TTL);
   return response;
@@ -135,7 +137,7 @@ async function searchUncached(query, cc, request, env) {
     if (!account) { await coolAccount(env, selected.id, 300); continue; }
     const r = await tidalFetch(`/search/tracks?query=${encodeURIComponent(query)}&limit=30&offset=0&countryCode=${cc}`, account, env);
     if (r.status === 429) {
-      console.warn(`tidal_search ${JSON.stringify({ account: String(selected.id).slice(-4), status: r.status })}`);
+      await recordUpstream429(env, selected, "search");
       await coolAccount(env, selected.id, positive(env.TIDAL_CROSSCHECK_COOLDOWN_SECONDS, 900));
       return busy();
     }
@@ -170,6 +172,7 @@ async function stream(trackId, request, env) {
   const key = `stream:${env.TIDAL_COUNTRY_CODE || "US"}:${trackId}:aac=${aac}:web=${web}`;
   const cached = await cachedJson(env, key);
   if (cached) return cached;
+  if (await softOpenBlocks(env)) return busy();
   const response = await streamUncached(trackId, request, env);
   let body;
   try { body = await response.clone().json(); } catch { return response; }
@@ -267,6 +270,31 @@ async function cacheJson(env, key, response, ttl) {
     await env.DB.prepare("INSERT OR REPLACE INTO tidal_response_cache(cache_key,response_json,expires_at) VALUES(?,?,?)")
       .bind(key, JSON.stringify({ status: response.status, body }), now() + Math.floor(ttl)).run();
   } catch { /* cache failures must never fail a relay request */ }
+}
+
+async function softOpenBlocks(env) {
+  const percent = Number.parseInt(env.TIDAL_SOFT_OPEN_PERCENT, 10);
+  if (!Number.isInteger(percent) || percent <= 0) return false;
+  const startedAt = now();
+  const seconds = positive(env.TIDAL_SOFT_OPEN_SECONDS, 600);
+  try {
+    await env.DB.prepare("INSERT OR IGNORE INTO tidal_soft_open_state(id,started_at) VALUES(1,?)").bind(startedAt).run();
+    const state = await env.DB.prepare("SELECT started_at FROM tidal_soft_open_state WHERE id=1").first();
+    return Boolean(state && state.started_at + seconds > now() && Math.random() * 100 < Math.min(percent, 100));
+  } catch { return false; }
+}
+
+async function recordUpstream429(env, account, endpoint) {
+  const event = {
+    account: String(account.id).slice(-4),
+    endpoint,
+    status: 429,
+    hour_n: Number(account.hour_n) || 0,
+    day_n: Number(account.day_n) || 0,
+  };
+  console.warn(`tidal_upstream_429 ${JSON.stringify(event)}`);
+  await env.DB.prepare("INSERT INTO tidal_upstream_429_events(account_id,endpoint,hour_n,day_n,occurred_at) VALUES(?,?,?,?,?)")
+    .bind(String(account.id), endpoint, event.hour_n, event.day_n, now()).run().catch(() => {});
 }
 
 function streamAnswerExpiry(body) {
@@ -478,12 +506,15 @@ async function playbackInfo(trackId, account, env, qualities = ["HI_RES_LOSSLESS
     for (const cc of unique([env.TIDAL_COUNTRY_CODE || "US", "ID", "GB", "US"])) {
       const p = new URLSearchParams({ countryCode: cc, audioquality: quality, playbackmode: "STREAM", assetpresentation: "FULL" });
       const r = await tidalFetch(`/tracks/${trackId}/playbackinfopostpaywall?${p}`, account, env);
+      if (r.status === 429) {
+        await recordUpstream429(env, account, "playbackinfo");
+        return r;
+      }
       if (!r.ok) {
         const details = await r.clone().json().catch(() => ({}));
         const userMessage = typeof details.userMessage === "string" ? details.userMessage.replace(/[\r\n]/g, " ").slice(0, 240) : null;
         console.warn(`tidal_playbackinfo ${JSON.stringify({ account: String(account.id).slice(-4), status: r.status, subStatus: details.subStatus ?? null, userMessage })}`);
       }
-      if (r.status === 429) return r;
       if (r.status === 401) return r;
       if (!r.ok) continue;
       if (quality === "HIGH") return r; // AAC asked for: the first answer is the one

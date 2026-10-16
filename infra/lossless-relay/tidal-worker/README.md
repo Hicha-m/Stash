@@ -56,3 +56,21 @@ mode. Successful stream answers are cached only until 60 seconds before the earl
 expiry exposed by the signed playback URL. Requests still pass the relay's caller and
 daily quota checks; a D1 cache hit does not consume a Tidal account slot.
 Apply with `wrangler d1 migrations apply` before deploying.
+
+## Cautious pool ramp
+
+The restart cap is configured to 100 requests/hour per account with a 1,600/day ceiling.
+Only raise the hourly cap to 250 after 3–4 hours without 429s. With the relay unpaused,
+the first cache miss starts a shared 10-minute soft-open window; 50% of uncached search
+and stream requests get `503 busy` with a five-minute retry. Cache hits continue to be
+served. After a later paused interval, reset the one-shot window with
+`DELETE FROM tidal_soft_open_state WHERE id=1` before reopening.
+
+Every upstream 429 is logged with the account suffix and its hour/day counters, and is
+stored in D1 for 30 days in `tidal_upstream_429_events`. Inspect recent events with:
+
+```sql
+SELECT substr(account_id, -4) AS account, endpoint, hour_n, day_n,
+       datetime(occurred_at, 'unixepoch') AS occurred_at
+FROM tidal_upstream_429_events ORDER BY occurred_at DESC;
+```

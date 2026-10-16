@@ -12,6 +12,8 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
   const dailyQuotas = new Map();
   const hiresCache = new Map();
   const responseCache = new Map();
+  const upstream429Events = [];
+  let softOpenState = null;
   const accountCaps = [];
   let nextAccount = 0;
   const env = {
@@ -34,6 +36,7 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
               const hit = responseCache.get(this.args[0]);
               return hit && hit.expires_at > this.args[1] ? { response_json: hit.response_json } : null;
             }
+            if (sql.includes("FROM tidal_soft_open_state")) return softOpenState;
             if (sql.includes("FROM tidal_hires_cache")) {
               const hit = hiresCache.get(this.args[0]);
               return hit && hit.checked_at > this.args[1] ? { hires: hit.hires } : null;
@@ -54,6 +57,13 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
             if (sql.includes("INTO tidal_response_cache")) {
               const [key, responseJson, expiresAt] = this.args;
               responseCache.set(key, { response_json: responseJson, expires_at: expiresAt });
+            }
+            if (sql.includes("INTO tidal_soft_open_state")) {
+              if (!softOpenState) softOpenState = { started_at: this.args[0] };
+            }
+            if (sql.includes("INTO tidal_upstream_429_events")) {
+              const [accountId, endpoint, hourN, dayN, occurredAt] = this.args;
+              upstream429Events.push({ account_id: accountId, endpoint, hour_n: hourN, day_n: dayN, occurred_at: occurredAt });
             }
             if (sql.includes("INSERT OR REPLACE INTO tidal_dash_manifests")) {
               const [trackId, manifestXml, initUrl, expiresAt] = this.args;
@@ -87,7 +97,7 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
     return new Response(JSON.stringify({ items: [] }), { status: 200 });
   };
 
-  return { env, calls, manifests, fetchTidal, dbWrites, dailyQuotas, accountCaps, hiresCache, responseCache };
+  return { env, calls, manifests, fetchTidal, dbWrites, dailyQuotas, accountCaps, hiresCache, responseCache, upstream429Events, get softOpenState() { return softOpenState; } };
 }
 
 function liveAccount() {
@@ -97,6 +107,8 @@ function liveAccount() {
     refresh_token: "test-tidal-refresh-token",
     token_expires_at: Math.floor(Date.now() / 1000) + 3600,
     generation: 1,
+    hour_n: 1,
+    day_n: 1,
   };
 }
 
@@ -189,6 +201,24 @@ test("an exhausted pool returns busy with a five-minute retry before contacting 
   assert.equal(f.calls.length, 0);
 });
 
+test("soft-open sheds the configured share of cache misses for its one-time window", async () => {
+  const f = fixture();
+  f.env.TIDAL_SOFT_OPEN_PERCENT = "100";
+  f.env.TIDAL_SOFT_OPEN_SECONDS = "600";
+  await withFetch(null, f.fetchTidal, async () => {
+    const first = await worker.fetch(authorizedRequest("/search?q=soft-open"), f.env);
+    const second = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    for (const response of [first, second]) {
+      assert.equal(response.status, 503);
+      assert.equal(response.headers.get("retry-after"), "300");
+      assert.deepEqual(await response.json(), { error: "busy" });
+    }
+  });
+  assert.ok(f.softOpenState?.started_at);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.accountCaps.length, 0);
+});
+
 test("Tidal search 429 cools that account and returns busy without caching an empty result", async () => {
   const f = fixture({ tidalResponse: async () => new Response("{}", { status: 429, headers: { "Retry-After": "60" } }) });
   await withFetch(null, f.fetchTidal, async () => {
@@ -200,6 +230,7 @@ test("Tidal search 429 cools that account and returns busy without caching an em
   assert.equal(f.calls.length, 1);
   assert.equal(f.responseCache.size, 0);
   assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("SET cooling_until") && args[0] >= Math.floor(Date.now() / 1000) + 899));
+  assert.deepEqual(f.upstream429Events.map(({ endpoint, hour_n, day_n }) => ({ endpoint, hour_n, day_n })), [{ endpoint: "search", hour_n: 1, day_n: 1 }]);
 });
 
 test("Tidal playback-info 429 cools that account and returns busy without caching a track miss", async () => {
@@ -213,6 +244,7 @@ test("Tidal playback-info 429 cools that account and returns busy without cachin
   assert.equal(f.calls.length, 1, "a 429 is not retried across qualities or regions");
   assert.equal(f.responseCache.size, 0);
   assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("SET cooling_until") && args[0] >= Math.floor(Date.now() / 1000) + 899));
+  assert.deepEqual(f.upstream429Events.map(({ endpoint, hour_n, day_n }) => ({ endpoint, hour_n, day_n })), [{ endpoint: "playbackinfo", hour_n: 1, day_n: 1 }]);
 });
 
 test("global daily stream cap allows requests to the cap and blocks the next one", async () => {
