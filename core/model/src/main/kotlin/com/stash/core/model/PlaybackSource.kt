@@ -50,7 +50,7 @@ sealed class PlaybackSource {
             is Album -> name
             is Radio -> "$label Radio"
             is Search -> "Search"
-            is AllSongs -> "All Songs"
+            is AllSongs -> "On this device"
             is Handoff -> label
             is Unknown -> ""
         }

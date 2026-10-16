@@ -37,7 +37,6 @@ import com.stash.feature.home.PlaylistBrowseScreen
 import com.stash.feature.library.AlbumDetailScreen
 import com.stash.feature.library.ArtistDetailScreen
 import com.stash.feature.library.LibraryScreen
-import com.stash.feature.library.allsongs.AllSongsScreen
 import com.stash.feature.library.LikedSongsDetailScreen
 import com.stash.feature.library.PlaylistDetailScreen
 import com.stash.feature.library.mixbuilder.MixBuilderScreen
@@ -261,9 +260,6 @@ private fun StashNavGraph(
                     }
                 },
             )
-        }
-        composable<AllSongsRoute> {
-            AllSongsScreen(onSelectionModeChanged = onSelectionModeChanged)
         }
         composable<SearchRoute> {
             SearchScreen(

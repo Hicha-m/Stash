@@ -73,7 +73,12 @@ class AllSongsViewModel @Inject constructor(
 
     private val scanMutex = Mutex()
 
-    init {
+    private var scannedOnce = false
+
+    /** The first time "On this device" opens in this ViewModel's life: scan the folders. Later scans are the Rescan button's. */
+    fun rescanOnOpen() {
+        if (scannedOnce) return
+        scannedOnce = true
         rescan()
     }
 
