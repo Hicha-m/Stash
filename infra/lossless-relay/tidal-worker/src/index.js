@@ -61,9 +61,14 @@ export default {
 function paused() {
   return json({ error: "tidal_relay_paused" }, 503, { "Retry-After": "600" });
 }
-function busy() {
-  return json({ error: "busy" }, 503, { "Retry-After": "300" });
+/**
+ * 503 busy. Same body for every cause so clients need no change; only Retry-After differs:
+ * 300 s when seats are capped/cooling, a short value when seats are only playback-paced.
+ */
+function busy(retryAfter = 300) {
+  return json({ error: "busy" }, 503, { "Retry-After": String(retryAfter) });
 }
+const PACING_RETRY_AFTER = 15;
 
 async function startDeviceAuth(request, env) {
   if (!authorized(request, env.ADMIN_TOKEN)) return unauthorized();
@@ -195,29 +200,22 @@ async function streamUncached(trackId, request, env) {
   const aacMode = new URL(request.url).searchParams.get("aac");
   const aacOnly = aacMode === "only";
   const allowAac = aacMode === "1" || aacOnly;
-  let refusedBy = null;
-  let unavailableBy = null;
-  let lossyInfo = null;
+  // Upstream budget: one playbackinfo call per seat taken. A second seat is only tried
+  // after a seat-level failure (dead session, failed refresh, Tidal 5xx), never for a
+  // track-level answer: with this client ID CD-only tracks always come back HIGH (AAC),
+  // and a 4005 is a track/rights refusal, so asking another seat just burns budget.
   for (let attempt = 0; attempt < 2; attempt++) {
-    const account = await takeAccount(env, refusedBy || unavailableBy);
-    if (!account) {
-      if (allowAac && lossyInfo) return aacInfo(lossyInfo);
-      return busy();
-    }
+    const account = await takeAccount(env, { playback: true });
+    if (!account) return busy(await onlyPacingBlocks(env) ? PACING_RETRY_AFTER : 300);
     const fresh = await refreshIfNeeded(account, env);
     if (!fresh) {
       await coolAccount(env, account.id, 300);
       continue;
     }
-    const data = await playbackInfo(trackId, fresh, env, aacOnly ? ["HIGH"] : undefined);
+    const data = await playbackInfo(trackId, fresh, env, aacOnly ? "HIGH" : "HI_RES_LOSSLESS");
     if (data.status === 401) {
       const denial = await data.clone().json().catch(() => ({}));
-      if (denial.subStatus === 4005) {
-        // An asset-not-ready refusal can differ across Tidal accounts. Check one
-        // other seat before treating it as unavailable to every relay user.
-        if (attempt === 0) { unavailableBy = account.id; continue; }
-        return json({ error: "not_available" }, 404);
-      }
+      if (denial.subStatus === 4005) return json({ error: "not_available" }, 404);
       await killAccount(env, account.id, "401");
       continue;
     }
@@ -233,17 +231,27 @@ async function streamUncached(trackId, request, env) {
     const info = await data.json();
     if (aacOnly) return aacInfo(info, await trackHires(trackId, fresh, env));
     if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
-      lossyInfo = info;
-      if (attempt === 0) { refusedBy = account.id; continue; }
-      if (allowAac) return aacInfo(info);
-      return json({ error: "lossless_unavailable" }, 404);
+      // The normal answer for a CD-only track with this client, not a seat problem.
+      return allowAac ? aacInfo(info) : json({ error: "lossless_unavailable" }, 404);
     }
-    if (refusedBy) await coolAccount(env, refusedBy, positive(env.TIDAL_CROSSCHECK_COOLDOWN_SECONDS, 900));
     const web = webEdge(request, env);
     if (web) return await edgeInfo(trackId, info, env, web);
     return await streamInfo(trackId, request, env, info, allowAac);
   }
-  return json({ error: refusedBy ? "lossless_unavailable" : "upstream_unavailable" }, refusedBy ? 404 : 503);
+  return json({ error: "upstream_unavailable" }, 503);
+}
+
+/**
+ * After a playback takeAccount found no seat: true when some seat is free under its
+ * caps and cooling but was refused only by playback pacing, so a short retry will work.
+ */
+async function onlyPacingBlocks(env) {
+  try {
+    const { hour, day, hourly, daily } = capWindow(env);
+    const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM tidal_accounts WHERE state='live' AND cooling_until<=?3
+      AND (hour_key!=?1 OR hour_n<?4) AND (day_key!=?2 OR day_n<?5)`).bind(hour, day, now(), hourly, daily).first();
+    return Number(row?.n) > 0;
+  } catch { return false; }
 }
 
 function normaliseQuery(query) { return query.trim().replace(/\s+/gu, " ").toLocaleLowerCase("en-US"); }
@@ -335,6 +343,7 @@ async function trackHires(trackId, account, env) {
       .bind(String(trackId), now() - HIRES_TTL).first();
     if (row) return row.hires === 1;
     const cc = encodeURIComponent(env.TIDAL_COUNTRY_CODE || "US");
+    await bumpSeat(env, account.id); // the metadata call is a second upstream call on this seat
     const r = await tidalFetch(`/tracks/${trackId}?countryCode=${cc}`, account, env);
     if (!r.ok) return undefined;
     const track = await r.json();
@@ -500,45 +509,68 @@ async function dash(request, trackId, env, isInit) {
   return new Response(xml, { headers: { "content-type": "application/dash+xml", "cache-control": "no-store", "access-control-allow-origin": "*" } });
 }
 
-async function playbackInfo(trackId, account, env, qualities = ["HI_RES_LOSSLESS", "LOSSLESS"]) {
-  let fallback = null;
-  for (const quality of qualities) {
-    for (const cc of unique([env.TIDAL_COUNTRY_CODE || "US", "ID", "GB", "US"])) {
-      const p = new URLSearchParams({ countryCode: cc, audioquality: quality, playbackmode: "STREAM", assetpresentation: "FULL" });
-      const r = await tidalFetch(`/tracks/${trackId}/playbackinfopostpaywall?${p}`, account, env);
-      if (r.status === 429) {
-        await recordUpstream429(env, account, "playbackinfo");
-        return r;
-      }
-      if (!r.ok) {
-        const details = await r.clone().json().catch(() => ({}));
-        const userMessage = typeof details.userMessage === "string" ? details.userMessage.replace(/[\r\n]/g, " ").slice(0, 240) : null;
-        console.warn(`tidal_playbackinfo ${JSON.stringify({ account: String(account.id).slice(-4), status: r.status, subStatus: details.subStatus ?? null, userMessage })}`);
-      }
-      if (r.status === 401) return r;
-      if (!r.ok) continue;
-      if (quality === "HIGH") return r; // AAC asked for: the first answer is the one
-      // Some Tidal regions return HTTP 200 with a lower quality than requested.
-      // Keep searching for FLAC before giving up; otherwise a successful HIGH
-      // response to HI_RES_LOSSLESS prevents the explicit LOSSLESS request.
-      const info = await r.clone().json().catch(() => null);
-      if (["LOSSLESS", "HI_RES_LOSSLESS"].includes(info?.audioQuality)) return r;
-      fallback = r;
-    }
+/**
+ * Exactly ONE upstream playbackinfo call: the configured country, the requested quality.
+ * Tidal answers with the best quality available up to the requested level, so asking
+ * HI_RES_LOSSLESS covers hi-res and (where this client gets it) CD FLAC; a HIGH answer
+ * is final. The old quality x country walk cost up to 6 calls per stream for CD-only
+ * tracks, which this client never receives as FLAC, and drew Tidal 429s.
+ */
+async function playbackInfo(trackId, account, env, quality) {
+  const p = new URLSearchParams({ countryCode: env.TIDAL_COUNTRY_CODE || "US", audioquality: quality, playbackmode: "STREAM", assetpresentation: "FULL" });
+  const r = await tidalFetch(`/tracks/${trackId}/playbackinfopostpaywall?${p}`, account, env);
+  if (r.status === 429) {
+    await recordUpstream429(env, account, "playbackinfo");
+    return r;
   }
-  return fallback || new Response("", { status: 404 });
+  if (!r.ok) {
+    // Redacted: last 4 of the seat id, status and Tidal's user message only.
+    const details = await r.clone().json().catch(() => ({}));
+    const userMessage = typeof details.userMessage === "string" ? details.userMessage.replace(/[\r\n]/g, " ").slice(0, 240) : null;
+    console.warn(`tidal_playbackinfo ${JSON.stringify({ account: String(account.id).slice(-4), status: r.status, subStatus: details.subStatus ?? null, userMessage })}`);
+  }
+  return r;
 }
 
-async function takeAccount(env, excludeId = null) {
-  const hour = new Date().toISOString().slice(0, 13);
-  const day = new Date().toISOString().slice(0, 10);
-  const hourly = positive(env.TIDAL_ACCOUNT_HOURLY_CAP, 250);
-  const daily = positive(env.TIDAL_ACCOUNT_DAILY_CAP, 1600);
+function capWindow(env) {
+  return {
+    hour: new Date().toISOString().slice(0, 13),
+    day: new Date().toISOString().slice(0, 10),
+    hourly: positive(env.TIDAL_ACCOUNT_HOURLY_CAP, 250),
+    daily: positive(env.TIDAL_ACCOUNT_DAILY_CAP, 1600),
+  };
+}
+
+/**
+ * Takes the least-recently-used live seat under its caps and counts one upstream call
+ * against it. With `playback: true` the seat must also have had no playback lookup in
+ * the last TIDAL_PLAYBACK_MIN_INTERVAL_SECONDS (default 12), and last_playback_at is
+ * stamped. Searches and metadata lookups pass no option: never paced, never stamped.
+ */
+async function takeAccount(env, { playback = false } = {}) {
+  const { hour, day, hourly, daily } = capWindow(env);
+  const t = now();
+  const paceCutoff = t - positive(env.TIDAL_PLAYBACK_MIN_INTERVAL_SECONDS, 12);
   return await env.DB.prepare(`UPDATE tidal_accounts SET
       hour_n=CASE WHEN hour_key=?1 THEN hour_n+1 ELSE 1 END,hour_key=?1,
-      day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2,last_used_at=?3
-    WHERE id=(SELECT id FROM tidal_accounts WHERE state='live' AND cooling_until<=?3 AND (hour_key!=?1 OR hour_n<?4) AND (day_key!=?2 OR day_n<?5) AND id IS NOT ?6 ORDER BY last_used_at,id LIMIT 1)
-    RETURNING *`).bind(hour, day, now(), hourly, daily, excludeId).first();
+      day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2,last_used_at=?3,
+      last_playback_at=CASE WHEN ?6=1 THEN ?3 ELSE last_playback_at END
+    WHERE id=(SELECT id FROM tidal_accounts WHERE state='live' AND cooling_until<=?3 AND (hour_key!=?1 OR hour_n<?4) AND (day_key!=?2 OR day_n<?5)
+      AND (?6=0 OR last_playback_at<=?7) ORDER BY last_used_at,id LIMIT 1)
+    RETURNING *`).bind(hour, day, t, hourly, daily, playback ? 1 : 0, paceCutoff).first();
+}
+
+/**
+ * Counts one extra upstream Tidal call against a seat already taken (takeAccount counts
+ * the first): the hires metadata lookup and the post-refresh retry in tidalFetch. Keeps
+ * hour_n/day_n equal to real upstream load. Never throws.
+ */
+async function bumpSeat(env, id) {
+  const { hour, day } = capWindow(env);
+  await env.DB.prepare(`UPDATE tidal_accounts SET
+      hour_n=CASE WHEN hour_key=?1 THEN hour_n+1 ELSE 1 END,hour_key=?1,
+      day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2
+    WHERE id=?3`).bind(hour, day, id).run().catch(() => {});
 }
 
 async function admitStream(request, env) {
@@ -638,7 +670,9 @@ async function tidalFetch(path, account, env) {
     const error = await r.clone().json().catch(() => ({}));
     if (error.subStatus === 4005) return r;
     const fresh = await refreshAccount(account, env);
-    if (fresh) r = await fetch(`${API}${path}`, { headers: tidalHeaders(fresh.access_token), signal: AbortSignal.timeout(9000) });
+    if (!fresh) return r;
+    await bumpSeat(env, account.id); // the retry is a second upstream call on this seat
+    r = await fetch(`${API}${path}`, { headers: tidalHeaders(fresh.access_token), signal: AbortSignal.timeout(9000) });
   }
   return r;
 }
@@ -656,7 +690,6 @@ function unauthorized() { return json({ error: "unauthorized" }, 401); }
 function json(data, status = 200, extra = {}) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...extra } }); }
 function now() { return Math.floor(Date.now() / 1000); }
 function positive(value, fallback) { const n = Number.parseInt(value, 10); return n > 0 ? n : fallback; }
-function unique(values) { return [...new Set(values)]; }
 function constantTime(a, b) { if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false; let x = 0; for (let i = 0; i < a.length; i++) x |= a.charCodeAt(i) ^ b.charCodeAt(i); return x === 0; }
 async function signature(secret, path, exp) { const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]); const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${path}:${exp}`))); return [...mac].map((b) => b.toString(16).padStart(2, "0")).join(""); }
 async function validSignature(secret, path, expRaw, sig) { const exp = Number(expRaw); if (!secret || !Number.isInteger(exp) || exp < now() || exp > now() + 3700 || typeof sig !== "string") return false; return constantTime(await signature(secret, path, exp), sig); }

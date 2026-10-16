@@ -5,7 +5,17 @@ import worker, { networkOf, networkTag } from "../src/index.js";
 const ACCESS_TOKEN = "test-access-token";
 const MPD = '<MPD><SegmentTemplate initialization="https://sp-ad-fa.audio.tidal.com/init.mp4?token=test" media="https://audio.tidal.com/$Number$" /></MPD>';
 
-function fixture({ tidalResponse, account = liveAccount(), accounts = [account] } = {}) {
+/**
+ * `pool: true` simulates tidal_accounts selection (caps, cooling, playback pacing, LRU)
+ * and mutates `accounts` in place; otherwise takeAccount hands out `accounts` in order.
+ */
+function fixture({ tidalResponse, account = liveAccount(), accounts = [account], pool = false } = {}) {
+  const eligible = (a, [hour, day, t, hourly, daily]) => (a.state || "live") === "live" && (a.cooling_until || 0) <= t
+    && (a.hour_key !== hour || a.hour_n < hourly) && (a.day_key !== day || a.day_n < daily);
+  const bump = (a, hour, day) => {
+    a.hour_n = a.hour_key === hour ? a.hour_n + 1 : 1; a.hour_key = hour;
+    a.day_n = a.day_key === day ? a.day_n + 1 : 1; a.day_key = day;
+  };
   const manifests = new Map();
   const calls = [];
   const dbWrites = [];
@@ -29,7 +39,19 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
           async first() {
             if (sql.includes("hour_n=CASE") && sql.includes("RETURNING *")) {
               accountCaps.push({ hourly: this.args[3], daily: this.args[4] });
-              return accounts[nextAccount++] || null;
+              if (!pool) return accounts[nextAccount++] || null;
+              const [hour, day, t, , , playback, paceCutoff] = this.args;
+              const pick = accounts
+                .filter((a) => eligible(a, this.args) && (playback === 0 || (a.last_playback_at || 0) <= paceCutoff))
+                .sort((x, y) => (x.last_used_at || 0) - (y.last_used_at || 0))[0];
+              if (!pick) return null;
+              bump(pick, hour, day);
+              pick.last_used_at = t;
+              if (playback === 1) pick.last_playback_at = t;
+              return { ...pick };
+            }
+            if (sql.includes("COUNT(*) AS n FROM tidal_accounts")) {
+              return pool ? { n: accounts.filter((a) => eligible(a, this.args)).length } : null;
             }
             if (sql.includes("SELECT manifest_xml,init_url,expires_at")) return manifests.get(this.args[0]) || null;
             if (sql.includes("FROM tidal_response_cache")) {
@@ -45,6 +67,11 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
           },
           async run() {
             dbWrites.push({ sql, args: this.args });
+            if (pool && sql.includes("hour_n=CASE") && sql.includes("WHERE id=?3")) {
+              const [hour, day, id] = this.args;
+              const seat = accounts.find((a) => a.id === id);
+              if (seat) bump(seat, hour, day);
+            }
             if (sql.includes("INSERT INTO tidal_daily_quotas")) {
               const [day, key] = this.args;
               const mapKey = `${day}:${key}`;
@@ -97,7 +124,7 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
     return new Response(JSON.stringify({ items: [] }), { status: 200 });
   };
 
-  return { env, calls, manifests, fetchTidal, dbWrites, dailyQuotas, accountCaps, hiresCache, responseCache, upstream429Events, get softOpenState() { return softOpenState; } };
+  return { env, accounts, calls, manifests, fetchTidal, dbWrites, dailyQuotas, accountCaps, hiresCache, responseCache, upstream429Events, get softOpenState() { return softOpenState; } };
 }
 
 function liveAccount() {
@@ -334,23 +361,6 @@ test("search cache is shared across normalized query variants for five days", as
   assert.ok(entry.expires_at >= Math.floor(Date.now() / 1000) + 5 * 86400 - 2);
 });
 
-test("stream continues from a downgraded Hi Res response to a Lossless request", async () => {
-  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
-  const f = fixture({ tidalResponse: async (url) => {
-    const quality = new URL(url).searchParams.get("audioquality");
-    return playbackInfo(quality === "HI_RES_LOSSLESS" ? "HIGH" : "LOSSLESS", "application/vnd.tidal.bts", direct);
-  } });
-
-  await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:321?client=media3"), f.env);
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.codec, "flac");
-    assert.equal(body.url, "https://cdn.example/track.flac");
-    assert.ok(f.calls.some(({ url }) => new URL(url).searchParams.get("audioquality") === "LOSSLESS"));
-  });
-});
-
 test("successful stream answers are shared only until shortly before the Tidal URL expires", async () => {
   const expiry = Math.floor(Date.now() / 1000) + 1800;
   const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: [`https://cdn.example/track.flac?token=${expiry}~sig`] });
@@ -384,79 +394,68 @@ test("track-level lossless refusals are cached across app requests", async () =>
     assert.equal(f.calls.length, callsAfterMiss);
   });
   assert.equal(f.responseCache.size, 1);
-  assert.equal(f.accountCaps.length, 2, "the second request spends a relay request quota but takes no Tidal account");
+  assert.equal(f.accountCaps.length, 1, "the second request spends a relay request quota but takes no Tidal account");
 });
 
-test("stream rejects a Tidal response below lossless quality", async () => {
-  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
-  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account" }];
-  const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", direct) });
+const playbackCalls = (f) => f.calls.filter((c) => c.url.includes("/playbackinfopostpaywall"));
+const FLAC_BTS = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
+const AAC_BTS = JSON.stringify({ mimeType: "audio/mp4", codecs: "mp4a.40.2", urls: ["https://cdn.example/track.m4a"] });
 
-  await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
-    assert.equal(response.status, 404);
-    assert.deepEqual(await response.json(), { error: "lossless_unavailable" });
-    assert.ok(f.calls.length > 1); // retries other quality/region combinations
-  });
-});
-
-test("two accounts declining the same track are not cooled", async () => {
-  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
+test("a CD-only track (HIGH answer) costs one playbackinfo call, one seat, and is never cross-checked", async () => {
   const accounts = [liveAccount(), { ...liveAccount(), id: "second-account", access_token: "second-token" }];
-  const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", direct) });
-
+  const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", AAC_BTS) });
   await withFetch(null, f.fetchTidal, async () => {
     const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
     assert.equal(response.status, 404);
     assert.deepEqual(await response.json(), { error: "lossless_unavailable" });
-    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until")), false);
   });
+  assert.equal(f.calls.length, 1);
+  const p = new URL(f.calls[0].url).searchParams;
+  assert.equal(p.get("audioquality"), "HI_RES_LOSSLESS");
+  assert.equal(p.get("countryCode"), "US");
+  assert.equal(f.accountCaps.length, 1, "no second seat is taken for a below-lossless answer");
+  assert.equal(f.calls.some(({ options }) => options.headers.authorization === "Bearer second-token"), false);
+  assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
 });
 
-test("a single-account track-level quality refusal returns busy without cooling the account", async () => {
-  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
-  const f = fixture({ tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", direct) });
-
+test("?aac=1 answers a CD-only track with AAC from the same single call", async () => {
+  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account" }];
+  const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", AAC_BTS) });
   await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
-    assert.equal(response.status, 503);
-    assert.deepEqual(await response.json(), { error: "busy" });
-    assert.equal(response.headers.get("retry-after"), "300");
-    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until")), false);
+    const body = await (await worker.fetch(authorizedRequest("/stream/td:1550546?aac=1"), f.env)).json();
+    assert.equal(body.codec, "aac");
+    assert.equal(body.bitrate, 320);
   });
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.accountCaps.length, 1);
 });
 
-test("a refusal without a second account to cross-check returns busy instead of caching a false miss", async () => {
-  const f = fixture({ tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", "{}") });
+test("a hi-res track costs one playbackinfo call", async () => {
+  const f = fixture({ tidalResponse: async () => playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", MPD) });
   await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
-    assert.equal(response.status, 503);
-    assert.deepEqual(await response.json(), { error: "busy" });
-  });
-  assert.equal(f.responseCache.size, 0);
-});
-
-test("stream cross-checks a downgraded account against the next account, then cools the refuser", async () => {
-  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
-  const accounts = [liveAccount(), { ...liveAccount(), id: "reserve-account", access_token: "reserve-token" }];
-  const f = fixture({ accounts, tidalResponse: async (_url, options) => {
-    const isReserve = options.headers.authorization === "Bearer reserve-token";
-    return playbackInfo(isReserve ? "LOSSLESS" : "HIGH", "application/vnd.tidal.bts", direct);
-  } });
-
-  await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    const response = await worker.fetch(authorizedRequest("/stream/td:654"), f.env);
     assert.equal(response.status, 200);
-    assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("cooling_until") && args[1] === "test-account" && args[0] >= Math.floor(Date.now() / 1000) + 899));
+    assert.equal((await response.json()).manifest, "dash");
   });
+  assert.equal(playbackCalls(f).length, 1);
+  assert.equal(f.calls.length, 1);
+});
+
+test("a LOSSLESS answer to the HI_RES_LOSSLESS request is served as FLAC", async () => {
+  const f = fixture({ tidalResponse: async () => playbackInfo("LOSSLESS", "application/vnd.tidal.bts", FLAC_BTS) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const body = await (await worker.fetch(authorizedRequest("/stream/td:321"), f.env)).json();
+    assert.equal(body.codec, "flac");
+    assert.equal(body.url, "https://cdn.example/track.flac");
+  });
+  assert.equal(f.calls.length, 1);
 });
 
 test("an invalid-session account is quarantined and the next account serves", async () => {
-  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
   const accounts = [liveAccount(), { ...liveAccount(), id: "reserve-account", access_token: "reserve-token" }];
   const f = fixture({ accounts, tidalResponse: async (_url, options) => {
     if (options.headers.authorization === "Bearer test-tidal-access-token") return new Response("{}", { status: 401 });
-    return playbackInfo("LOSSLESS", "application/vnd.tidal.bts", direct);
+    return playbackInfo("LOSSLESS", "application/vnd.tidal.bts", FLAC_BTS);
   } });
 
   await withFetch(null, f.fetchTidal, async () => {
@@ -466,74 +465,81 @@ test("an invalid-session account is quarantined and the next account serves", as
   });
 });
 
-test("Tidal subStatus 4005 without another account returns busy and never retires the account", async () => {
-  const f = fixture({ tidalResponse: async () => new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 }) });
+test("Tidal subStatus 4005 is a track-level not_available: no second seat, account never retired", async () => {
+  const accounts = ["a", "b", "c"].map((id) => ({ ...liveAccount(), id }));
+  const f = fixture({ accounts, tidalResponse: async () => new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 }) });
 
   await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
-    assert.equal(response.status, 503);
-    assert.deepEqual(await response.json(), { error: "busy" });
-    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("state='dead'")), false);
+    for (const path of ["/stream/td:321", "/stream/td:322?aac=only", "/stream/td:323?aac=1"]) {
+      const response = await worker.fetch(authorizedRequest(path), f.env);
+      assert.equal(response.status, 404);
+      assert.deepEqual(await response.json(), { error: "not_available" });
+    }
   });
+  assert.equal(f.calls.length, 3, "one upstream call per stream");
+  assert.equal(f.accountCaps.length, 3, "one seat per stream: no second-seat retry");
+  assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
 });
 
-test("?aac=only retries a 4005 refusal on another account for a Hi-Res track", async () => {
-  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account", access_token: "second-token" }];
-  const aac = JSON.stringify({ mimeType: "audio/mp4", codecs: "mp4a.40.2", urls: ["https://cdn.example/track.m4a"] });
-  const f = fixture({ accounts, tidalResponse: async (url, options) => {
-    if (options.headers.authorization === "Bearer test-tidal-access-token") return new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 });
-    if (url.includes("playbackinfopostpaywall")) return playbackInfo("HIGH", "application/vnd.tidal.bts", aac);
-    return new Response(JSON.stringify({ mediaMetadata: { tags: ["HIRES_LOSSLESS"] } }), { status: 200 });
-  } });
-
+test("playback pacing blocks a second lookup on the same seat but never blocks search", async () => {
+  const f = fixture({ pool: true, accounts: [liveAccount()], tidalResponse: async (url) => (url.includes("/search/")
+    ? new Response(JSON.stringify({ items: [] }), { status: 200 })
+    : playbackInfo("LOSSLESS", "application/vnd.tidal.bts", FLAC_BTS)) });
   await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:363236466?aac=only"), f.env);
-    assert.equal(response.status, 200);
-    const body = await response.json();
+    assert.equal((await worker.fetch(authorizedRequest("/stream/td:1"), f.env)).status, 200);
+    const paced = await worker.fetch(authorizedRequest("/stream/td:2"), f.env);
+    assert.equal(paced.status, 503);
+    assert.deepEqual(await paced.json(), { error: "busy" });
+    assert.equal(paced.headers.get("retry-after"), "15", "pacing-busy asks for a short retry");
+    const stampedAt = f.accounts[0].last_playback_at;
+    assert.ok(stampedAt > 0);
+    assert.equal((await worker.fetch(authorizedRequest("/search?q=anything"), f.env)).status, 200);
+    assert.equal(f.accounts[0].last_playback_at, stampedAt, "search does not stamp last_playback_at");
+  });
+  assert.equal(playbackCalls(f).length, 1);
+  assert.equal(f.calls.length, 2);
+});
+
+test("pacing lets a lookup through once the interval has passed, and busy when every seat is paced", async () => {
+  const old = Math.floor(Date.now() / 1000) - 13;
+  const accounts = [{ ...liveAccount(), id: "a", last_playback_at: old }, { ...liveAccount(), id: "b", last_playback_at: old }];
+  const f = fixture({ pool: true, accounts, tidalResponse: async () => playbackInfo("LOSSLESS", "application/vnd.tidal.bts", FLAC_BTS) });
+  await withFetch(null, f.fetchTidal, async () => {
+    assert.equal((await worker.fetch(authorizedRequest("/stream/td:1"), f.env)).status, 200);
+    assert.equal((await worker.fetch(authorizedRequest("/stream/td:2"), f.env)).status, 200);
+    const third = await worker.fetch(authorizedRequest("/stream/td:3"), f.env);
+    assert.equal(third.status, 503, "both seats paced");
+    assert.deepEqual(await third.json(), { error: "busy" });
+    assert.equal(third.headers.get("retry-after"), "15");
+  });
+  assert.ok(f.accounts.every((a) => a.last_playback_at > old));
+  assert.equal(f.calls.length, 2);
+});
+
+test("capped seats keep the five-minute busy, not the pacing retry", async () => {
+  const hour = new Date().toISOString().slice(0, 13);
+  const f = fixture({ pool: true, accounts: [{ ...liveAccount(), hour_key: hour, hour_n: 250 }] });
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:1"), f.env);
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get("retry-after"), "300");
+  });
+  assert.equal(f.calls.length, 0);
+});
+
+test("seat counters reflect every upstream call, including the hires metadata lookup", async () => {
+  const f = fixture({ pool: true, accounts: [{ ...liveAccount(), hour_n: 0, day_n: 0 }], tidalResponse: (url) => (url.includes("/playbackinfopostpaywall")
+    ? playbackInfo("HIGH", "application/vnd.tidal.bts", AAC_BTS)
+    : new Response(JSON.stringify({ mediaMetadata: { tags: ["HIRES_LOSSLESS"] } }), { status: 200 })) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const body = await (await worker.fetch(authorizedRequest("/stream/td:42?aac=only"), f.env)).json();
     assert.equal(body.codec, "aac");
     assert.equal(body.hires, true);
-    assert.ok(f.calls.some(({ options }) => options.headers.authorization === "Bearer second-token"));
-    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
   });
-});
-
-test("?web=1 retries a 4005 refusal on another account and returns signed Hi-Res links", async () => {
-  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account", access_token: "second-token" }];
-  const f = fixture({ accounts, tidalResponse: async (_url, options) => {
-    if (options.headers.authorization === "Bearer test-tidal-access-token") return new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 });
-    return playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", MPD);
-  } });
-  Object.assign(f.env, { EDGE_SECRET: "e".repeat(64), EDGE_BASE: "https://tidal-edge.example.deno.net" });
-
-  await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:363236466?web=1"), f.env);
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.edge, true);
-    assert.equal(body.codec, "flac");
-    assert.match(body.url, /^https:\/\/tidal-edge\.example\.deno\.net\/t\//);
-    assert.ok(f.calls.some(({ options }) => options.headers.authorization === "Bearer second-token"));
-    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
-  });
-});
-
-test("?aac=1 retries a 4005 refusal on another account and preserves the app AAC fallback", async () => {
-  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account", access_token: "second-token" }];
-  const aac = JSON.stringify({ mimeType: "audio/mp4", codecs: "mp4a.40.2", urls: ["https://cdn.example/track.m4a"] });
-  const f = fixture({ accounts, tidalResponse: async (_url, options) => {
-    if (options.headers.authorization === "Bearer test-tidal-access-token") return new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 });
-    return playbackInfo("HIGH", "application/vnd.tidal.bts", aac);
-  } });
-
-  await withFetch(null, f.fetchTidal, async () => {
-    const response = await worker.fetch(authorizedRequest("/stream/td:1550546?aac=1"), f.env);
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.codec, "aac");
-    assert.equal(body.bitrate, 320);
-    assert.ok(f.calls.some(({ options }) => options.headers.authorization === "Bearer second-token"));
-    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
-  });
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.accounts[0].hour_n, 2);
+  assert.equal(f.accounts[0].day_n, 2);
+  assert.equal(new URL(playbackCalls(f)[0].url).searchParams.get("audioquality"), "HIGH");
 });
 
 test("DASH manifest route passes Tidal's init URL through unchanged", async () => {
