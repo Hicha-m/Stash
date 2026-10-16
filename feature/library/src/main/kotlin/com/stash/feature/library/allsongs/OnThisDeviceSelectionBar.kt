@@ -24,7 +24,6 @@ import com.stash.core.ui.components.ListenTogetherRole
 import com.stash.core.ui.components.LocalListenTogetherRole
 import com.stash.core.ui.selection.SelectionAction
 import com.stash.core.ui.selection.SelectionScaffoldOverlay
-import com.stash.core.ui.selection.SelectionScaffoldOverlay
 import com.stash.core.ui.selection.SelectionState
 
 /**
