@@ -1,5 +1,6 @@
 package com.stash.feature.library.allsongs
 
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PlaylistAdd
@@ -32,7 +33,7 @@ import com.stash.core.ui.selection.SelectionState
  * the active one, over Library's one [SelectionState].
  */
 @Composable
-fun OnThisDeviceSelectionBar(
+fun BoxScope.OnThisDeviceSelectionBar(
     selection: SelectionState,
     viewModel: AllSongsViewModel,
 ) {
