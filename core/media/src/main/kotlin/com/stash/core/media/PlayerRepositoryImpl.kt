@@ -1076,7 +1076,9 @@ class PlayerRepositoryImpl @Inject constructor(
             // Full-fat resolve (allowYtDlp = true) for the single next-up track
             // during active playback, so auto-advance stays seamless during a
             // Qobuz-proxy outage even if it falls through to the YouTube path.
-            streamResolver.resolve(entity, allowYouTube = true, allowYtDlp = true)
+            // speculative: a Tidal-only track is left to the real play (the user may skip
+            // it); the shared Tidal relay pool is small.
+            streamResolver.resolve(entity, allowYouTube = true, allowYtDlp = true, speculative = true)
         } catch (ce: CancellationException) {
             prefetchInFlight.remove(next.id)
             throw ce

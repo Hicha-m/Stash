@@ -47,6 +47,60 @@ class StreamSourceRegistryTest {
         LosslessSourceHealth(), losslessPrefs, dispatcher, log,
     )
 
+    private fun registryWithTidal(tidal: TidalStreamResolver) = StreamSourceRegistry(
+        kennyy, qobuz, qbdlx, jiosaavn, youtube, streamingPreference,
+        LosslessSourceHealth(), losslessPrefs, Dispatchers.IO, log, tidal,
+    )
+
+    @Test
+    fun `speculative prefetch never asks the Tidal relay and caches no lossy stand-in`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+        val tidal: TidalStreamResolver = mockk {
+            coEvery { needsRelay(any()) } returns true
+            coEvery { resolve(any()) } returns stubStreamUrl("tidal")
+        }
+        val track = stubTrack()
+
+        val result = registryWithTidal(tidal).resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+
+        assertThat(result).isNull()
+        coVerify(exactly = 0) { tidal.resolve(any()) }
+        coVerify(exactly = 0) { youtube.resolve(any(), any()) }
+        coVerify(exactly = 0) { jiosaavn.resolve(any()) }
+    }
+
+    @Test
+    fun `speculative prefetch walks on past a cached Tidal miss`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+        val tidal: TidalStreamResolver = mockk {
+            coEvery { needsRelay(any()) } returns false
+            coEvery { resolve(any()) } returns null
+        }
+
+        val result = registryWithTidal(tidal).resolve(stubTrack(), allowYouTube = true, allowYtDlp = true, speculative = true)
+
+        assertThat(result!!.origin).isEqualTo("youtube")
+    }
+
+    @Test
+    fun `a real play asks Tidal`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val tidal: TidalStreamResolver = mockk {
+            coEvery { resolve(any()) } returns stubStreamUrl("tidal")
+        }
+
+        val result = registryWithTidal(tidal).resolve(stubTrack(), allowYouTube = true, allowYtDlp = true)
+
+        assertThat(result!!.origin).isEqualTo("tidal")
+        coVerify(exactly = 0) { tidal.needsRelay(any()) }
+    }
+
     private fun stubStreamUrl(origin: String) = StreamUrl(
         url = "https://example.test/$origin.flac",
         expiresAtMs = Long.MAX_VALUE,
