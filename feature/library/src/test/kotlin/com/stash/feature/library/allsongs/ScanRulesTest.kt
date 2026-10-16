@@ -6,12 +6,17 @@ import com.stash.core.data.db.entity.ScannedSongEntity
 import com.stash.core.model.MusicSource
 import com.stash.core.model.isScannedSong
 import org.junit.Test
+import org.junit.Rule
+import org.junit.rules.TemporaryFolder
 
 /**
  * The All Songs scanner's rules: no overlapping folders and not Stash's own download folder (review C6),
  * files re-read when they change (C7), a failed listing never deletes (N3), the playable allowlist.
  */
 class ScanRulesTest {
+    @get:Rule val tmp = TemporaryFolder()
+
+    private val covers by lazy { ScannedCoverStore(tmp.newFolder("scanned_art")) }
 
     private val ext = "com.android.externalstorage.documents"
     private fun tree(docId: String, authority: String = ext) = TreeRef(authority, docId)
@@ -126,12 +131,23 @@ class ScanRulesTest {
             id = 7, folderId = 1, uri = "content://x/tree/t/document/a.flac", title = "T", artist = "A", album = "",
             durationMs = 1000, fileFormat = "flac", fileSizeBytes = 5, lastModified = 9, dateAdded = 3,
         )
-        val track = row.toTrack()
+        val track = row.toTrack(covers)
         assertThat(track.isScannedSong).isTrue()
         assertThat(track.source).isEqualTo(MusicSource.LOCAL)
         assertThat(track.isDownloaded).isTrue()
         assertThat(track.filePath).isEqualTo(row.uri)
         assertThat(track.fileFormat).isEqualTo("flac")
-        assertThat(row.copy(id = 8).toTrack().id).isNotEqualTo(track.id)
+        assertThat(row.copy(id = 8).toTrack(covers).id).isNotEqualTo(track.id)
+    }
+
+    @Test fun `a stored cover name resolves to a path in the cover directory`() {
+        val row = ScannedSongEntity(
+            id = 1, folderId = 1, uri = "content://x/a.mp3", title = "T", artist = "A", album = "",
+            durationMs = 1, fileFormat = "mp3", fileSizeBytes = 1, lastModified = 1, dateAdded = 1,
+            albumArtPath = "scanned_abc.jpg",
+        )
+        assertThat(row.toTrack(covers).albumArtPath).isEqualTo(covers.file("scanned_abc.jpg").absolutePath)
+        assertThat(row.copy(albumArtPath = "").toTrack(covers).albumArtPath).isNull()
+        assertThat(row.copy(albumArtPath = null).toTrack(covers).albumArtPath).isNull()
     }
 }
