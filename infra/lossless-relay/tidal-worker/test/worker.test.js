@@ -10,6 +10,7 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
   const calls = [];
   const dbWrites = [];
   const dailyQuotas = new Map();
+  const hiresCache = new Map();
   const accountCaps = [];
   let nextAccount = 0;
   const env = {
@@ -28,6 +29,10 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
               return accounts[nextAccount++] || null;
             }
             if (sql.includes("SELECT manifest_xml,init_url,expires_at")) return manifests.get(this.args[0]) || null;
+            if (sql.includes("FROM tidal_hires_cache")) {
+              const hit = hiresCache.get(this.args[0]);
+              return hit && hit.checked_at > this.args[1] ? { hires: hit.hires } : null;
+            }
             return null;
           },
           async run() {
@@ -36,6 +41,10 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
               const [day, key] = this.args;
               const mapKey = `${day}:${key}`;
               dailyQuotas.set(mapKey, (dailyQuotas.get(mapKey) || 0) + 1);
+            }
+            if (sql.includes("INTO tidal_hires_cache")) {
+              const [trackId, hires, checkedAt] = this.args;
+              hiresCache.set(trackId, { hires, checked_at: checkedAt });
             }
             if (sql.includes("INSERT OR REPLACE INTO tidal_dash_manifests")) {
               const [trackId, manifestXml, initUrl, expiresAt] = this.args;
@@ -69,7 +78,7 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
     return new Response(JSON.stringify({ items: [] }), { status: 200 });
   };
 
-  return { env, calls, manifests, fetchTidal, dbWrites, dailyQuotas, accountCaps };
+  return { env, calls, manifests, fetchTidal, dbWrites, dailyQuotas, accountCaps, hiresCache };
 }
 
 function liveAccount() {
@@ -400,4 +409,78 @@ test("?web=1 without an edge configured keeps the normal answer; no ?web keeps i
       assert.match(b.url, /^https:\/\/relay\.example\/dash\/td\/654\.mpd/);
     });
   }
+});
+
+function aacResponse() {
+  return playbackInfo("HIGH", "application/vnd.tidal.bts",
+    JSON.stringify({ mimeType: "audio/mp4", codecs: "mp4a.40.2", urls: ["https://cdn.example/track.m4a"] }));
+}
+
+/** Tidal stub: AAC playbackinfo plus a /tracks/<id> metadata answer from `meta(url)`. */
+function aacWithMeta(meta) {
+  return (url) => (url.includes("/playbackinfopostpaywall") ? aacResponse() : meta(url));
+}
+const metaCalls = (f) => f.calls.filter((c) => /\/tracks\/\d+\?/.test(c.url));
+
+test("?aac=only reports hires=true from mediaMetadata HIRES_LOSSLESS, then serves it from the cache", async () => {
+  const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "LOSSLESS", mediaMetadata: { tags: ["LOSSLESS", "HIRES_LOSSLESS"] } }), { status: 200 })) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const first = await (await worker.fetch(authorizedRequest("/stream/42?aac=only"), f.env)).json();
+    assert.equal(first.codec, "aac");
+    assert.equal(first.hires, true);
+    assert.equal(metaCalls(f).length, 1);
+    assert.match(metaCalls(f)[0].url, /\/tracks\/42\?countryCode=US$/);
+
+    const second = await (await worker.fetch(authorizedRequest("/stream/42?aac=only"), f.env)).json();
+    assert.equal(second.hires, true);
+    assert.equal(metaCalls(f).length, 1, "cache hit makes no metadata call");
+  });
+  // One daily stream-quota unit per stream; the metadata lookup adds none.
+  assert.equal(f.dailyQuotas.get(`${new Date().toISOString().slice(0, 10)}:global`), 2);
+});
+
+test("?aac=only accepts audioQuality HI_RES_LOSSLESS as hires", async () => {
+  const f = fixture({ tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "HI_RES_LOSSLESS" }), { status: 200 })) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const body = await (await worker.fetch(authorizedRequest("/stream/7?aac=only"), f.env)).json();
+    assert.equal(body.hires, true);
+  });
+});
+
+test("?aac=only reports hires=false for a CD-quality track and caches the false", async () => {
+  const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "LOSSLESS", mediaMetadata: { tags: ["LOSSLESS"] } }), { status: 200 })) });
+  await withFetch(null, f.fetchTidal, async () => {
+    assert.equal((await (await worker.fetch(authorizedRequest("/stream/8?aac=only"), f.env)).json()).hires, false);
+    assert.equal((await (await worker.fetch(authorizedRequest("/stream/8?aac=only"), f.env)).json()).hires, false);
+    assert.equal(metaCalls(f).length, 1);
+  });
+  assert.deepEqual(f.hiresCache.get("8").hires, 0);
+});
+
+test("?aac=only omits hires when metadata fails, is unparseable, or throws; playback still answers", async () => {
+  for (const meta of [
+    () => new Response("", { status: 500 }),
+    () => new Response("not json", { status: 200 }),
+    () => new Response(JSON.stringify({ title: "no quality fields" }), { status: 200 }),
+    () => { throw new TypeError("network down"); },
+  ]) {
+    const f = fixture({ tidalResponse: aacWithMeta(meta) });
+    await withFetch(null, f.fetchTidal, async () => {
+      const res = await worker.fetch(authorizedRequest("/stream/9?aac=only"), f.env);
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.codec, "aac");
+      assert.equal("hires" in body, false);
+    });
+    assert.equal(f.hiresCache.size, 0, "unknown is never cached");
+  }
+});
+
+test("only ?aac=only looks up hires; lossless streams make no metadata call", async () => {
+  const f = fixture({ tidalResponse: () => losslessResponse() });
+  await withFetch(null, f.fetchTidal, async () => {
+    const body = await (await worker.fetch(authorizedRequest("/stream/10"), f.env)).json();
+    assert.equal("hires" in body, false);
+    assert.equal(metaCalls(f).length, 0);
+  });
 });

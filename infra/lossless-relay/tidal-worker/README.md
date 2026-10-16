@@ -37,3 +37,13 @@ refuses Cloudflare egress and browser Origins): `{ url: <edge>/t/<token>/manifes
 The token is base64url(JSON) "." base64url(HMAC-SHA256(EDGE_SECRET, body)) and carries the Tidal URLs / MPD itself
 (no D1 write). Needs `wrangler secret put EDGE_SECRET` (same value as the edge) and the var `EDGE_BASE`
 (e.g. `https://tidal-edge.<org>.deno.net`). Without both, `?web=1` is ignored and the normal answer is returned.
+
+## `?aac=only` and `hires`
+
+`/stream/<id>?aac=only` (the web player) answers Tidal's 320 kbps AAC and adds
+`hires: true|false` = whether the track has a Hi-Res lossless master (the only kind
+this client can fetch as FLAC). It is read from `GET /tracks/<id>` with the account
+already taken for the stream (no extra account slot, no extra daily stream quota) and
+cached in D1 table `tidal_hires_cache` (migration 0004) for 30 days. D1, not the Cache
+API: `cache.put` is a no-op on `*.workers.dev`. If the lookup fails, `hires` is omitted.
+Apply with `wrangler d1 migrations apply` before deploying.

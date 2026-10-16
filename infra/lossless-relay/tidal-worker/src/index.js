@@ -4,6 +4,7 @@ const API = "https://api.tidal.com/v1";
 const AUTH = "https://auth.tidal.com/v1/oauth2";
 const UA = "okhttp/5.3.2";
 const SCOPE = "r_usr+w_usr+w_sub";
+const HIRES_TTL = 30 * 86400; // a track's master quality rarely changes; recheck monthly
 
 export default {
   async scheduled(_event, env) {
@@ -11,6 +12,7 @@ export default {
     await env.DB.batch([
       env.DB.prepare("DELETE FROM tidal_daily_quotas WHERE day < ?").bind(cutoff),
       env.DB.prepare("DELETE FROM tidal_dash_manifests WHERE expires_at <= ?").bind(now()),
+      env.DB.prepare("DELETE FROM tidal_hires_cache WHERE checked_at <= ?").bind(now() - HIRES_TTL),
     ]);
   },
   async fetch(request, env) {
@@ -170,7 +172,7 @@ async function stream(trackId, request, env) {
       continue;
     }
     const info = await data.json();
-    if (aacOnly) return aacInfo(info);
+    if (aacOnly) return aacInfo(info, await trackHires(trackId, fresh, env));
     if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
       lossyInfo = info;
       if (attempt === 0) { refusedBy = account.id; continue; }
@@ -185,14 +187,42 @@ async function stream(trackId, request, env) {
   return json({ error: refusedBy ? "lossless_unavailable" : "upstream_unavailable" }, refusedBy ? 404 : 503);
 }
 
+/**
+ * Whether a Tidal track has a Hi-Res lossless master: the only kind this client can
+ * actually fetch as FLAC (CD-quality tracks come back as AAC). Cached in D1 for 30 days.
+ * Uses the account already taken for this stream: no extra account/hourly/daily slot is
+ * spent, and the daily stream quota is untouched. A cache miss costs one metadata call.
+ * @returns {Promise<boolean|undefined>} undefined when unknown; never throws.
+ */
+async function trackHires(trackId, account, env) {
+  try {
+    const row = await env.DB.prepare("SELECT hires FROM tidal_hires_cache WHERE track_id=? AND checked_at>? LIMIT 1")
+      .bind(String(trackId), now() - HIRES_TTL).first();
+    if (row) return row.hires === 1;
+    const cc = encodeURIComponent(env.TIDAL_COUNTRY_CODE || "US");
+    const r = await tidalFetch(`/tracks/${trackId}?countryCode=${cc}`, account, env);
+    if (!r.ok) return undefined;
+    const track = await r.json();
+    const tags = track?.mediaMetadata?.tags;
+    if (!Array.isArray(tags) && typeof track?.audioQuality !== "string") return undefined;
+    const hires = (Array.isArray(tags) && tags.includes("HIRES_LOSSLESS"))
+      || ["HI_RES_LOSSLESS", "HI_RES"].includes(track.audioQuality);
+    await env.DB.prepare("INSERT OR REPLACE INTO tidal_hires_cache(track_id,hires,checked_at) VALUES(?,?,?)")
+      .bind(String(trackId), hires ? 1 : 0, now()).run().catch(() => {});
+    return hires;
+  } catch {
+    return undefined; // metadata is a nicety: never block playback on it
+  }
+}
+
 /** Tidal's progressive AAC stream from a below-lossless playbackinfo answer, or lossless_unavailable. */
-function aacInfo(info) {
+function aacInfo(info, hires) {
   if (!String(info.manifestMimeType || "").toLowerCase().includes("bts") || !info.manifest) return json({ error: "lossless_unavailable" }, 404);
   const bts = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(info.manifest), (c) => c.charCodeAt(0))));
   const codecs = String(bts.codecs || "").toLowerCase();
   const audioUrl = bts.urls?.[0];
   if (!/mp4a|aac/.test(codecs) || !audioUrl?.startsWith("https://")) return json({ error: "lossless_unavailable" }, 404);
-  return json({ url: audioUrl, codec: "aac", codecs, container: "mp4", manifest: "none", audioQuality: info.audioQuality, bitDepth: 0, sampleRate: 44100, bitrate: 320 });
+  return json({ url: audioUrl, codec: "aac", codecs, container: "mp4", manifest: "none", audioQuality: info.audioQuality, bitDepth: 0, sampleRate: 44100, bitrate: 320, ...(typeof hires === "boolean" ? { hires } : {}) });
 }
 
 async function streamInfo(trackId, request, env, info, allowAac = false) {
