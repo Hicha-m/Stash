@@ -11,6 +11,7 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
   const dbWrites = [];
   const dailyQuotas = new Map();
   const hiresCache = new Map();
+  const responseCache = new Map();
   const accountCaps = [];
   let nextAccount = 0;
   const env = {
@@ -29,6 +30,10 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
               return accounts[nextAccount++] || null;
             }
             if (sql.includes("SELECT manifest_xml,init_url,expires_at")) return manifests.get(this.args[0]) || null;
+            if (sql.includes("FROM tidal_response_cache")) {
+              const hit = responseCache.get(this.args[0]);
+              return hit && hit.expires_at > this.args[1] ? { response_json: hit.response_json } : null;
+            }
             if (sql.includes("FROM tidal_hires_cache")) {
               const hit = hiresCache.get(this.args[0]);
               return hit && hit.checked_at > this.args[1] ? { hires: hit.hires } : null;
@@ -45,6 +50,10 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
             if (sql.includes("INTO tidal_hires_cache")) {
               const [trackId, hires, checkedAt] = this.args;
               hiresCache.set(trackId, { hires, checked_at: checkedAt });
+            }
+            if (sql.includes("INTO tidal_response_cache")) {
+              const [key, responseJson, expiresAt] = this.args;
+              responseCache.set(key, { response_json: responseJson, expires_at: expiresAt });
             }
             if (sql.includes("INSERT OR REPLACE INTO tidal_dash_manifests")) {
               const [trackId, manifestXml, initUrl, expiresAt] = this.args;
@@ -78,7 +87,7 @@ function fixture({ tidalResponse, account = liveAccount(), accounts = [account] 
     return new Response(JSON.stringify({ items: [] }), { status: 200 });
   };
 
-  return { env, calls, manifests, fetchTidal, dbWrites, dailyQuotas, accountCaps, hiresCache };
+  return { env, calls, manifests, fetchTidal, dbWrites, dailyQuotas, accountCaps, hiresCache, responseCache };
 }
 
 function liveAccount() {
@@ -239,6 +248,21 @@ test("search maps Tidal catalog entries to the relay contract", async () => {
   });
 });
 
+test("search cache is shared across normalized query variants for five days", async () => {
+  const f = fixture({ tidalResponse: async () => new Response(JSON.stringify({ items: [{ id: 88, title: "Birds" }] }), { status: 200 }) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const first = await worker.fetch(authorizedRequest("/search?q=%20%20Birds%20%20of%20%20Feather%20"), f.env);
+    const second = await worker.fetch(authorizedRequest("/search?q=birds%20of%20feather"), f.env);
+    assert.deepEqual(await first.json(), await second.json());
+  });
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.accountCaps.length, 1);
+  const [key, entry] = [...f.responseCache.entries()][0];
+  assert.match(key, /^search:US:[a-f0-9]{64}$/);
+  assert.equal(key.includes("birds"), false, "the normalized query is not stored as a cache key");
+  assert.ok(entry.expires_at >= Math.floor(Date.now() / 1000) + 5 * 86400 - 2);
+});
+
 test("stream continues from a downgraded Hi Res response to a Lossless request", async () => {
   const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
   const f = fixture({ tidalResponse: async (url) => {
@@ -254,6 +278,42 @@ test("stream continues from a downgraded Hi Res response to a Lossless request",
     assert.equal(body.url, "https://cdn.example/track.flac");
     assert.ok(f.calls.some(({ url }) => new URL(url).searchParams.get("audioquality") === "LOSSLESS"));
   });
+});
+
+test("successful stream answers are shared only until shortly before the Tidal URL expires", async () => {
+  const expiry = Math.floor(Date.now() / 1000) + 1800;
+  const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: [`https://cdn.example/track.flac?token=${expiry}~sig`] });
+  const f = fixture({ tidalResponse: async (url) => {
+    const quality = new URL(url).searchParams.get("audioquality");
+    return playbackInfo(quality === "HI_RES_LOSSLESS" ? "HI_RES_LOSSLESS" : "LOSSLESS", "application/vnd.tidal.bts", direct);
+  } });
+  await withFetch(null, f.fetchTidal, async () => {
+    const first = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    const firstBody = await first.json();
+    const firstCallCount = f.calls.length;
+    const second = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    assert.deepEqual(await second.json(), firstBody);
+    assert.equal(f.calls.length, firstCallCount);
+  });
+  assert.equal(f.accountCaps.length, 1);
+  const entry = [...f.responseCache.values()][0];
+  assert.ok(entry.expires_at <= expiry - 60);
+  assert.ok(entry.expires_at > Math.floor(Date.now() / 1000));
+});
+
+test("track-level lossless refusals are cached across app requests", async () => {
+  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account" }];
+  const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", "{}") });
+  await withFetch(null, f.fetchTidal, async () => {
+    const first = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    assert.deepEqual(await first.json(), { error: "lossless_unavailable" });
+    const callsAfterMiss = f.calls.length;
+    const second = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    assert.deepEqual(await second.json(), { error: "lossless_unavailable" });
+    assert.equal(f.calls.length, callsAfterMiss);
+  });
+  assert.equal(f.responseCache.size, 1);
+  assert.equal(f.accountCaps.length, 2, "the second request spends a relay request quota but takes no Tidal account");
 });
 
 test("stream rejects a Tidal response below lossless quality", async () => {
@@ -406,6 +466,21 @@ test("DASH manifest route passes Tidal's init URL through unchanged", async () =
     assert.equal(await manifest.text(), MPD);
     assert.equal(f.calls.length, 1); // serving the MPD does not proxy the CDN init segment
   });
+});
+
+test("DASH stream cache expires before the signed Tidal segment URLs", async () => {
+  const tidalExpiry = Math.floor(Date.now() / 1000) + 1200;
+  const mpd = `<MPD><SegmentTemplate initialization="https://audio.tidal.com/init.mp4?token=${tidalExpiry}~sig&amp;x=1" media="https://audio.tidal.com/$Number$?token=${tidalExpiry}~sig" /></MPD>`;
+  const f = fixture({ tidalResponse: async () => playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", mpd) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:655"), f.env);
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(Number(new URL(body.url).searchParams.get("exp")), tidalExpiry - 30);
+  });
+  const entry = [...f.responseCache.values()][0];
+  assert.ok(entry.expires_at <= tidalExpiry - 90);
+  assert.ok(entry.expires_at > Math.floor(Date.now() / 1000));
 });
 
 const EDGE = { EDGE_SECRET: "e".repeat(64), EDGE_BASE: "https://tidal-edge.example.deno.net" };

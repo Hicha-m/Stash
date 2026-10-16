@@ -46,4 +46,13 @@ this client can fetch as FLAC). It is read from `GET /tracks/<id>` with the acco
 already taken for the stream (no extra account slot, no extra daily stream quota) and
 cached in D1 table `tidal_hires_cache` (migration 0004) for 30 days. D1, not the Cache
 API: `cache.put` is a no-op on `*.workers.dev`. If the lookup fails, `hires` is omitted.
+
+## Shared response cache
+
+Search results are shared in D1 for five days by country and a SHA-256 digest of the
+trimmed, case-folded, whitespace-collapsed query. Definitive per-track
+`lossless_unavailable` and `not_available` answers are cached for five days per stream
+mode. Successful stream answers are cached only until 60 seconds before the earliest
+expiry exposed by the signed playback URL. Requests still pass the relay's caller and
+daily quota checks; a D1 cache hit does not consume a Tidal account slot.
 Apply with `wrangler d1 migrations apply` before deploying.

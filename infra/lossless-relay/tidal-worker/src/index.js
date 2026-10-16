@@ -5,6 +5,8 @@ const AUTH = "https://auth.tidal.com/v1/oauth2";
 const UA = "okhttp/5.3.2";
 const SCOPE = "r_usr+w_usr+w_sub";
 const HIRES_TTL = 30 * 86400; // a track's master quality rarely changes; recheck monthly
+const RESPONSE_CACHE_TTL = 5 * 86400;
+const STREAM_CACHE_SAFETY = 60;
 
 export default {
   async scheduled(_event, env) {
@@ -13,6 +15,7 @@ export default {
       env.DB.prepare("DELETE FROM tidal_daily_quotas WHERE day < ?").bind(cutoff),
       env.DB.prepare("DELETE FROM tidal_dash_manifests WHERE expires_at <= ?").bind(now()),
       env.DB.prepare("DELETE FROM tidal_hires_cache WHERE checked_at <= ?").bind(now() - HIRES_TTL),
+      env.DB.prepare("DELETE FROM tidal_response_cache WHERE expires_at <= ?").bind(now()),
     ]);
   },
   async fetch(request, env) {
@@ -109,9 +112,18 @@ async function pollDeviceAuth(request, env) {
 }
 
 async function search(url, request, env) {
-  const query = (url.searchParams.get("q") || "").trim();
+  const query = normaliseQuery(url.searchParams.get("q") || "");
   if (!query) return json({ tracks: [] });
-  const cc = env.TIDAL_COUNTRY_CODE || "US";
+  const country = env.TIDAL_COUNTRY_CODE || "US";
+  const key = `search:${country}:${await cacheDigest(query)}`;
+  const cached = await cachedJson(env, key);
+  if (cached) return cached;
+  const response = await searchUncached(query, country, request, env);
+  if (response.status === 200) await cacheJson(env, key, response, RESPONSE_CACHE_TTL);
+  return response;
+}
+
+async function searchUncached(query, cc, request, env) {
   let data;
   for (let attempt = 0; attempt < 2; attempt++) {
     const selected = await takeAccount(env);
@@ -144,6 +156,26 @@ async function search(url, request, env) {
 }
 
 async function stream(trackId, request, env) {
+  const url = new URL(request.url);
+  const aac = url.searchParams.get("aac") || "";
+  const web = url.searchParams.get("web") === "1" ? "web" : "app";
+  const key = `stream:${env.TIDAL_COUNTRY_CODE || "US"}:${trackId}:aac=${aac}:web=${web}`;
+  const cached = await cachedJson(env, key);
+  if (cached) return cached;
+  const response = await streamUncached(trackId, request, env);
+  let body;
+  try { body = await response.clone().json(); } catch { return response; }
+  if (response.status === 404 && ["lossless_unavailable", "not_available"].includes(body.error)) {
+    await cacheJson(env, key, response, RESPONSE_CACHE_TTL);
+  } else if (response.status === 200) {
+    const expiresAt = streamAnswerExpiry(body);
+    const ttl = expiresAt - now() - STREAM_CACHE_SAFETY;
+    if (ttl > 0) await cacheJson(env, key, response, ttl);
+  }
+  return response;
+}
+
+async function streamUncached(trackId, request, env) {
   // ?aac=1: when no account can play the track losslessly, answer with Tidal's AAC
   // stream (labelled codec "aac") instead of lossless_unavailable. Opt-in so the
   // download path, which must never save AAC as FLAC, keeps the lossless-only answer.
@@ -198,6 +230,57 @@ async function stream(trackId, request, env) {
     return await streamInfo(trackId, request, env, info, allowAac);
   }
   return json({ error: refusedBy ? "lossless_unavailable" : "upstream_unavailable" }, refusedBy ? 404 : 503);
+}
+
+function normaliseQuery(query) { return query.trim().replace(/\s+/gu, " ").toLocaleLowerCase("en-US"); }
+
+async function cacheDigest(value) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function cachedJson(env, key) {
+  try {
+    const row = await env.DB.prepare("SELECT response_json FROM tidal_response_cache WHERE cache_key=? AND expires_at>? LIMIT 1")
+      .bind(key, now()).first();
+    if (!row) return null;
+    const entry = JSON.parse(row.response_json);
+    if (!entry || !Number.isInteger(entry.status) || !entry.body) return null;
+    return json(entry.body, entry.status);
+  } catch { return null; }
+}
+
+async function cacheJson(env, key, response, ttl) {
+  try {
+    const body = await response.clone().json();
+    await env.DB.prepare("INSERT OR REPLACE INTO tidal_response_cache(cache_key,response_json,expires_at) VALUES(?,?,?)")
+      .bind(key, JSON.stringify({ status: response.status, body }), now() + Math.floor(ttl)).run();
+  } catch { /* cache failures must never fail a relay request */ }
+}
+
+function streamAnswerExpiry(body) {
+  let expiry = Number(body.expiresAt) || 0;
+  const url = typeof body.url === "string" ? body.url : "";
+  try {
+    const parsed = new URL(url);
+    const paramExpiry = Number(parsed.searchParams.get("exp")) || 0;
+    if (paramExpiry) expiry = expiry ? Math.min(expiry, paramExpiry) : paramExpiry;
+    const tidalTokenExpiry = /^(\d{10})~/.exec(parsed.searchParams.get("token") || "");
+    if (tidalTokenExpiry) {
+      const tokenExpiry = Number(tidalTokenExpiry[1]);
+      expiry = expiry ? Math.min(expiry, tokenExpiry) : tokenExpiry;
+    }
+  } catch { /* URLs without readable expiry are not cached */ }
+  return expiry;
+}
+
+function earliestTidalExpiry(manifest) {
+  let expiry = 0;
+  for (const match of manifest.matchAll(/[?&]token=(\d{10})~/gu)) {
+    const candidate = Number(match[1]);
+    if (candidate > now() && (!expiry || candidate < expiry)) expiry = candidate;
+  }
+  return expiry;
 }
 
 /**
@@ -261,7 +344,9 @@ async function streamInfo(trackId, request, env, info, allowAac = false) {
     let xml = new TextDecoder().decode(bytes);
     const init = /initialization="([^"]+)"/.exec(xml)?.[1];
     if (!init || !init.startsWith("https://")) return json({ error: "invalid_dash_manifest" }, 502);
-    const exp = now() + 3600;
+    const manifestExpiry = earliestTidalExpiry(xml);
+    const exp = Math.min(now() + 3600, manifestExpiry ? manifestExpiry - 30 : Number.MAX_SAFE_INTEGER);
+    if (exp <= now() + STREAM_CACHE_SAFETY) return json({ error: "manifest_expired" }, 503);
     await env.DB.prepare(`INSERT OR REPLACE INTO tidal_dash_manifests(track_id,manifest_xml,init_url,expires_at) VALUES(?,?,?,?)`)
       .bind(trackId, xml, init, exp).run();
     const origin = (env.PUBLIC_HOST || new URL(request.url).origin).replace(/\/$/, "");
