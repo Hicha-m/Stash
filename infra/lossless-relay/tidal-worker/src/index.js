@@ -147,11 +147,13 @@ async function stream(trackId, request, env) {
   const aacOnly = aacMode === "only";
   const allowAac = aacMode === "1" || aacOnly;
   let refusedBy = null;
+  let unavailableBy = null;
   let lossyInfo = null;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const account = await takeAccount(env, refusedBy);
+    const account = await takeAccount(env, refusedBy || unavailableBy);
     if (!account) {
       if (allowAac && lossyInfo) return aacInfo(lossyInfo);
+      if (unavailableBy) return json({ error: "not_available" }, 404);
       return json({ error: refusedBy ? "lossless_unavailable" : "no_account" }, refusedBy ? 404 : 503);
     }
     const fresh = await refreshIfNeeded(account, env);
@@ -162,7 +164,12 @@ async function stream(trackId, request, env) {
     const data = await playbackInfo(trackId, fresh, env, aacOnly ? ["HIGH"] : undefined);
     if (data.status === 401) {
       const denial = await data.clone().json().catch(() => ({}));
-      if (denial.subStatus === 4005) return json({ error: "not_available" }, 404);
+      if (denial.subStatus === 4005) {
+        // An asset-not-ready refusal can differ across Tidal accounts. Check one
+        // other seat before treating it as unavailable to every relay user.
+        if (attempt === 0) { unavailableBy = account.id; continue; }
+        return json({ error: "not_available" }, 404);
+      }
       await killAccount(env, account.id, "401");
       continue;
     }

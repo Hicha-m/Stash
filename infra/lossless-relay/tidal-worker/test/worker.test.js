@@ -332,6 +332,65 @@ test("Tidal subStatus 4005 is a track refusal and never retires the account", as
   });
 });
 
+test("?aac=only retries a 4005 refusal on another account for a Hi-Res track", async () => {
+  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account", access_token: "second-token" }];
+  const aac = JSON.stringify({ mimeType: "audio/mp4", codecs: "mp4a.40.2", urls: ["https://cdn.example/track.m4a"] });
+  const f = fixture({ accounts, tidalResponse: async (url, options) => {
+    if (options.headers.authorization === "Bearer test-tidal-access-token") return new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 });
+    if (url.includes("playbackinfopostpaywall")) return playbackInfo("HIGH", "application/vnd.tidal.bts", aac);
+    return new Response(JSON.stringify({ mediaMetadata: { tags: ["HIRES_LOSSLESS"] } }), { status: 200 });
+  } });
+
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:363236466?aac=only"), f.env);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.codec, "aac");
+    assert.equal(body.hires, true);
+    assert.ok(f.calls.some(({ options }) => options.headers.authorization === "Bearer second-token"));
+    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
+  });
+});
+
+test("?web=1 retries a 4005 refusal on another account and returns signed Hi-Res links", async () => {
+  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account", access_token: "second-token" }];
+  const f = fixture({ accounts, tidalResponse: async (_url, options) => {
+    if (options.headers.authorization === "Bearer test-tidal-access-token") return new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 });
+    return playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", MPD);
+  } });
+  Object.assign(f.env, { EDGE_SECRET: "e".repeat(64), EDGE_BASE: "https://tidal-edge.example.deno.net" });
+
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:363236466?web=1"), f.env);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.edge, true);
+    assert.equal(body.codec, "flac");
+    assert.match(body.url, /^https:\/\/tidal-edge\.example\.deno\.net\/t\//);
+    assert.ok(f.calls.some(({ options }) => options.headers.authorization === "Bearer second-token"));
+    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
+  });
+});
+
+test("?aac=1 retries a 4005 refusal on another account and preserves the app AAC fallback", async () => {
+  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account", access_token: "second-token" }];
+  const aac = JSON.stringify({ mimeType: "audio/mp4", codecs: "mp4a.40.2", urls: ["https://cdn.example/track.m4a"] });
+  const f = fixture({ accounts, tidalResponse: async (_url, options) => {
+    if (options.headers.authorization === "Bearer test-tidal-access-token") return new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 });
+    return playbackInfo("HIGH", "application/vnd.tidal.bts", aac);
+  } });
+
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:1550546?aac=1"), f.env);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.codec, "aac");
+    assert.equal(body.bitrate, 320);
+    assert.ok(f.calls.some(({ options }) => options.headers.authorization === "Bearer second-token"));
+    assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until") || sql.includes("state='dead'")), false);
+  });
+});
+
 test("DASH manifest route passes Tidal's init URL through unchanged", async () => {
   const f = fixture({ tidalResponse: async () => playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", MPD) });
 
