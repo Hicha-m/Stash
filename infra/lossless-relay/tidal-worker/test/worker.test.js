@@ -303,7 +303,7 @@ test("stream cross-checks a downgraded account against the next account, then co
   await withFetch(null, f.fetchTidal, async () => {
     const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
     assert.equal(response.status, 200);
-    assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("cooling_until") && args[1] === "test-account"));
+    assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("cooling_until") && args[1] === "test-account" && args[0] >= Math.floor(Date.now() / 1000) + 899));
   });
 });
 

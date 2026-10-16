@@ -179,7 +179,7 @@ async function stream(trackId, request, env) {
       if (allowAac) return aacInfo(info);
       return json({ error: "lossless_unavailable" }, 404);
     }
-    if (refusedBy) await coolAccount(env, refusedBy, 3600);
+    if (refusedBy) await coolAccount(env, refusedBy, positive(env.TIDAL_CROSSCHECK_COOLDOWN_SECONDS, 900));
     const web = webEdge(request, env);
     if (web) return await edgeInfo(trackId, info, env, web);
     return await streamInfo(trackId, request, env, info, allowAac);

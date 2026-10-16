@@ -9,6 +9,7 @@ TIDAL_CLIENT_ID = "fX2JxdmntZWK0ixT"
 TIDAL_COUNTRY_CODE = "US"
 TIDAL_ACCOUNT_HOURLY_CAP = "621"
 TIDAL_ACCOUNT_DAILY_CAP = "11000"
+TIDAL_CROSSCHECK_COOLDOWN_SECONDS = "900"
 GLOBAL_DAILY_CAP = "34667"
 NETWORK_DAILY_CAP = "2000"
 EDGE_BASE = "https://stash-tidal-edge.stashfm.deno.net" # tidal-edge on Deno Deploy (Tidal's CDN refuses Cloudflare); ?web=1 signs links for it with the EDGE_SECRET secret
