@@ -168,12 +168,51 @@ test("request limiter keys IPv6 clients by their /56 network", async () => {
   assert.equal(limitKey, "2001:db8:abcd:0/56");
 });
 
-test("per-account cap defaults mirror Qobuz", async () => {
+test("per-account cap defaults use the Tidal pool limits", async () => {
   const f = fixture();
   await withFetch(null, f.fetchTidal, async () => {
     await worker.fetch(authorizedRequest("/search?q=test"), f.env);
   });
-  assert.deepEqual(f.accountCaps[0], { hourly: 621, daily: 11000 });
+  assert.deepEqual(f.accountCaps[0], { hourly: 250, daily: 1600 });
+});
+
+test("an exhausted pool returns busy with a five-minute retry before contacting Tidal", async () => {
+  const f = fixture({ accounts: [] });
+  await withFetch(null, f.fetchTidal, async () => {
+    for (const path of ["/search?q=example", "/stream/td:321"]) {
+      const response = await worker.fetch(authorizedRequest(path), f.env);
+      assert.equal(response.status, 503);
+      assert.equal(response.headers.get("retry-after"), "300");
+      assert.deepEqual(await response.json(), { error: "busy" });
+    }
+  });
+  assert.equal(f.calls.length, 0);
+});
+
+test("Tidal search 429 cools that account and returns busy without caching an empty result", async () => {
+  const f = fixture({ tidalResponse: async () => new Response("{}", { status: 429, headers: { "Retry-After": "60" } }) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/search?q=example"), f.env);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "busy" });
+    assert.equal(response.headers.get("retry-after"), "300");
+  });
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.responseCache.size, 0);
+  assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("SET cooling_until") && args[0] >= Math.floor(Date.now() / 1000) + 899));
+});
+
+test("Tidal playback-info 429 cools that account and returns busy without caching a track miss", async () => {
+  const f = fixture({ tidalResponse: async () => new Response("{}", { status: 429, headers: { "Retry-After": "60" } }) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "busy" });
+    assert.equal(response.headers.get("retry-after"), "300");
+  });
+  assert.equal(f.calls.length, 1, "a 429 is not retried across qualities or regions");
+  assert.equal(f.responseCache.size, 0);
+  assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("SET cooling_until") && args[0] >= Math.floor(Date.now() / 1000) + 899));
 });
 
 test("global daily stream cap allows requests to the cap and blocks the next one", async () => {
@@ -318,7 +357,8 @@ test("track-level lossless refusals are cached across app requests", async () =>
 
 test("stream rejects a Tidal response below lossless quality", async () => {
   const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
-  const f = fixture({ tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", direct) });
+  const accounts = [liveAccount(), { ...liveAccount(), id: "second-account" }];
+  const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", direct) });
 
   await withFetch(null, f.fetchTidal, async () => {
     const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
@@ -341,15 +381,27 @@ test("two accounts declining the same track are not cooled", async () => {
   });
 });
 
-test("a single account is not retried or cooled for a track-level quality refusal", async () => {
+test("a single-account track-level quality refusal returns busy without cooling the account", async () => {
   const direct = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: ["https://cdn.example/track.flac"] });
   const f = fixture({ tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", direct) });
 
   await withFetch(null, f.fetchTidal, async () => {
     const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
-    assert.equal(response.status, 404);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "busy" });
+    assert.equal(response.headers.get("retry-after"), "300");
     assert.equal(f.dbWrites.some(({ sql }) => sql.includes("SET cooling_until")), false);
   });
+});
+
+test("a refusal without a second account to cross-check returns busy instead of caching a false miss", async () => {
+  const f = fixture({ tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", "{}") });
+  await withFetch(null, f.fetchTidal, async () => {
+    const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "busy" });
+  });
+  assert.equal(f.responseCache.size, 0);
 });
 
 test("stream cross-checks a downgraded account against the next account, then cools the refuser", async () => {
@@ -382,12 +434,13 @@ test("an invalid-session account is quarantined and the next account serves", as
   });
 });
 
-test("Tidal subStatus 4005 is a track refusal and never retires the account", async () => {
+test("Tidal subStatus 4005 without another account returns busy and never retires the account", async () => {
   const f = fixture({ tidalResponse: async () => new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 }) });
 
   await withFetch(null, f.fetchTidal, async () => {
     const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
-    assert.equal(response.status, 404);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "busy" });
     assert.equal(f.dbWrites.some(({ sql }) => sql.includes("state='dead'")), false);
   });
 });

@@ -60,6 +60,9 @@ export default {
 function paused() {
   return json({ error: "tidal_relay_paused" }, 503, { "Retry-After": "600" });
 }
+function busy() {
+  return json({ error: "busy" }, 503, { "Retry-After": "300" });
+}
 
 async function startDeviceAuth(request, env) {
   if (!authorized(request, env.ADMIN_TOKEN)) return unauthorized();
@@ -127,10 +130,15 @@ async function searchUncached(query, cc, request, env) {
   let data;
   for (let attempt = 0; attempt < 2; attempt++) {
     const selected = await takeAccount(env);
-    if (!selected) return json({ tracks: [] }, 503);
+    if (!selected) return busy();
     const account = await refreshIfNeeded(selected, env);
     if (!account) { await coolAccount(env, selected.id, 300); continue; }
     const r = await tidalFetch(`/search/tracks?query=${encodeURIComponent(query)}&limit=30&offset=0&countryCode=${cc}`, account, env);
+    if (r.status === 429) {
+      console.warn(`tidal_search ${JSON.stringify({ account: String(selected.id).slice(-4), status: r.status })}`);
+      await coolAccount(env, selected.id, positive(env.TIDAL_CROSSCHECK_COOLDOWN_SECONDS, 900));
+      return busy();
+    }
     if (r.status === 401) {
       const denial = await r.clone().json().catch(() => ({}));
       if (denial.subStatus !== 4005) { await killAccount(env, selected.id, "401"); continue; }
@@ -191,8 +199,7 @@ async function streamUncached(trackId, request, env) {
     const account = await takeAccount(env, refusedBy || unavailableBy);
     if (!account) {
       if (allowAac && lossyInfo) return aacInfo(lossyInfo);
-      if (unavailableBy) return json({ error: "not_available" }, 404);
-      return json({ error: refusedBy ? "lossless_unavailable" : "no_account" }, refusedBy ? 404 : 503);
+      return busy();
     }
     const fresh = await refreshIfNeeded(account, env);
     if (!fresh) {
@@ -212,6 +219,10 @@ async function streamUncached(trackId, request, env) {
       continue;
     }
     if (!data.ok) {
+      if (data.status === 429) {
+        await coolAccount(env, account.id, positive(env.TIDAL_CROSSCHECK_COOLDOWN_SECONDS, 900));
+        return busy();
+      }
       if (data.status >= 500) await coolAccount(env, account.id, 300);
       if (data.status === 404) return json({ error: "not_available" }, 404);
       continue;
@@ -470,8 +481,9 @@ async function playbackInfo(trackId, account, env, qualities = ["HI_RES_LOSSLESS
       if (!r.ok) {
         const details = await r.clone().json().catch(() => ({}));
         const userMessage = typeof details.userMessage === "string" ? details.userMessage.replace(/[\r\n]/g, " ").slice(0, 240) : null;
-        console.warn(`tidal_playbackinfo ${JSON.stringify({ status: r.status, subStatus: details.subStatus ?? null, userMessage })}`);
+        console.warn(`tidal_playbackinfo ${JSON.stringify({ account: String(account.id).slice(-4), status: r.status, subStatus: details.subStatus ?? null, userMessage })}`);
       }
+      if (r.status === 429) return r;
       if (r.status === 401) return r;
       if (!r.ok) continue;
       if (quality === "HIGH") return r; // AAC asked for: the first answer is the one
@@ -489,8 +501,8 @@ async function playbackInfo(trackId, account, env, qualities = ["HI_RES_LOSSLESS
 async function takeAccount(env, excludeId = null) {
   const hour = new Date().toISOString().slice(0, 13);
   const day = new Date().toISOString().slice(0, 10);
-  const hourly = positive(env.TIDAL_ACCOUNT_HOURLY_CAP, 621);
-  const daily = positive(env.TIDAL_ACCOUNT_DAILY_CAP, 11000);
+  const hourly = positive(env.TIDAL_ACCOUNT_HOURLY_CAP, 250);
+  const daily = positive(env.TIDAL_ACCOUNT_DAILY_CAP, 1600);
   return await env.DB.prepare(`UPDATE tidal_accounts SET
       hour_n=CASE WHEN hour_key=?1 THEN hour_n+1 ELSE 1 END,hour_key=?1,
       day_n=CASE WHEN day_key=?2 THEN day_n+1 ELSE 1 END,day_key=?2,last_used_at=?3
