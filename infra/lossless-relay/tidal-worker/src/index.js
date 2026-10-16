@@ -28,12 +28,14 @@ export default {
       if (url.pathname === "/admin/device/poll" && request.method === "POST") return pollDeviceAuth(request, env);
       if (url.pathname === "/search" && request.method === "GET") {
         if (!authorized(request, env.ACCESS_TOKEN)) return unauthorized();
+        if (env.TIDAL_RELAY_PAUSED === "1") return paused();
         return await search(url, request, env);
       }
       const path = decodeURIComponent(url.pathname);
       const streamMatch = path.match(/^\/stream\/(?:td:)?(\d+)$/);
       if (streamMatch && request.method === "GET") {
         if (!authorized(request, env.ACCESS_TOKEN)) return unauthorized();
+        if (env.TIDAL_RELAY_PAUSED === "1") return paused();
         const quota = await admitStream(request, env);
         if (quota.denial) return quota.denial;
         const response = await stream(streamMatch[1], request, env);
@@ -51,6 +53,10 @@ export default {
     }
   },
 };
+
+function paused() {
+  return json({ error: "tidal_relay_paused" }, 503, { "Retry-After": "600" });
+}
 
 async function startDeviceAuth(request, env) {
   if (!authorized(request, env.ADMIN_TOKEN)) return unauthorized();
@@ -376,6 +382,11 @@ async function playbackInfo(trackId, account, env, qualities = ["HI_RES_LOSSLESS
     for (const cc of unique([env.TIDAL_COUNTRY_CODE || "US", "ID", "GB", "US"])) {
       const p = new URLSearchParams({ countryCode: cc, audioquality: quality, playbackmode: "STREAM", assetpresentation: "FULL" });
       const r = await tidalFetch(`/tracks/${trackId}/playbackinfopostpaywall?${p}`, account, env);
+      if (!r.ok) {
+        const details = await r.clone().json().catch(() => ({}));
+        const userMessage = typeof details.userMessage === "string" ? details.userMessage.replace(/[\r\n]/g, " ").slice(0, 240) : null;
+        console.warn(`tidal_playbackinfo ${JSON.stringify({ status: r.status, subStatus: details.subStatus ?? null, userMessage })}`);
+      }
       if (r.status === 401) return r;
       if (!r.ok) continue;
       if (quality === "HIGH") return r; // AAC asked for: the first answer is the one
