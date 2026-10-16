@@ -98,8 +98,9 @@ import com.stash.core.data.db.entity.TrackTagEntity
         SyncUndoMembershipEntity::class,
         ArtistImageEntity::class,
         SharedMixEntity::class,
+        com.stash.core.data.db.entity.TidalMatchEntity::class,
     ],
-    version = 55,
+    version = 56,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -138,6 +139,8 @@ abstract class StashDatabase : RoomDatabase() {
     abstract fun lastFmCacheDao(): LastFmCacheDao
 
     abstract fun spotifyResolutionDao(): SpotifyResolutionDao
+
+    abstract fun tidalMatchDao(): com.stash.core.data.db.dao.TidalMatchDao
 
     abstract fun flacUpgradeQueueDao(): FlacUpgradeQueueDao
 
@@ -1449,6 +1452,23 @@ abstract class StashDatabase : RoomDatabase() {
         }
 
         /**
+         * v55 -> v56 adds `tidal_match_cache` ([com.stash.core.data.db.entity.TidalMatchEntity]):
+         * what the shared Tidal relay answered per song, so plays, syncs and upgrade sweeps stop
+         * re-asking it. A new, empty table; no existing row changes.
+         */
+        val MIGRATION_55_56 = object : Migration(55, 56) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `tidal_match_cache` (" +
+                        "`key` TEXT NOT NULL, `tidal_id` TEXT, `title` TEXT NOT NULL, " +
+                        "`artist` TEXT NOT NULL, `artwork` TEXT, `confidence` REAL NOT NULL, " +
+                        "`searched_at` INTEGER NOT NULL, `lossless_miss_at` INTEGER, " +
+                        "`aac_miss_at` INTEGER, PRIMARY KEY(`key`))",
+                )
+            }
+        }
+
+        /**
          * The complete migration chain, shared by every builder of a
          * [StashDatabase]: the DI singleton in
          * [com.stash.core.data.di.DatabaseModule] AND the throwaway instance
@@ -1516,6 +1536,7 @@ abstract class StashDatabase : RoomDatabase() {
                 MIGRATION_52_53,
                 MIGRATION_53_54,
                 MIGRATION_54_55,
+                MIGRATION_55_56,
             )
         }
     }

@@ -31,15 +31,26 @@ class TidalStreamResolver @Inject constructor(
     /** A server is configured (non-blocking; see [BitchordClient.configured]). */
     fun enabledHint(): Boolean = client.configured.value
 
+    /**
+     * True when serving [track] would have to ask the relay: nothing cached about it for
+     * this mode and the pool is not busy. Speculative resolves (next-up prefetch) read this
+     * and leave Tidal-dependent tracks for the real play; no request is made here.
+     */
+    suspend fun needsRelay(track: TrackEntity): Boolean =
+        client.lookup(track.toQuery(), allowAac = losslessPrefs.tidalAacFallbackNow(), cacheOnly = true) ==
+            com.stash.data.download.lossless.bitchord.TidalLookup.NeedsRelay
+
+    private fun TrackEntity.toQuery() = TrackQuery(
+        artist = artist,
+        title = title,
+        album = album.takeIf { it.isNotBlank() },
+        isrc = isrc?.takeIf { it.isNotBlank() },
+        durationMs = durationMs,
+    )
+
     suspend fun resolve(track: TrackEntity): StreamUrl? {
         if (!client.isConfigured()) return null
-        val query = TrackQuery(
-            artist = track.artist,
-            title = track.title,
-            album = track.album.takeIf { it.isNotBlank() },
-            isrc = track.isrc?.takeIf { it.isNotBlank() },
-            durationMs = track.durationMs,
-        )
+        val query = track.toQuery()
         // allowAac: a CD-only track streams as Tidal's 320 kbps AAC rather than
         // falling through to the lossy rungs below (JioSaavn / YouTube) — unless
         // the user switched "Tidal AAC when no FLAC" off (Tidal = FLAC only).

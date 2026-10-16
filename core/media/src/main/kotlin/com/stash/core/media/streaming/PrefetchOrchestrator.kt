@@ -100,7 +100,8 @@ class PrefetchOrchestrator @Inject constructor(
                 // prefetch for the whole synced library.
                 if (!track.isStreamable && track.isStreamableCheckedAt != null) return@launch
 
-                val resolved = streamResolver.resolve(track)
+                // speculative: never makes the shared Tidal relay search for a look-ahead.
+                val resolved = streamResolver.resolve(track, speculative = true)
                 if (resolved != null) {
                     streamUrlCache.put(nextTrackId, resolved)
                     Log.d(TAG, "Prefetched stream URL for track $nextTrackId")
