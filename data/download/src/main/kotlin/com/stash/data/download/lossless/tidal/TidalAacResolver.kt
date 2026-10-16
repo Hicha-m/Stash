@@ -7,6 +7,7 @@ import com.stash.data.download.lossless.LosslessSourcePreferences
 import com.stash.data.download.lossless.SourceResult
 import com.stash.data.download.lossless.TrackQuery
 import com.stash.data.download.lossless.bitchord.BitchordClient
+import com.stash.data.download.lossless.bitchord.TidalLookup
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
@@ -44,19 +45,29 @@ class TidalAacResolver @Inject constructor(
             Log.i(TAG, "skip '$label': circuit breaker open")
             return null
         }
+        // A cached AAC miss (or no match at all) and an open pool-busy circuit cost nothing.
+        when (client.lookup(query, allowAac = true, cacheOnly = true)) {
+            TidalLookup.NoMatch, TidalLookup.Off, is TidalLookup.Busy -> return null
+            else -> Unit
+        }
         if (!rateLimiter.acquire(SOURCE_ID)) {
             Log.i(TAG, "skip '$label': rate-limited")
             return null
         }
-        val stream = try {
-            client.resolve(query, allowAac = true)
+        val outcome = try {
+            client.lookup(query, allowAac = true)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            rateLimiter.reportFailure(SOURCE_ID)
             Log.w(TAG, "resolve threw ${e.javaClass.simpleName}")
-            return null
-        } ?: return null
+            TidalLookup.Failed
+        }
+        val stream = when (outcome) {
+            is TidalLookup.Found -> outcome.stream
+            is TidalLookup.Busy -> { rateLimiter.reportRateLimited(SOURCE_ID); return null }
+            TidalLookup.Failed -> { rateLimiter.reportFailure(SOURCE_ID); return null }
+            else -> return null
+        }
         rateLimiter.reportSuccess(SOURCE_ID)
         if (stream.codec != "aac" || stream.isDash) {
             Log.i(TAG, "skip '$label': relay answered ${stream.codec} (dash=${stream.isDash}); lossless chain owns it")

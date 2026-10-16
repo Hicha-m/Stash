@@ -61,7 +61,7 @@ class LosslessUpgraderImpl @Inject constructor(
         // tracks that never downloaded; null-safe at the delete site.
         val oldPath = track.filePath
 
-        val purpose = if (sweep) LosslessDownloadPurpose() else null
+        val purpose = if (sweep) LosslessDownloadPurpose(upgradeSweep = true) else null
         val result = if (purpose != null) {
             withContext(purpose) { downloadManager.tryLosslessDownload(track, forced = true) }
         } else {
@@ -101,7 +101,7 @@ class LosslessUpgraderImpl @Inject constructor(
      * A tap carries no purpose and keeps the conservative NoMatch mapping.
      */
     private suspend fun isRealMiss(purpose: LosslessDownloadPurpose): Boolean =
-        !purpose.matchFound && registry.canSearchNow() && availability.fileUrlAvailableNow()
+        !purpose.matchFound && !purpose.searchIncomplete && registry.canSearchNow() && availability.fileUrlAvailableNow()
 
     /**
      * Mirrors the canonical post-Success block from

@@ -45,7 +45,16 @@ class LosslessSourceRegistry @Inject constructor(
                 Log.d(TAG, "skipping ${source.id}: degraded (content-health cooldown)")
                 continue
             }
-            if (!source.isEnabled()) continue
+            if (!source.isEnabled()) {
+                // A breaker-open source never searched: a sweep must not read the
+                // chain's null as "no lossless version" for this track.
+                if (source.rateLimitState().isCircuitBroken) {
+                    kotlinx.coroutines.currentCoroutineContext()[
+                        com.stash.data.download.lossless.relay.LosslessDownloadPurpose
+                    ]?.searchIncomplete = true
+                }
+                continue
+            }
             val result = runCatching { source.resolve(query, bypassRateLimit) }
                 .onFailure { e ->
                     // A cancelled caller is not a failing source: rethrow, or the
