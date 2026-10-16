@@ -2,6 +2,7 @@ package com.stash.data.download.lossless.qobuz
 
 import com.stash.core.common.VersionWords
 import com.stash.data.download.lossless.TrackQuery
+import java.text.Normalizer
 import kotlin.math.abs
 
 /**
@@ -34,6 +35,8 @@ object QobuzCandidateMatcher {
      *
      * @param candDurationSec candidate duration in SECONDS (Qobuz's unit).
      * @param candVersion Qobuz's separate `version` field, when known.
+     * @param candAlbum the candidate's album title, when known. A version the query doesn't name
+     *   only gets the length tiebreak on the query's own album (a live album like KISS "Alive!").
      */
     fun confidence(
         query: TrackQuery,
@@ -43,6 +46,7 @@ object QobuzCandidateMatcher {
         candDurationSec: Int,
         candStreamable: Boolean,
         candVersion: String? = null,
+        candAlbum: String? = null,
     ): Float {
         if (!candStreamable) return 0f
 
@@ -55,7 +59,7 @@ object QobuzCandidateMatcher {
             return 0.95f
         }
 
-        val titleSim = jaccard(normalize(query.title), normalize(candTitle))
+        val titleSim = maxOf(jaccard(normalize(query.title), normalize(candTitle)), suffixFreeTitleSim(query.title, candTitle, candVersion))
         // Spotify often expands artist names with collaborators/eras
         // ("Diana Ross and the Supremes", "Joey Bada$$ feat. Jay
         // Electronica") while Qobuz indexes the canonical short form
@@ -93,12 +97,20 @@ object QobuzCandidateMatcher {
                 VersionWords.DASH_SUFFIX.find(candTitle)?.value.orEmpty() + " " + candVersion.orEmpty(),
         )
         val extraVersion = candVersionWords - versionWords(query.title + " " + query.album.orEmpty())
-        // A length within 5% says it's the recording the user has (e.g. a live album
-        // whose titles don't say "live"), so the version only breaks ties.
+        // The reverse: the query's title names a version ("Song - Live", "Song (Remix)") the
+        // candidate names nowhere, its album included ("Live at Leeds" carries live takes).
+        val queryVersionWords = versionWords(
+            BRACKETED.findAll(query.title).joinToString(" ") { it.value } + " " +
+                VersionWords.DASH_SUFFIX.find(query.title)?.value.orEmpty(),
+        )
+        val missingVersion = queryVersionWords - candVersionWords - versionWords(candAlbum.orEmpty())
+        // A length within 5% on the query's own album says it's the recording the user has
+        // (a live album whose titles don't say "live"), so the version only breaks ties. On
+        // another album the same length proves nothing: a live take often runs like the studio cut.
         val durationConfirms = (query.durationMs ?: 0L) > 0 && candDurationSec > 0 && durationFactor == 1.0f
         val versionFactor = when {
-            extraVersion.isEmpty() -> 1.0f
-            durationConfirms -> VERSION_TIEBREAK
+            extraVersion.isEmpty() && missingVersion.isEmpty() -> 1.0f
+            durationConfirms && sameAlbum(query.album, candAlbum) -> VERSION_TIEBREAK
             else -> VERSION_PENALTY
         }
 
@@ -122,6 +134,52 @@ object QobuzCandidateMatcher {
     private val BRACKETED = Regex("\\([^)]*\\)|\\[[^]]*\\]")
 
     /**
+     * Words a reissue suffix may carry without naming a different recording: Spotify writes
+     * "Disorder - 2007 Remaster" where the catalog has "Disorder" with the version kept apart.
+     */
+    private val REISSUE_WORDS = setOf(
+        "remaster", "remastered", "remasters", "digital", "digitally", "mono", "stereo",
+        "single", "album", "version", "edition", "deluxe",
+    )
+
+    /**
+     * The title score with the query's dash suffix set aside ("Disorder - 2007 Remaster" vs the
+     * catalog's "Disorder" + version "2007 Remaster"), or 0 when that's not safe: the candidate
+     * title has a dash suffix of its own ("Song - Part 1" vs "Song - Part 2"), or the suffix says
+     * something neither the candidate's brackets/version repeat nor a reissue word explains.
+     * Versions the suffix names are still checked by the version rule after this.
+     */
+    private fun suffixFreeTitleSim(queryTitle: String, candTitle: String, candVersion: String?): Float {
+        val suffix = VersionWords.DASH_SUFFIX.find(queryTitle)?.value ?: return 0f
+        if (VersionWords.DASH_SUFFIX.containsMatchIn(candTitle)) return 0f
+        val suffixWords = tokens(normalize(suffix))
+        if (suffixWords.isEmpty()) return 0f
+        // Bracket contents unwrapped first: normalize() drops anything in brackets, and some
+        // catalogs write the version field itself as "(Robot Baby Mix)".
+        val candExtra = tokens(normalize((BRACKETED.findAll(candTitle).map { it.value } + candVersion.orEmpty())
+            .joinToString(" ") { it.trim().removeSurrounding("(", ")").removeSurrounding("[", "]") }))
+        val explained = suffixWords.all { it in candExtra || it in REISSUE_WORDS || it.all(Char::isDigit) }
+        if (!explained) return 0f
+        return jaccard(normalize(queryTitle.removeRange(queryTitle.length - suffix.length, queryTitle.length)), normalize(candTitle))
+    }
+
+    /**
+     * Same release: the albums' normalised words mostly agree ("Alive!" vs "Alive! (Remastered)")
+     * and neither names a version the other doesn't. normalize() drops brackets, so without that
+     * check "Vespertine (Live)" passed for "Vespertine".
+     */
+    private fun sameAlbum(queryAlbum: String?, candAlbum: String?): Boolean {
+        val a = normalize(queryAlbum ?: return false)
+        val b = normalize(candAlbum ?: return false)
+        if (a.isEmpty() || b.isEmpty() || jaccard(a, b) < SAME_ALBUM_MIN) return false
+        return versionWords(queryAlbum) == versionWords(candAlbum)
+    }
+
+    private const val SAME_ALBUM_MIN = 0.6f
+
+    private fun tokens(s: String): Set<String> = s.split(" ").filter { it.isNotEmpty() }.toSet()
+
+    /**
      * The version words [text] names. The list (whole words; a year, stereo, mono, single... mix
      * is the same song; "Edit" left out, radio edits are fine) is the library's too, so it lives in
      * core:common: [VersionWords].
@@ -137,7 +195,11 @@ object QobuzCandidateMatcher {
      * sensibly.
      */
     fun normalize(s: String): String =
-        s.lowercase()
+        // Fold accents first: catalogs often store "é" as "e" + a combining mark (NFD), which the
+        // punctuation pass below would delete, so "Molécules" never matched "Molécules". Folding
+        // both sides also lets "Capuçon"/"Capucon" and "Rodríguez"/"Rodriguez" agree.
+        Normalizer.normalize(s, Normalizer.Form.NFD).replace(COMBINING_MARKS, "")
+            .lowercase()
             .replace(Regex("\\([^)]*\\)"), " ")
             .replace(Regex("\\[[^]]*\\]"), " ")
             .replace(Regex("(?i)\\b(feat\\.?|ft\\.?|featuring)\\b.*"), " ")
@@ -155,6 +217,8 @@ object QobuzCandidateMatcher {
             .replace(Regex("[^\\p{L}\\p{N}\\p{S}\\s]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
+
+    private val COMBINING_MARKS = Regex("\\p{Mn}+")
 
     /** Jaccard similarity on whitespace-tokenized strings. */
     fun jaccard(a: String, b: String): Float {

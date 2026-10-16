@@ -187,13 +187,31 @@ class QobuzCandidateMatcherTest {
     @Test fun `a live album whose titles don't say live keeps the live cut when the length confirms it`() {
         // KISS "Deuce" off "Alive!" (217 s). Neither the title nor the album says "live".
         val query = TrackQuery(artist = "KISS", title = "Deuce", album = "Alive!", durationMs = 217_000)
-        fun cand(version: String?, sec: Int) = QobuzCandidateMatcher.confidence(
+        fun cand(version: String?, sec: Int, album: String?) = QobuzCandidateMatcher.confidence(
             query, "Deuce", "KISS", candIsrc = null, candDurationSec = sec, candStreamable = true, candVersion = version,
+            candAlbum = album,
         )
-        val live = cand("Live", 218)
-        val studio = cand(null, 185)
+        val live = cand("Live", 218, "Alive!")
+        val studio = cand(null, 185, "KISS")
         assertThat(live).isWithin(0.0001f).of(0.9f)
         assertThat(live).isGreaterThan(studio)
+    }
+
+    @Test fun `a length-matched live take from another album is still rejected`() {
+        // Björk "Pagan Poetry" (Vespertine) vs a live take that runs the same length: the
+        // matching length alone used to let it through (0.9) when no studio cut was listed.
+        val query = TrackQuery(artist = "Björk", title = "Pagan Poetry", album = "Vespertine", durationMs = 314_000)
+        val live = QobuzCandidateMatcher.confidence(
+            query, "Pagan Poetry", "Björk", candIsrc = null, candDurationSec = 315, candStreamable = true,
+            candVersion = "Live", candAlbum = "Live at Royal Opera House",
+        )
+        assertThat(live).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        // Nor does a live edition of the same album count as the user's release.
+        val liveEdition = QobuzCandidateMatcher.confidence(
+            query, "Pagan Poetry", "Björk", candIsrc = null, candDurationSec = 330, candStreamable = true,
+            candVersion = "Live", candAlbum = "Vespertine (Live)",
+        )
+        assertThat(liveEdition).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
     }
 
     @Test fun `a length more than 5 percent off still rejects the version`() {
@@ -206,7 +224,35 @@ class QobuzCandidateMatcherTest {
         val plain = score("Song", "Song", queryDurationMs = 200_000, candDurationSec = 200)
         val live = score("Song", "Song", candVersion = "Live", queryDurationMs = 200_000, candDurationSec = 200)
         assertThat(plain).isGreaterThan(live)
-        assertThat(live).isAtLeast(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        // No album to confirm it is the user's release, so the version rule rejects it.
+        assertThat(live).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+    }
+
+    @Test fun `a Spotify dash suffix matches the catalog title with the version kept apart`() {
+        assertThat(score("Disorder - 2007 Remaster", "Disorder", candVersion = "2007 Remaster")).isEqualTo(1.0f)
+        assertThat(score("Dreams - 2004 Remaster", "Dreams")).isEqualTo(1.0f) // reissue words alone
+        assertThat(score("Breathe Me - Ulrich Schnauss Remix", "Breathe Me", candVersion = "Ulrich Schnauss Remix")).isEqualTo(1.0f)
+        assertThat(score("Silver - Robot Baby Mix", "Silver (Robot Baby Mix)")).isEqualTo(1.0f)
+        assertThat(score("Silver - Robot Baby Mix", "Silver", candVersion = "(Robot Baby Mix)")).isEqualTo(1.0f) // bracketed version field
+    }
+
+    @Test fun `a dash suffix the candidate does not explain is not set aside`() {
+        // "Part 1" vs "Part 2", and a remix the candidate doesn't name, keep the plain title score.
+        assertThat(score("Song - Part 1", "Song - Part 2")).isAtMost(0.5f) // plain title score, not raised to 1.0
+        assertThat(score("Song - Club Mix", "Song")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+    }
+
+    @Test fun `a version the query names but the candidate lacks is penalized`() {
+        // "Song (Live)" took the studio "Song" at 1.0 and "Song - Live" at 0.5, even at equal lengths.
+        assertThat(score("Song - Live", "Song", queryDurationMs = 200_000, candDurationSec = 200)).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(score("Song (Live)", "Song", queryDurationMs = 200_000, candDurationSec = 200)).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+    }
+
+    @Test fun `accents fold on both sides, including decomposed catalog text`() {
+        val decomposed = "Molécules" // e + combining acute, as some catalogs store it
+        assertThat(score("Molécules", decomposed)).isEqualTo(1.0f)
+        assertThat(QobuzCandidateMatcher.normalize("Gautier Capuçon")).isEqualTo(QobuzCandidateMatcher.normalize("Gautier Capucon"))
+        assertThat(QobuzCandidateMatcher.normalize("Rodríguez")).isEqualTo("rodriguez")
     }
 
     @Test fun `an ISRC match ignores the version`() {

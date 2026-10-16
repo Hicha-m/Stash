@@ -74,6 +74,7 @@ class MatcherCorpusTest {
         candDurationSec = c.durationSec,
         candStreamable = true,
         candVersion = c.version.takeIf { it.isNotBlank() },
+        candAlbum = c.album.takeIf { it.isNotBlank() },
     )
 
     private fun outcome(item: Item): Pair<Outcome, Candidate?> {
@@ -119,8 +120,8 @@ class MatcherCorpusTest {
 
     private companion object {
         /** Ratchet: today's counts on corpus v1. Lower them when the matcher improves. */
-        const val BASELINE_WRONG_ACCEPTS = 23
-        const val BASELINE_MISSES = 45
+        const val BASELINE_WRONG_ACCEPTS = 9
+        const val BASELINE_MISSES = 28
         const val REPORT_LIMIT = 60
     }
 }
