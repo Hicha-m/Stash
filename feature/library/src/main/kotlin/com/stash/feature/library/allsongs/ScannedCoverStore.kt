@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.annotation.VisibleForTesting
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.UUID
 import javax.inject.Inject
@@ -37,9 +39,9 @@ class ScannedCoverStore @VisibleForTesting internal constructor(val dir: File) {
                 val tmp = File(dir, "$PREFIX${UUID.randomUUID()}.tmp")
                 try {
                     tmp.writeBytes(bytes)
-                    if (!tmp.renameTo(file) && !(file.exists() && file.length() == bytes.size.toLong())) {
-                        error("couldn't move the cover into place")
-                    }
+                    // An atomic replace, as AlbumArtCache does: File.renameTo can't replace an
+                    // existing file everywhere, so a short one would otherwise stay.
+                    Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
                 } finally {
                     tmp.delete()
                 }
