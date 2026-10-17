@@ -37,11 +37,11 @@ function d1(db) {
 function relay(db, tidal) {
   const env = { ACCESS_TOKEN, TIDAL_CLIENT_ID: "id", TIDAL_COUNTRY_CODE: "US", DB: d1(db) };
   const calls = [];
-  const call = async (path) => {
+  const call = async (path, headers = {}) => {
     const original = globalThis.fetch;
     globalThis.fetch = async (url) => { calls.push(String(url)); return tidal(String(url)); };
     try {
-      return await worker.fetch(new Request(`https://relay.example${path}`, { headers: { "X-Access-Token": ACCESS_TOKEN } }), env);
+      return await worker.fetch(new Request(`https://relay.example${path}`, { headers: { "X-Access-Token": ACCESS_TOKEN, ...headers } }), env);
     } finally { globalThis.fetch = original; }
   };
   return { env, calls, call };
@@ -173,6 +173,25 @@ test("real SQL: an expired token whose refresh is rejected as invalid retires th
   assert.equal((await r.call("/search?q=x")).status, 503);
   assert.equal(seat(db, "a").state, "dead");
   assert.equal(r.calls.filter((u) => !isAuth(u)).length, 0);
+});
+
+test("real SQL: uncached searches count against s:<network> and the cap refuses before any seat", async () => {
+  const db = database();
+  for (const id of ["a", "b", "c"]) addSeat(db, id);
+  const r = relay(db, searchOk);
+  Object.assign(r.env, { IP_SALT: "salt", NETWORK_SEARCH_DAILY_CAP: "2" });
+  const ip = { "CF-Connecting-IP": "198.51.100.7" };
+  assert.equal((await r.call("/search?q=one", ip)).status, 200);
+  assert.equal((await r.call("/search?q=one", ip)).status, 200, "cache hit");
+  assert.equal((await r.call("/search?q=two", ip)).status, 200);
+  const over = await r.call("/search?q=three", ip);
+  assert.equal(over.status, 429);
+  assert.deepEqual(await over.json(), { error: "network_daily_cap" });
+  const rows = db.prepare("SELECT key, n FROM tidal_daily_quotas").all();
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].key, /^s:[0-9a-f]{16}$/);
+  assert.equal(rows[0].n, 2);
+  assert.equal(r.calls.length, 2);
 });
 
 test("real SQL: the hourly job prunes expired device grants and keeps pending ones", async () => {
