@@ -62,6 +62,10 @@ internal data class BitchordStreamResponse(
     val bitrate: Int = 0,
 )
 
+/** A non-2xx body from the relay: `{error:"<code>"}`. */
+@Serializable
+internal data class BitchordErrorResponse(val error: String = "")
+
 /**
  * A playable Tidal stream from a BitChord server. [isDash] = [url] is an MPD
  * (`/dash/td/<id>.mpd?exp&sig`) whose init segment the server has patched; else
@@ -110,7 +114,9 @@ sealed interface TidalLookup {
  *    `audioQuality` is LOSSLESS / HI_RES_LOSSLESS are considered.
  *  - `GET {base}/stream/td:<n>?client=media3` → `{url, codec, container,
  *    manifest:"dash"|"none", bitDepth, sampleRate, bitrate}`, or 404 when the
- *    track has no FLAC (the server rejects lossy itself). `client=media3` pins the
+ *    track has no FLAC (the server rejects lossy itself): `{error:"lossless_unavailable"}`
+ *    is definitive, `{error:"not_available"}` may be transient. 502 `upstream_error` is
+ *    transient and never cached. `client=media3` pins the
  *    server's DASH-vs-progressive sniffing to "native DASH client" so it never
  *    swaps the Tidal MPD for a Deezer progressive file meant for browsers.
  *  - 503 (`busy` / `tidal_relay_paused` / `global_daily_cap`) and 429
@@ -123,7 +129,7 @@ sealed interface TidalLookup {
  *
  * Request budget: every `/search` and `/stream` spends quota on a small shared pool of
  * Tidal accounts, so answers are cached per song in Room ([TidalMatchDao]; matches 30 days,
- * misses 14 days — never the stream URL itself), concurrent identical lookups share one
+ * misses 14 days (6 h for a `/stream` 404 that is not `lossless_unavailable`) — never the stream URL itself), concurrent identical lookups share one
  * request, and a busy pool pauses every caller on this device for as long as the relay asks.
  *
  * Matching reuses [QobuzCandidateMatcher] — the scorer the Qobuz rung uses — on
@@ -303,9 +309,10 @@ class BitchordClient @Inject constructor(
                             TidalLookup.Found(stream)
                         }
                     }
-                    // lossless_unavailable / not_available: a real answer about this song.
-                    Reply.NotFound -> {
-                        stampMiss(match, allowAac)
+                    // lossless_unavailable: a real answer about this song. not_available (or a body
+                    // we can't read) may be a transient refusal: a short miss, see [stampMiss].
+                    is Reply.NotFound -> {
+                        stampMiss(match, allowAac, definitive = r.definitive)
                         TidalLookup.NoMatch
                     }
                     is Reply.Busy -> busy(r.untilMs)
@@ -329,10 +336,19 @@ class BitchordClient @Inject constructor(
         return TidalLookup.Busy(busyUntilMs)
     }
 
-    /** AAC mode's 404 also means no lossless: asked for AAC, the relay still prefers lossless. */
-    private suspend fun stampMiss(match: TidalMatchEntity, allowAac: Boolean) {
+    /**
+     * AAC mode's 404 also means no lossless: asked for AAC, the relay still prefers lossless.
+     *
+     * A [definitive] miss is kept [MISS_TTL_MS]; any other is kept only [SHORT_MISS_TTL_MS]. The
+     * row has no TTL column, so a short miss is written BACKDATED — stamped
+     * `now − (MISS_TTL_MS − SHORT_MISS_TTL_MS)` — and [cachedMiss]'s one 14-day check expires it
+     * 6 h from now. No schema migration, and [TidalMatchDao.deleteOlderThan] (30-day prune) is
+     * unaffected: the backdated stamp is still well inside it.
+     */
+    private suspend fun stampMiss(match: TidalMatchEntity, allowAac: Boolean, definitive: Boolean = true) {
         val now = nowMs()
-        writeCache(if (allowAac) match.copy(aacMissAt = now, losslessMissAt = now) else match.copy(losslessMissAt = now))
+        val at = if (definitive) now else now - (MISS_TTL_MS - SHORT_MISS_TTL_MS)
+        writeCache(if (allowAac) match.copy(aacMissAt = at, losslessMissAt = at) else match.copy(losslessMissAt = at))
     }
 
     private fun cachedMiss(c: TidalMatchEntity?, allowAac: Boolean, now: Long): Boolean {
@@ -409,8 +425,12 @@ class BitchordClient @Inject constructor(
     /** One relay answer, sorted by what the caller must do about it. */
     private sealed interface Reply {
         data class Ok(val body: String) : Reply
-        /** 404: the relay's definitive "no such song / no FLAC / no AAC". */
-        data object NotFound : Reply
+        /**
+         * 404. [definitive] = `lossless_unavailable` (no lossless for this track with this
+         * client; the relay itself caches it 5 days). `not_available` — which the relay trusts
+         * only 6 h, as it can be a transient refusal — or an unreadable body is not.
+         */
+        data class NotFound(val definitive: Boolean) : Reply
         /** 503 (no pooled account free) or 429 (slow down): back off until [untilMs] (from Retry-After). */
         data class Busy(val untilMs: Long) : Reply
         /** Anything else (5xx, other 4xx): transient, never cached as a miss. */
@@ -428,7 +448,7 @@ class BitchordClient @Inject constructor(
                 Log.d(TAG, "HTTP ${r.code}")
                 val now = nowMs()
                 return when (r.code) {
-                    404 -> Reply.NotFound
+                    404 -> Reply.NotFound(definitive = errorCode(r) == "lossless_unavailable")
                     // The relay says how long: 15 s when only seat pacing blocks, 30 s for its
                     // per-network limiter, 300 / 600 s when capped or paused. A flat 5 min turned
                     // a 15 s pacing blip into a device-wide Tidal blackout.
@@ -443,6 +463,13 @@ class BitchordClient @Inject constructor(
             return Reply.Ok(body.string())
         }
     }
+
+    /** The `error` code of a non-2xx JSON body, or null when absent, oversized or unparseable. */
+    private fun errorCode(r: okhttp3.Response): String? = runCatching {
+        val body = r.body ?: return null
+        if (body.contentLength() > MAX_BODY_BYTES) return null
+        json.decodeFromString<BitchordErrorResponse>(body.string()).error.takeIf { it.isNotEmpty() }
+    }.getOrNull()
 
     /** Retry-After (seconds) clamped to [[min], [max]]; absent or junk (an HTTP-date too) → [BUSY_BACKOFF_MS]. */
     private fun retryAfterMs(r: okhttp3.Response, min: Long, max: Long): Long =
@@ -460,6 +487,8 @@ class BitchordClient @Inject constructor(
         const val MATCH_TTL_MS = 30L * 24 * 60 * 60_000
         /** A definitive miss (no match, no lossless, no AAC) is trusted this long. */
         const val MISS_TTL_MS = 14L * 24 * 60 * 60_000
+        /** A `/stream` 404 that is not `lossless_unavailable` (the relay trusts `not_available` 6 h). */
+        const val SHORT_MISS_TTL_MS = 6L * 60 * 60_000
         /** Pool busy (503 / 429) with no usable Retry-After: leave the relay alone this long. */
         const val BUSY_BACKOFF_MS = 5 * 60_000L
         /** Bounds on a 503's Retry-After: the relay's shortest pacing wait up to a long pause. */
