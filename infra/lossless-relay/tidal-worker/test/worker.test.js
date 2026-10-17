@@ -558,6 +558,21 @@ test("a 401 whose refresh cannot complete cools that seat (never kills it) and t
   assert.equal(f.dbWrites.some(({ sql }) => sql.includes("state='dead'")), false);
 });
 
+test("/stream answers another upstream 4xx with 502 upstream_error, on one seat and no quota", async () => {
+  for (const status of [400, 403]) {
+    const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: async () => new Response("{}", { status }) });
+    f.env.IP_SALT = "test-salt";
+    await withFetch(null, f.fetchTidal, async () => {
+      const r = await worker.fetch(authorizedRequest("/stream/td:321", "GET", { "CF-Connecting-IP": "192.0.2.15" }), f.env);
+      assert.equal(r.status, 502);
+      assert.deepEqual(await r.json(), { error: "upstream_error" });
+    });
+    assert.equal(f.accountCaps.length, 1, `${status}: no second seat`);
+    assert.equal(f.dailyQuotas.size, 0);
+    assert.equal(f.responseCache.size, 0);
+  }
+});
+
 test("Tidal subStatus 4005 is a track-level not_available: no second seat, account never retired", async () => {
   const accounts = ["a", "b", "c"].map((id) => ({ ...liveAccount(), id }));
   const f = fixture({ accounts, tidalResponse: async () => new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 }) });

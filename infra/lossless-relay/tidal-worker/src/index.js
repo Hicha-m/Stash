@@ -262,7 +262,7 @@ async function streamUncached(trackId, request, env) {
   const aacOnly = aacMode === "only";
   const allowAac = aacMode === "1" || aacOnly;
   // Upstream budget: one playbackinfo call per seat taken. A second seat is only tried
-  // after a seat-level failure (dead session, failed refresh, Tidal 5xx), never for a
+  // after a seat-level failure (failed refresh, Tidal 5xx), never for a
   // track-level answer: with this client ID CD-only tracks always come back HIGH (AAC),
   // and a 4005 is a track/rights refusal, so asking another seat just burns budget.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -285,8 +285,10 @@ async function streamUncached(trackId, request, env) {
         await onUpstream429(env, account, "playbackinfo");
         return busy();
       }
-      if (data.status >= 500) await coolAccount(env, account.id, 300);
       if (data.status === 404) return json({ error: "not_available" }, 404);
+      // Any other 4xx is Tidal refusing this request, not this seat: another seat gets the same.
+      if (data.status < 500) return json({ error: "upstream_error" }, 502);
+      await coolAccount(env, account.id, 300);
       continue;
     }
     const info = await data.json();
