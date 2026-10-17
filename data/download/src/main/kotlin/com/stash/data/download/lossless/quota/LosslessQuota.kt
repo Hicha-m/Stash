@@ -197,6 +197,9 @@ class LosslessQuota internal constructor(
 
     /** Raises the day's [LosslessQuotaNotice] when [a] crosses a threshold not yet announced. */
     private suspend fun maybeNotify(a: LosslessAllowance) = noticeMutex.withLock {
+        // The stored "already announced today" must be in before it is judged, or an answer that
+        // lands during the cold-start read would announce the day's limit a second time.
+        loaded.await()
         val limit = a.limit ?: return@withLock
         if (nowMs() >= a.resetsAtMs) return@withLock
         val left = limit - a.used
