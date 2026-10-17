@@ -11,15 +11,20 @@
  * Endpoints:
  *   GET /v1/qobuz/file?track_id=&format_id=   signed (X-Stash-Install/-Ts/-Auth), X-Stash-Version: 1,
  *                                             optional X-Stash-Purpose: stream | download
+ *   GET /v1/quota                             signed (X-Stash-Install/-Ts/-Auth over "<install>:quota:<ts>"):
+ *                                             today's daily lossless count, not counted itself
  *   GET /v1/status                            reachability probe for the Settings "Test" button
  *
- * State: D1 (accounts' rotation state, the shared mint cache, daily quotas).
+ * State: D1 (accounts' rotation state, the shared mint cache, daily quotas), plus QUOTA_DB: the daily
+ * lossless counter shared with the Tidal relay (src/quota.js). A lossless mint answered (a cache HIT
+ * included) costs the install one unit; at FREE_LOSSLESS_DAILY it is answered 429 daily_lossless_cap.
  * Secrets: RELAY_KEY, RELAY_KEY_PREV (optional), QOBUZ_ACCOUNTS, QOBUZ_ACCOUNTS_EXTRA and
  *          QOBUZ_ACCOUNTS_RECOVERED, QOBUZ_ACCOUNTS_RECOVERED_2 and QOBUZ_ACCOUNTS_RECOVERED_3 (optional additive arrays).
  *          Deploy: see README.md.
  */
 import { createHmac } from "node:crypto";
-import { verifyMint } from "./auth.js";
+import { verifyMint, verifyQuota } from "./auth.js";
+import { readStanding, spendLossless, losslessHeaders, capAnswer, quotaBody, pruneUsage } from "./quota.js";
 import { mintFromQobuz } from "./qobuz.js";
 import {
     getCached, putCachedStmt, readQuota, readQuotas, bumpQuotaStmt,
@@ -52,7 +57,11 @@ const ensured = new WeakMap();
 
 export default {
     fetch: (request, env) => handle(request, env, globalThis.fetch, Math.floor(Date.now() / 1000)),
-    scheduled: (event, env) => prune(env.DB, Math.floor(Date.now() / 1000)),
+    scheduled: async (event, env) => {
+        const nowSec = Math.floor(Date.now() / 1000);
+        await prune(env.DB, nowSec);
+        await pruneUsage(env, nowSec); // never throws
+    },
 };
 
 /**
@@ -65,8 +74,9 @@ export async function handle(request, env, fetchImpl, nowSec) {
     const url = new URL(request.url);
     if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
     if (url.pathname === "/v1/status") return json({ ok: true }, 200);
-    if (url.pathname !== "/v1/qobuz/file") return json({ error: "not_found" }, 404);
+    if (url.pathname !== "/v1/qobuz/file" && url.pathname !== "/v1/quota") return json({ error: "not_found" }, 404);
     try {
+        if (url.pathname === "/v1/quota") return await quota(request, env, nowSec);
         return await mint(request, url, env, fetchImpl, nowSec);
     } catch (e) {
         console.error(e); // visible in `wrangler tail`
@@ -103,8 +113,16 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         if (!success) return json({ error: "rate_limited" }, 429, { "Retry-After": "60" });
     }
 
+    // The daily lossless counter, shared with the Tidal relay. Checked before any answer: a cache HIT
+    // is still a lossless stream for the user, so it counts too. Off (null) without QUOTA_DB.
+    const standing = await readStanding(request, env, "i:" + install, nowSec);
+    if (standing?.over) {
+        const cap = capAnswer(standing, nowSec);
+        return json(cap.body, cap.status, cap.headers);
+    }
+
     const cached = await getCached(env.DB, trackId, formatId, nowSec);
-    if (cached) return ok(cached.url, cached.got_format_id, cached.bit_depth, cached.sample_rate, "HIT");
+    if (cached) return ok(cached.url, cached.got_format_id, cached.bit_depth, cached.sample_rate, "HIT", losslessHeaders(await spendLossless(standing)));
 
     const day = dayKey(nowSec);
     const caps = vars(env);
@@ -177,7 +195,8 @@ async function mint(request, url, env, fetchImpl, nowSec) {
             }
             if (r.kind === "ok" && r.etsp) writes.push(putCachedStmt(env.DB, trackId, formatId, r)); // no etsp → serve once, never cache
             await env.DB.batch(writes);
-            return r.kind === "ok" ? ok(r.url, r.formatId, r.bitDepth, r.sampleRateHz, "MISS") : json({ error: "not_available" }, 404);
+            if (r.kind !== "ok") return json({ error: "not_available" }, 404); // a 404 never counts as lossless
+            return ok(r.url, r.formatId, r.bitDepth, r.sampleRateHz, "MISS", losslessHeaders(await spendLossless(standing)));
         }
         if (r.kind === "dead") await killAccount(env.DB, label, r.reason);
         // A transient reached Qobuz and cools an account, so it costs the caller's network one unit
@@ -199,6 +218,27 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         return json({ error: "not_available" }, 404);
     }
     return json({ error: "busy" }, 503, { "Retry-After": "60" });
+}
+
+/**
+ * GET /v1/quota: where the install stands today, for the app's cold start. Signed like a mint but over
+ * "<install>:quota:<ts>", behind the same per-network limiter, and never counted. 404 quota_off when the
+ * counter is off (no QUOTA_DB): the same status an older relay without the route gives.
+ */
+async function quota(request, env, nowSec) {
+    const h = (name) => request.headers.get(name) || "";
+    if (!env.RELAY_KEY) return json({ error: "server_misconfigured", message: "RELAY_KEY not set" }, 500);
+    const install = h("X-Stash-Install");
+    if (!verifyQuota({ install, ts: h("X-Stash-Ts"), auth: h("X-Stash-Auth") }, nowSec, [env.RELAY_KEY, env.RELAY_KEY_PREV])) {
+        return json({ error: "unauthorized" }, 401, { "X-Stash-Server-Time": String(nowSec) });
+    }
+    if (env.MINT_RL) {
+        const { success } = await env.MINT_RL.limit({ key: networkOf(h("CF-Connecting-IP")) });
+        if (!success) return json({ error: "rate_limited" }, 429, { "Retry-After": "60" });
+    }
+    const standing = await readStanding(request, env, "i:" + install, nowSec);
+    if (!standing) return json({ error: "quota_off" }, 404);
+    return json(quotaBody(standing), 200, { ...losslessHeaders(standing), "Cache-Control": "no-store" });
 }
 
 /**
@@ -324,9 +364,12 @@ function parseAccounts(env) {
     });
 }
 
-/** The spec §1 success shape. sample_rate is already Hz. `no-store`: the URL is short-lived and per-request headers gate it. */
-function ok(url, formatId, bitDepth, sampleRateHz, cache) {
-    return json({ url, format_id: formatId, bit_depth: bitDepth, sample_rate: sampleRateHz }, 200, { "X-Stash-Cache": cache, "Cache-Control": "no-store" });
+/**
+ * The spec §1 success shape. sample_rate is already Hz. `no-store`: the URL is short-lived and per-request headers gate it.
+ * `extra`: the daily lossless counter headers (none with the counter off).
+ */
+function ok(url, formatId, bitDepth, sampleRateHz, cache, extra = {}) {
+    return json({ url, format_id: formatId, bit_depth: bitDepth, sample_rate: sampleRateHz }, 200, { "X-Stash-Cache": cache, "Cache-Control": "no-store", ...extra });
 }
 
 function json(obj, status, extra = {}) {
