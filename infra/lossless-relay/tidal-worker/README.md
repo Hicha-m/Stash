@@ -28,7 +28,7 @@ Run `npm run tidal:login` to add a live account or `npm run tidal:login -- --res
 Design: `docs/superpowers/specs/2026-10-17-lossless-daily-counter-design.md`. Every install gets `FREE_LOSSLESS_DAILY`
 (default 500) lossless answers per UTC day, **Qobuz and Tidal together**: both relays count in one D1 database,
 `stash-quota` (binding `QUOTA_DB`, table `usage(day, subject, n)`, subject `i:<install id>`; schema and migrate command
-in `infra/lossless-quota/`, copied for the tests to `test/fixtures/quota_0001_init.sql`: keep them equal). Code:
+in `infra/lossless-quota/`, copied for the tests to `test/fixtures/quota_*.sql`: keep them equal). Code:
 `src/quota.js` (an identical copy of the Qobuz relay's) and `src/auth.js`.
 
 - **Install headers.** The app sends `X-Stash-Install` (its random install id, `[A-Za-z0-9-]{8,64}`), `X-Stash-Ts`
@@ -56,8 +56,30 @@ in `infra/lossless-quota/`, copied for the tests to `test/fixtures/quota_0001_in
 - **`GET /quota`** → `200 {"used":n,"limit":500,"resetsAt":T,"supporter":false}` (`limit: null` for a supporter)
   with the headers. Needs `X-Access-Token` and the signed headers (missing ones: 401); behind `REQUEST_RL`; never
   counted. `404 {"error":"quota_off"}` without `QUOTA_DB` or `RELAY_KEY` (an older deploy answers `not_found` 404).
-- **Supporters (step 3, not built):** `entitlementOf(request, env)` in `src/quota.js` returns null today; when it
-  returns an entitlement the cap is skipped (still counted).
+- **Supporters:** `/stream` and `/quota` may carry `X-Stash-Entitlement: <token>`, the token the tip jar issues to a
+  Ko-fi supporter: `base64url(UTF-8 JSON {"tier":"supporter","iat":<epoch s>,"tid":"<32 hex>","v":1})` `.`
+  `base64url(Ed25519 signature over the ASCII bytes of the first segment)`, both without padding. Verified with
+  WebCrypto against the var `ENTITLEMENT_PUBLIC_KEY` (standard base64 of the raw 32-byte public key; public, in
+  `wrangler.toml`, the same value as the Qobuz relay's). Only tier `supporter`, `v` 1, a 32-hex `tid` and an `iat` at
+  most 300 s ahead are accepted (no expiry); verified tokens are cached per isolate. A missing, malformed, wrongly
+  signed or revoked token is never an error: the request just gets the free quota. For a valid token the free limit
+  is skipped: headers read `<used>/unlimited` (`used` = the install's own count, which still counts every FLAC
+  answer) and `/quota` answers `{"supporter":true,"limit":null}`. The network, global and fair-share limits still
+  apply to supporters.
+- **Per-token ceiling:** every FLAC answer under a token also counts in `usage` as subject `t:<tid>`. At
+  `SUPPORTER_DAILY_CAP` (default 5000) that day the token is treated as absent: the install's free limit applies
+  again (headers `<used>/500`, then the 429 or `?aac=1`'s AAC). This keeps a posted token from being a free pass.
+- **Revocation:** table `revoked_tokens(tid, revoked_at, reason)` in `stash-quota` (migration
+  `infra/lossless-quota/migrations/0002_revoked_tokens.sql`, copied to `test/fixtures/quota_0002_revoked_tokens.sql`),
+  checked in the same D1 read as the install's count. Revoke (the tid is in the token's first segment, base64url
+  JSON; takes effect on the next request):
+
+  ```powershell
+  npx wrangler d1 execute stash-quota --remote --config infra/lossless-quota/wrangler.toml --command "INSERT INTO revoked_tokens (tid, revoked_at, reason) VALUES ('<32 hex tid>', unixepoch(), 'posted publicly')"
+  ```
+
+  Un-revoke: `DELETE FROM revoked_tokens WHERE tid = '<tid>'`. Apply migration 0002 before deploying this relay:
+  without the table a supporter's counter read fails and that request is served with the counter off.
 - **Safety:** no `QUOTA_DB` binding skips the counter (`QUOTA_DB not bound`, once per isolate); a D1 error on the
   counter skips it for that request. The network, global and fair-share limits are unchanged and still apply. A race
   can serve one or two past the limit. The hourly job prunes `usage` rows older than 7 days.
