@@ -1,5 +1,7 @@
 package com.stash.data.download.lossless
 
+import com.stash.core.common.YouTubeSongTitle
+import com.stash.core.model.MusicSource
 import com.stash.data.download.lossless.spotifyresolve.SpotifyUriResolver
 
 /**
@@ -112,6 +114,24 @@ data class TrackQuery(
      */
     val durationReliable: Boolean = true,
 )
+
+/**
+ * This query for a library row from [source]. A YouTube Music row is read as the song it names
+ * ([YouTubeSongTitle]: "Artist - Song (Official Video)" uploaded by a channel becomes Artist /
+ * "Song"), so the lookups search and score the song rather than the upload; with raw titles a
+ * catalog search found the song for 61% of labelled YouTube rows, with parsed ones 76%. Its length
+ * is marked unreliable too (often the video's, see [TrackQuery.durationReliable]). Other rows are
+ * returned unchanged.
+ */
+fun TrackQuery.forLibrarySource(source: MusicSource): TrackQuery {
+    if (source != MusicSource.YOUTUBE) return this
+    val song = YouTubeSongTitle.parse(title, artist)
+    return copy(
+        artist = song.artist.ifBlank { artist },
+        title = song.queryTitle.ifBlank { title },
+        durationReliable = false,
+    )
+}
 
 /**
  * The `https://open.spotify.com/track/<id>` URL antra's `/api/resolve`

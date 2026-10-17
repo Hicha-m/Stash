@@ -2,9 +2,9 @@ package com.stash.core.media.streaming
 
 import android.util.Log
 import com.stash.core.data.db.entity.TrackEntity
-import com.stash.core.model.MusicSource
 import com.stash.data.download.lossless.LosslessSourceHealthGate
 import com.stash.data.download.lossless.TrackQuery
+import com.stash.data.download.lossless.forLibrarySource
 import com.stash.data.download.lossless.qobuz.QobuzSource
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -53,8 +53,7 @@ class QobuzStreamResolver @Inject constructor(
             album = track.album.takeIf { it.isNotBlank() },
             isrc = track.isrc?.takeIf { it.isNotBlank() },
             durationMs = track.durationMs,
-            durationReliable = track.source != MusicSource.YOUTUBE,
-        )
+        ).forLibrarySource(track.source)
         val requestedQuality = qualityPolicy.streamingTier().qobuzCode
         val result = source.resolveImmediate(query, requestedQuality) ?: run {
             Log.d(TAG, "no_result id=${track.id}")
