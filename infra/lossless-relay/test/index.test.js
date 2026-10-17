@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { fakeD1 } from "./fake-d1.js";
-import worker, { handle, networkOf, refusalNamesTrack } from "../src/index.js";
+import worker, { handle, networkOf, network48Of, refusalNamesTrack } from "../src/index.js";
 import { bumpQuotaStmt } from "../src/db.js";
 
 const NOW = 1788282000; // 2026-09-01T17:00:00Z
@@ -353,6 +353,68 @@ test("networkOf: IPv4 as is; IPv6 by its /56, however it's written", () => {
     assert.equal(networkOf("2001:db8::1"), "2001:db8:0:0/56");
     assert.notEqual(networkOf("2001:db8:aa:cc00::1"), networkOf("2001:db8:aa:bb00::1"));
     assert.equal(networkOf(""), "?");
+});
+
+test("network48Of: an IPv6 caller's /48, however it's written; null for IPv4 and a missing address", () => {
+    assert.equal(network48Of("2001:db8:aa:bb12:1:2:3:4"), "2001:db8:aa/48");
+    assert.equal(network48Of("2001:DB8:AA:FF00::9"), "2001:db8:aa/48"); // another /56 of the same /48
+    assert.equal(network48Of("2001:db8::1"), "2001:db8:0/48");
+    assert.notEqual(network48Of("2001:db8:ab::1"), network48Of("2001:db8:aa::1"));
+    assert.equal(network48Of("203.0.113.9"), null);
+    assert.equal(network48Of("::ffff:203.0.113.9"), null);
+    assert.equal(network48Of(""), null);
+});
+
+test("a /48's aggregate cap stops a script hopping /56s inside one tunnel-broker /48: 429, no Qobuz call; other /48s and IPv4 unaffected", async () => {
+    const e = env({ IP_SALT: "salt-1", NETWORK_DAILY_CAP: "2", NETWORK48_DAILY_CAP: "3" });
+    const q = qobuzByToken(new Set());
+    // Three different /56s of 2001:db8:aa::/48, one mint each: every /56 is under its own cap of 2.
+    for (let i = 0; i < 3; i++) {
+        assert.equal((await handle(mintReq(100 + i, 27, { install: `hop-install-${i}`, ip: `2001:db8:aa:${i}100::1` }), e, q, NOW + i)).status, 200);
+    }
+    const r = await handle(mintReq(200, 27, { install: "hop-install-x", ip: "2001:db8:aa:4400::1" }), e, q, NOW + 10); // a fresh /56, same /48
+    assert.equal(r.status, 429);
+    assert.equal(r.headers.get("Retry-After"), "3600");
+    assert.equal(q.calls.length, 3);
+    assert.equal(e.DB.raw.prepare("SELECT n FROM quota WHERE key LIKE 'w:%'").get().n, 3);
+    assert.equal((await handle(mintReq(201, 27, { install: "next-door", ip: "2001:db8:ab::1" }), e, q, NOW + 11)).status, 200);
+    assert.equal((await handle(mintReq(202, 27, { install: "v4-caller", ip: "198.51.100.7" }), e, q, NOW + 12)).status, 200);
+    // IPv4 callers never get a /48 row.
+    assert.equal(e.DB.raw.prepare("SELECT COUNT(*) AS c FROM quota WHERE key LIKE 'w:%'").get().c, 2);
+});
+
+test("the /48 cap defaults to four network caps", async () => {
+    const e = env({ IP_SALT: "salt-1", NETWORK_DAILY_CAP: "1" });
+    const q = qobuzByToken(new Set());
+    const statuses = [];
+    for (let i = 0; i < 5; i++) statuses.push((await handle(mintReq(100 + i, 27, { install: `hop-install-${i}`, ip: `2001:db8:aa:${i}100::1` }), e, q, NOW + i)).status);
+    assert.deepEqual(statuses, [200, 200, 200, 200, 429]);
+});
+
+test("a /48's free-404 allowance is aggregated too: hopping /56s doesn't multiply it", async () => {
+    const e = env({ IP_SALT: "salt-1", NETWORK_FREE_404_DAILY: "2", NETWORK48_FREE_404_DAILY: "3" });
+    const q = qobuz(...Array(10).fill([404, ""]));
+    for (let i = 0; i < 4; i++) assert.equal((await handle(mintReq(1000 + i, 27, { install: `hop-install-${i}`, ip: `2001:db8:aa:${i}100::1` }), e, q, NOW + i)).status, 404);
+    assert.equal(e.DB.raw.prepare("SELECT n FROM quota WHERE key LIKE 'wf:%'").get().n, 3);
+    // The fourth, past the /48's allowance, counted like any answer: on its /56's and its /48's caps.
+    assert.equal(e.DB.raw.prepare("SELECT n FROM quota WHERE key LIKE 'w:%'").get().n, 1);
+    assert.equal(e.DB.raw.prepare("SELECT COUNT(*) AS c FROM quota WHERE key LIKE 'n:%'").get().c, 1);
+});
+
+test("without IP_SALT the network caps stay off, and the relay warns once per isolate", async () => {
+    const fresh = await import(new URL("../src/index.js?no-salt-warning", import.meta.url));
+    const warned = [];
+    const orig = console.warn;
+    console.warn = (...a) => warned.push(a.join(" "));
+    try {
+        const e = env({ NETWORK_DAILY_CAP: "1" });
+        assert.equal((await fresh.handle(mintReq(42, 27), e, qobuz([200, GOOD]), NOW)).status, 200);
+        assert.equal((await fresh.handle(mintReq(43, 27), e, qobuz([200, GOOD]), NOW)).status, 200); // no network cap
+    } finally {
+        console.warn = orig;
+    }
+    assert.equal(warned.length, 1);
+    assert.match(warned[0], /IP_SALT/);
 });
 
 test("the per-IP limiter counts an IPv6 caller by its /56: rotating addresses inside it shares one bucket", async () => {

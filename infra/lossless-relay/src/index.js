@@ -124,12 +124,18 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         if (wait > 0) return json({ error: "paced" }, 429, { "Retry-After": String(wait) });
     }
     // The install's daily cap, then its network's: the install id is client-chosen, so a script that
-    // rotates it meets the network cap instead. Both counters, and the network's free-404 tally
-    // (spendStmts), come back in one read. No IP_SALT, no network tag: the network caps are off.
+    // rotates it meets the network cap instead. An IPv6 caller also meets its /48's aggregate cap
+    // (network48Of): one free tunnel-broker /48 holds 256 /56s, each with its own network cap.
+    // Every counter, and the free-404 tallies (spendStmts), come back in one read. No IP_SALT, no
+    // network tag: the network caps are off.
     const tag = ipTag(env, network);
-    const keys = { install: "i:" + install, network: tag && "n:" + tag, free404: tag && "nf:" + tag };
+    const tag48 = ipTag(env, network48Of(h("CF-Connecting-IP")));
+    const keys = {
+        install: "i:" + install, network: tag && "n:" + tag, free404: tag && "nf:" + tag,
+        network48: tag48 && "w:" + tag48, free404w: tag48 && "wf:" + tag48,
+    };
     const used = await readQuotas(env.DB, day, Object.values(keys).filter(Boolean));
-    if (used[keys.install] >= caps.install || (tag && used[keys.network] >= caps.network)) {
+    if (used[keys.install] >= caps.install || (tag && used[keys.network] >= caps.network) || (tag48 && used[keys.network48] >= caps.network48)) {
         return json({ error: "rate_limited" }, 429, { "Retry-After": "3600" });
     }
 
@@ -156,7 +162,8 @@ async function mint(request, url, env, fetchImpl, nowSec) {
             continue;
         }
         if (r.kind === "ok" || r.kind === "locked") {
-            const free404 = r.kind === "locked" && r.reason === "404" && Boolean(tag) && used[keys.free404] < caps.free404;
+            const free404 = r.kind === "locked" && r.reason === "404" && Boolean(tag) && used[keys.free404] < caps.free404
+                && (!tag48 || used[keys.free404w] < caps.free404w);
             const writes = spendStmts(env.DB, day, keys, tag, free404);
             if (free404) writes.push(refundAccountStmt(env.DB, label, nowSec));
             if (r.kind === "ok" && refusedBy) {
@@ -207,10 +214,15 @@ export function pacedWaitSec(used, caps, nowSec) {
  */
 function spendStmts(db, day, keys, tag, free404) {
     const writes = [bumpQuotaStmt(db, day, keys.install, tag)];
-    if (free404) return [...writes, bumpQuotaStmt(db, day, keys.free404)];
+    if (free404) return [...writes, ...[keys.free404, keys.free404w].filter(Boolean).map((k) => bumpQuotaStmt(db, day, k))];
     writes.push(bumpQuotaStmt(db, day, "global"));
-    if (keys.network) writes.push(bumpQuotaStmt(db, day, keys.network));
+    writes.push(...networkStmts(db, day, keys));
     return writes;
+}
+
+/** The caller's network counters: its `n:` cap and, for IPv6, its /48's `w:` aggregate. Empty without IP_SALT. */
+function networkStmts(db, day, keys) {
+    return [keys.network, keys.network48].filter(Boolean).map((k) => bumpQuotaStmt(db, day, k));
 }
 
 /**
@@ -234,24 +246,47 @@ export function networkOf(addr) {
 }
 
 /**
+ * The /48 an IPv6 caller's /56 sits in, for the aggregate `w:` cap, or null for IPv4 (and IPv4-mapped
+ * IPv6) and a missing address: an IPv4 caller has no /48 and is capped by its address alone. Same
+ * normalisation as networkOf, so every way of writing an address lands on one key.
+ */
+export function network48Of(addr) {
+    const net = networkOf(addr);
+    if (!net.endsWith("/56")) return null;
+    return net.split(":").slice(0, 3).join(":") + "/48";
+}
+
+/**
  * A short salted hash of the caller's network (networkOf) for the per-network caps and the abuse
  * report (many installs behind one network is how a scraper rotating install ids shows up), or null
  * when IP_SALT is unset, which turns the per-network caps off. The salt is a Worker secret, never the
  * relay key: that key is public, and with it the whole IPv4 space would reverse in minutes.
  */
 function ipTag(env, network) {
-    return env.IP_SALT && network !== "?" ? createHmac("sha256", env.IP_SALT).update(network).digest("hex").slice(0, 16) : null;
+    if (!env.IP_SALT) {
+        // Off by design (local dev), but in production it silently drops every network cap: say so once per isolate.
+        if (!warnedNoSalt) { warnedNoSalt = true; console.warn("IP_SALT not set: per-network caps are OFF"); }
+        return null;
+    }
+    return network && network !== "?" ? createHmac("sha256", env.IP_SALT).update(network).digest("hex").slice(0, 16) : null;
 }
+let warnedNoSalt = false;
 
 function vars(env) {
     const n = (v, d) => (Number.parseInt(v, 10) > 0 ? Number.parseInt(v, 10) : d);
-    return {
+    const c = {
         global: n(env.GLOBAL_DAILY_CAP, 600),
         install: n(env.INSTALL_DAILY_CAP, 100),
         // Per network (only with IP_SALT): a few installs' worth, so a household or a carrier NAT still fits.
         network: n(env.NETWORK_DAILY_CAP, 400),
         // Qobuz 404s (ids it doesn't know) a network gets each day without spending the global or account caps.
         free404: n(env.NETWORK_FREE_404_DAILY, 50),
+    };
+    return {
+        ...c,
+        // An IPv6 /48 together (256 /56s): four networks' worth, so a site with a few subnets still fits.
+        network48: n(env.NETWORK48_DAILY_CAP, 4 * c.network),
+        free404w: n(env.NETWORK48_FREE_404_DAILY, 4 * c.free404),
         hourly: n(env.ACCOUNT_HOURLY_CAP, 20),
         daily: n(env.ACCOUNT_DAILY_CAP, 200),
         // These account labels bypass only the per-account hourly/daily selection limits.
