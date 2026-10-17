@@ -486,6 +486,31 @@ test("?aac is normalised to '', '1' or 'only' before the cache key: junk values 
   assert.deepEqual([...f.responseCache.keys()], ["stream:US:5:aac=:web=app"]);
 });
 
+test("progressive FLAC and AAC answers carry expiresAt from the Tidal URL; omitted when unreadable; DASH keeps its shape", async () => {
+  const expiry = Math.floor(Date.now() / 1000) + 1800;
+  const bts = (codecs, file) => JSON.stringify({ codecs, urls: [`https://cdn.example/${file}?token=${expiry}~sig`] });
+  const cases = [
+    ["/stream/td:1", () => playbackInfo("LOSSLESS", "application/vnd.tidal.bts", bts("flac", "a.flac")), expiry],
+    ["/stream/td:2?aac=1", () => playbackInfo("HIGH", "application/vnd.tidal.bts", bts("mp4a.40.2", "a.m4a")), expiry],
+    ["/stream/td:3?aac=only", () => playbackInfo("HIGH", "application/vnd.tidal.bts", bts("mp4a.40.2", "a.m4a")), expiry],
+    ["/stream/td:4", () => losslessResponse(), undefined],
+    ["/stream/td:5?aac=1", () => aacResponse(), undefined],
+  ];
+  for (const [path, tidal, want] of cases) {
+    const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: async (url) => (url.includes("/playbackinfopostpaywall") ? tidal() : new Response("{}", { status: 500 })) });
+    await withFetch(null, f.fetchTidal, async () => {
+      const body = await (await worker.fetch(authorizedRequest(path), f.env)).json();
+      assert.equal(body.expiresAt, want, path);
+      if (want === undefined) assert.equal("expiresAt" in body, false, path);
+    });
+  }
+  const f = fixture({ tidalResponse: async () => playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", MPD) });
+  await withFetch(null, f.fetchTidal, async () => {
+    const body = await (await worker.fetch(authorizedRequest("/stream/td:6"), f.env)).json();
+    assert.equal("expiresAt" in body, false, "DASH answers carry their expiry in the signed URL");
+  });
+});
+
 test("track-level lossless refusals are cached across app requests", async () => {
   const accounts = [liveAccount(), { ...liveAccount(), id: "second-account" }];
   const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", "{}") });

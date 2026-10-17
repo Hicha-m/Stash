@@ -481,7 +481,16 @@ function aacInfo(info, hires) {
   const codecs = String(bts.codecs || "").toLowerCase();
   const audioUrl = bts.urls?.[0];
   if (!/mp4a|aac/.test(codecs) || !audioUrl?.startsWith("https://")) return json({ error: "lossless_unavailable" }, 404);
-  return json({ url: audioUrl, codec: "aac", codecs, container: "mp4", manifest: "none", audioQuality: info.audioQuality, bitDepth: 0, sampleRate: 44100, bitrate: 320, ...(typeof hires === "boolean" ? { hires } : {}) });
+  return json({ url: audioUrl, codec: "aac", codecs, container: "mp4", manifest: "none", audioQuality: info.audioQuality, bitDepth: 0, sampleRate: 44100, bitrate: 320, ...urlExpiry(audioUrl), ...(typeof hires === "boolean" ? { hires } : {}) });
+}
+
+/**
+ * { expiresAt } (epoch seconds) for a progressive Tidal URL, read the way streamAnswerExpiry
+ * reads it (token=<unix>~ / exp=), so the app knows when to re-ask; {} when it is unreadable.
+ */
+function urlExpiry(audioUrl) {
+  const expiresAt = streamAnswerExpiry({ url: audioUrl });
+  return expiresAt > 0 ? { expiresAt } : {};
 }
 
 async function streamInfo(trackId, request, env, info, allowAac = false) {
@@ -501,7 +510,7 @@ async function streamInfo(trackId, request, env, info, allowAac = false) {
     }
     const audioUrl = bts.urls?.[0];
     if (!audioUrl?.startsWith("https://")) return json({ error: "invalid_media_url" }, 502);
-    return json({ url: audioUrl, codec: "flac", container: audioUrl.toLowerCase().includes(".mp4") ? "mp4" : "flac", manifest: "none", bitDepth, sampleRate, bitrate: 1411 });
+    return json({ url: audioUrl, codec: "flac", container: audioUrl.toLowerCase().includes(".mp4") ? "mp4" : "flac", manifest: "none", bitDepth, sampleRate, bitrate: 1411, ...urlExpiry(audioUrl) });
   }
   if (mime.includes("dash")) {
     let xml = new TextDecoder().decode(bytes);
