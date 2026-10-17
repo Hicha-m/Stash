@@ -1,3 +1,4 @@
+// Searches q.searchArtist/q.searchTitle when set (YouTube rows: the parsed song, as the app searches).
 // Deezer public search: top-5 candidates per query, the "artist title" text the app searches with.
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 const [qPath, out] = process.argv.slice(2);
@@ -7,7 +8,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let n = 0;
 for (const q of queries) {
   if (done[q.qid]) continue;
-  const url = `https://api.deezer.com/search?limit=5&q=${encodeURIComponent(`${q.artist} ${q.title}`.trim())}`;
+  const url = `https://api.deezer.com/search?limit=5&q=${encodeURIComponent(`${q.searchArtist ?? q.artist} ${q.searchTitle ?? q.title}`.trim())}`;
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
       const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
