@@ -52,13 +52,34 @@ Code: `src/quota.js` (an identical copy lives in `tidal-worker/src/quota.js`).
   `200 {"used":n,"limit":500,"resetsAt":T,"supporter":false}` (`limit: null` for a supporter) with the headers;
   `401` + `X-Stash-Server-Time` for a bad signature; `404 {"error":"quota_off"}` when the counter is off (also what
   an older relay without the route answers: `not_found`).
-- **Supporters (step 3, not built):** `entitlementOf(request, env)` in `src/quota.js` returns null today. When it
-  returns an entitlement the cap is skipped (the answer is still counted).
+- **Supporters:** a request may carry `X-Stash-Entitlement: <token>` (mints and `/v1/quota`), the token the tip jar
+  issues to a Ko-fi supporter: `base64url(UTF-8 JSON {"tier":"supporter","iat":<epoch s>,"tid":"<32 hex>","v":1})`
+  `.` `base64url(Ed25519 signature over the ASCII bytes of the first segment)`, both without padding. The relay
+  verifies it with WebCrypto against the var `ENTITLEMENT_PUBLIC_KEY` (standard base64 of the raw 32-byte public key;
+  public, in `wrangler.toml`), accepts only tier `supporter`, `v` 1, a 32-hex `tid` and an `iat` at most 300 s ahead
+  (no expiry), and caches verified tokens per isolate. A missing, malformed, wrongly signed or revoked token is never
+  an error: the request just gets the free quota. For a valid token the free limit and `INSTALL_DAILY_CAP` are
+  skipped: headers read `<used>/unlimited` (`used` = the install's own count, which still counts every answer) and
+  `/v1/quota` answers `{"supporter":true,"limit":null}`. The network, /48 and global caps still apply to supporters.
+- **Per-token ceiling:** every answer under a token also counts in `usage` as subject `t:<tid>`. At
+  `SUPPORTER_DAILY_CAP` (default 5000) that day the token is treated as absent: the install's free 500 and its
+  `INSTALL_DAILY_CAP` apply again (headers `<used>/500`). This keeps a posted token from being a free pass for everyone.
+- **Revocation:** table `revoked_tokens(tid, revoked_at, reason)` in `stash-quota` (migration
+  `0002_revoked_tokens.sql`), checked in the same D1 read as the install's count. Revoke a token (takes effect on
+  the next request; the tid is in the token's first segment, base64url JSON):
+
+  ```powershell
+  npx wrangler d1 execute stash-quota --remote --config infra/lossless-quota/wrangler.toml --command "INSERT INTO revoked_tokens (tid, revoked_at, reason) VALUES ('<32 hex tid>', unixepoch(), 'posted publicly')"
+  ```
+
+  Un-revoke: `DELETE FROM revoked_tokens WHERE tid = '<tid>'`. Apply migration 0002 before deploying this relay:
+  without the table a supporter's counter read fails and that request is served with the counter off.
 - **Off switch:** no `QUOTA_DB` binding → the counter is skipped (one `QUOTA_DB not bound` warning per isolate). A D1
   error on the counter also skips it for that request: the counter never stops a mint. A race can serve one or two
   past the limit.
 - `INSTALL_DAILY_CAP` (`rate_limited`, also counts 404s, but not cache hits) stays as this relay's own per-install cap and
-  abuse telemetry; the network, /48, global and account caps are unchanged and still apply.
+  abuse telemetry (supporters under their ceiling skip it); the network, /48, global and account caps are unchanged and
+  still apply to everyone.
 - The hourly cron prunes `usage` rows older than 7 days.
 
 ## Caps and what each answer costs
