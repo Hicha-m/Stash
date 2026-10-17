@@ -72,6 +72,19 @@ test("401 when unsigned or signed with the wrong key; the previous key still wor
     assert.equal((await handle(mintReq(42, 27, { key: KEY }), e, q, NOW)).status, 200);
 });
 
+test("a 401 carries the server's clock in X-Stash-Server-Time; a skewed timestamp is still refused", async () => {
+    const e = env(); const q = qobuz([200, GOOD]);
+    for (const opts of [{ signed: false }, { key: "bogus" }, { ts: NOW - 301 }, { ts: NOW + 301 }]) {
+        const r = await handle(mintReq(42, 27, opts), e, q, NOW);
+        assert.equal(r.status, 401, JSON.stringify(opts));
+        assert.equal(r.headers.get("X-Stash-Server-Time"), String(NOW), JSON.stringify(opts));
+    }
+    assert.equal(q.calls.length, 0);
+    const okR = await handle(mintReq(42, 27, { ts: NOW - 300 }), e, q, NOW);
+    assert.equal(okR.status, 200);
+    assert.equal(okR.headers.get("X-Stash-Server-Time"), null); // only on the 401
+});
+
 test("500 when RELAY_KEY is unset: an open relay is a misconfiguration, not a mode", async () => {
     assert.equal((await handle(mintReq(42, 27), env({ RELAY_KEY: undefined }), qobuz([200, GOOD]), NOW)).status, 500);
 });

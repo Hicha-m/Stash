@@ -85,7 +85,9 @@ async function mint(request, url, env, fetchImpl, nowSec) {
 
     const install = h("X-Stash-Install");
     const signed = verifyMint({ install, ts: h("X-Stash-Ts"), auth: h("X-Stash-Auth") }, trackId, formatId, nowSec, [env.RELAY_KEY, env.RELAY_KEY_PREV]);
-    if (!signed) return json({ error: "unauthorized" }, 401);
+    // The server's clock rides on the 401 so a device whose clock drifted past ±MAX_SKEW_S can correct its
+    // X-Stash-Ts and retry. It tells nothing a caller couldn't learn from the Date header; the window stays.
+    if (!signed) return json({ error: "unauthorized" }, 401, { "X-Stash-Server-Time": String(nowSec) });
 
     // Data Saver asks for format 5 (MP3 320). The relay serves lossless only, and the client's
     // router discards any relay format below 6 anyway, so a well-formed non-lossless format is
