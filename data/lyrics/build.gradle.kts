@@ -33,7 +33,7 @@ dependencies {
     implementation(project(":data:download"))
 
     implementation(libs.hilt.android)
-    implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
+    implementation(libs.okhttp.dnsoverhttps)
     ksp(libs.hilt.android.compiler)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
