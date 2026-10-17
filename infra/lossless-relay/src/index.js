@@ -6,7 +6,7 @@
  * never transits here (spec §4). The wire contract in spec §1-2 is enforced by
  * the shipped client, so every status below means exactly one thing to it:
  *   200 mint · 404 not available (ends the track) · 503 busy (base cools 60 s)
- *   anything else: base cools 5 min. Never 200 with an error body.
+ *   anything else: base cools 5 min. Never 200 with an error body. A 401 carries X-Stash-Server-Time.
  *
  * Endpoints:
  *   GET /v1/qobuz/file?track_id=&format_id=   signed (X-Stash-Install/-Ts/-Auth), X-Stash-Version: 1,
