@@ -508,7 +508,7 @@ async function streamInfo(trackId, request, env, info, allowAac = false) {
       .bind(trackId, xml, init, exp).run();
     const origin = (env.PUBLIC_HOST || new URL(request.url).origin).replace(/\/$/, "");
     const mpdPath = `/dash/td/${trackId}.mpd`;
-    const signedMpd = `${origin}${mpdPath}?exp=${exp}&sig=${await signature(env.ACCESS_TOKEN, mpdPath, exp)}`;
+    const signedMpd = `${origin}${mpdPath}?exp=${exp}&sig=${await signature(dashKey(env), mpdPath, exp)}`;
     return json({ url: signedMpd, codec: "flac", container: "fmp4", manifest: "dash", bitDepth, sampleRate, bitrate: Math.max(1411, Math.floor(sampleRate * bitDepth * 2 / 1000)) });
   }
   return json({ error: "unsupported_manifest" }, 404);
@@ -586,9 +586,19 @@ async function edgeInfo(trackId, info, env, edge) {
   });
 }
 
+/**
+ * HMAC key for /dash links. ACCESS_TOKEN ships in every install (effectively public), so links
+ * signed with it can be forged; DASH_SIGNING_KEY (secret, >= 32 chars) replaces it. The fallback
+ * keeps a deploy made before the secret exists working; links signed earlier stop verifying
+ * once it is set (they last at most an hour).
+ */
+function dashKey(env) {
+  return typeof env.DASH_SIGNING_KEY === "string" && env.DASH_SIGNING_KEY.length >= 32 ? env.DASH_SIGNING_KEY : env.ACCESS_TOKEN;
+}
+
 async function dash(request, trackId, env, isInit) {
   const url = new URL(request.url);
-  if (!await validSignature(env.ACCESS_TOKEN, url.pathname, url.searchParams.get("exp"), url.searchParams.get("sig"))) return unauthorized();
+  if (!await validSignature(dashKey(env), url.pathname, url.searchParams.get("exp"), url.searchParams.get("sig"))) return unauthorized();
   const row = await env.DB.prepare("SELECT manifest_xml,init_url,expires_at FROM tidal_dash_manifests WHERE track_id=? AND expires_at>? LIMIT 1").bind(trackId, now()).first();
   if (!row) return json({ error: "manifest_expired" }, 404);
   if (isInit) {
@@ -613,7 +623,7 @@ async function dash(request, trackId, env, isInit) {
   const initPath = `/dash/td/${trackId}/init.mp4`;
   const exp = Math.min(row.expires_at, now() + 3600);
   const origin = (env.PUBLIC_HOST || new URL(request.url).origin).replace(/\/$/, "");
-  const initUrl = `${origin}${initPath}?exp=${exp}&sig=${await signature(env.ACCESS_TOKEN, initPath, exp)}`;
+  const initUrl = `${origin}${initPath}?exp=${exp}&sig=${await signature(dashKey(env), initPath, exp)}`;
   const xml = row.manifest_xml.replace(/initialization="[^"]+"/, `initialization="${initUrl.replaceAll("&", "&amp;")}"`);
   return new Response(xml, { headers: { "content-type": "application/dash+xml", "cache-control": "no-store", "access-control-allow-origin": "*" } });
 }

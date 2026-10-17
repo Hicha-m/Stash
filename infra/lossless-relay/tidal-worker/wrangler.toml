@@ -43,7 +43,10 @@ simple = { limit = 6, period = 60 }
 [triggers]
 crons = ["17 * * * *"]
 
-# Set with Wrangler secrets (never vars): ACCESS_TOKEN, ADMIN_TOKEN, TIDAL_CLIENT_SECRET, IP_SALT.
+# Set with Wrangler secrets (never vars): ACCESS_TOKEN, ADMIN_TOKEN, TIDAL_CLIENT_SECRET, IP_SALT, DASH_SIGNING_KEY.
 # TIDAL_CLIENT_SECRET is the shared Android client credential from the selected
 # community implementation, not a TIDAL Developer Portal app secret.
 # IP_SALT is a random private salt for storing only salted network hashes in D1.
+# DASH_SIGNING_KEY (optional, >= 32 random chars) signs /dash links. Without it they fall back to
+# ACCESS_TOKEN, which ships in every install, so anyone could forge them. Setting it voids links
+# signed earlier (they last at most an hour).

@@ -705,6 +705,25 @@ test("DASH manifest route passes Tidal's init URL through unchanged", async () =
   });
 });
 
+test("DASH links are signed with DASH_SIGNING_KEY when set; an ACCESS_TOKEN-signed link is refused", async () => {
+  const { createHmac } = await import("node:crypto");
+  const sign = (key, path, exp) => createHmac("sha256", key).update(`${path}:${exp}`).digest("hex");
+  for (const [key, expected] of [["k".repeat(32), "k".repeat(32)], ["too-short", ACCESS_TOKEN], [undefined, ACCESS_TOKEN]]) {
+    const f = fixture({ tidalResponse: async () => playbackInfo("HI_RES_LOSSLESS", "application/dash+xml", MPD) });
+    if (key) f.env.DASH_SIGNING_KEY = key;
+    await withFetch(null, f.fetchTidal, async () => {
+      const url = new URL((await (await worker.fetch(authorizedRequest("/stream/td:654"), f.env)).json()).url);
+      const exp = url.searchParams.get("exp");
+      assert.equal(url.searchParams.get("sig"), sign(expected, url.pathname, exp), `key ${key}`);
+      assert.equal((await worker.fetch(new Request(url), f.env)).status, 200);
+      if (expected !== ACCESS_TOKEN) {
+        const forged = `${url.origin}${url.pathname}?exp=${exp}&sig=${sign(ACCESS_TOKEN, url.pathname, exp)}`;
+        assert.equal((await worker.fetch(new Request(forged), f.env)).status, 401);
+      }
+    });
+  }
+});
+
 test("DASH stream cache expires before the signed Tidal segment URLs", async () => {
   const tidalExpiry = Math.floor(Date.now() / 1000) + 1200;
   const mpd = `<MPD><SegmentTemplate initialization="https://audio.tidal.com/init.mp4?token=${tidalExpiry}~sig&amp;x=1" media="https://audio.tidal.com/$Number$?token=${tidalExpiry}~sig" /></MPD>`;
