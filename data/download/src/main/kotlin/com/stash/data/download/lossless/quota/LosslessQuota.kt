@@ -265,15 +265,15 @@ class LosslessQuota internal constructor(
         return if (p is JsonNull || p.content.equals("unlimited", ignoreCase = true)) UNLIMITED else null
     }
 
-    internal companion object {
-        const val TAG = "LosslessQuota"
-        const val HEADER_COUNT = "X-Stash-Lossless"
-        const val HEADER_RESET = "X-Stash-Lossless-Reset"
-        const val CAP_ERROR = "daily_lossless_cap"
+    companion object {
+        internal const val TAG = "LosslessQuota"
+        internal const val HEADER_COUNT = "X-Stash-Lossless"
+        internal const val HEADER_RESET = "X-Stash-Lossless-Reset"
+        internal const val CAP_ERROR = "daily_lossless_cap"
         /** The free allowance, assumed only when a cap body omits its limit. */
-        const val DEFAULT_LIMIT = 500
+        internal const val DEFAULT_LIMIT = 500
         /** The "running low" heads-up fires with this many or fewer left. */
-        const val WARN_LEFT = 50
+        internal const val WARN_LEFT = 50
         private const val DAY_SEC = 86_400L
 
         /** [readLimit]'s "unlimited", distinct from its null "unknown". */
@@ -286,9 +286,10 @@ class LosslessQuota internal constructor(
         private val KEY_NOTICED_LEVEL = intPreferencesKey("noticed_level")
 
         /** No DataStore, work run in place: for tests that only need the state. */
-        fun inMemory(nowMs: () -> Long = System::currentTimeMillis): LosslessQuota =
+        internal fun inMemory(nowMs: () -> Long = System::currentTimeMillis): LosslessQuota =
             LosslessQuota(null, nowMs, CoroutineScope(Dispatchers.Unconfined))
 
+        /** The UTC midnight after [nowMs], epoch seconds: when a day's allowance resets. */
         fun nextUtcMidnightSec(nowMs: Long): Long = (nowMs / 1000 / DAY_SEC + 1) * DAY_SEC
 
         /** [a] as of [nowMs]: once its reset has passed, a fresh day with nothing used. */
@@ -296,7 +297,7 @@ class LosslessQuota internal constructor(
             if (nowMs < a.resetsAtMs) a else LosslessAllowance(0, a.limit, nextUtcMidnightSec(nowMs))
 
         /** `"412/500"` → (412, 500); `"412/unlimited"` → (412, null); junk → null. */
-        fun parseCount(v: String?): Pair<Int, Int?>? {
+        internal fun parseCount(v: String?): Pair<Int, Int?>? {
             val parts = v?.trim()?.split('/')?.takeIf { it.size == 2 } ?: return null
             val used = parts[0].trim().toIntOrNull()?.takeIf { it >= 0 } ?: return null
             val l = parts[1].trim()
