@@ -6,10 +6,11 @@ import { DatabaseSync } from "node:sqlite";
 import worker from "../src/index.js";
 import { verifySigned } from "../src/auth.js";
 import { hooks, nextResetSec } from "../src/quota.js";
+import { keypair, token, tidOf } from "./entitlement-keys.js";
 
 /**
  * The daily lossless counter against real SQLite: the relay's own migrations for DB, and the shared stash-quota
- * schema for QUOTA_DB (test/fixtures/quota_0001_init.sql, a copy of infra/lossless-quota/migrations/0001_init.sql).
+ * schema for QUOTA_DB (test/fixtures/quota_*.sql, copies of infra/lossless-quota/migrations/*.sql, applied in order).
  */
 const ACCESS_TOKEN = "test-access-token";
 const KEY = "k-secret";
@@ -25,7 +26,8 @@ function relayDb() {
 }
 function quotaDb() {
   const db = new DatabaseSync(":memory:");
-  db.exec(readFileSync(new URL("./fixtures/quota_0001_init.sql", import.meta.url), "utf8"));
+  const dir = new URL("./fixtures/", import.meta.url);
+  for (const file of readdirSync(dir).filter((f) => /^quota_\d+.*\.sql$/.test(f)).sort()) db.exec(readFileSync(new URL(file, dir), "utf8"));
   return db;
 }
 /** A D1-shaped binding over node:sqlite, as in sql.test.js. */
@@ -263,4 +265,89 @@ test("the hourly job also prunes week-old usage rows", async () => {
   r.setUsed(4);
   await worker.scheduled({}, r.env);
   assert.deepEqual(r.qdb.prepare("SELECT day FROM usage").all().map((x) => x.day), [today()]);
+});
+
+// ---- Supporter tokens (X-Stash-Entitlement) end to end, with a test keypair ----
+
+const KEYS = keypair();
+const supporterRelay = (env = {}, opts = {}) => relay(tidal(), { seats: 8, ...opts, env: { ENTITLEMENT_PUBLIC_KEY: KEYS.publicKey, FREE_LOSSLESS_DAILY: "1", ...env } });
+const withToken = (t, headers) => ({ ...headers, "X-Stash-Entitlement": t });
+
+test("a valid token: FLAC past FREE_LOSSLESS_DAILY, header <used>/unlimited, the install and t:<tid> rows both count", async () => {
+  const r = supporterRelay();
+  const t = token(KEYS.privateKey);
+  for (let i = 1; i <= 3; i++) {
+    const res = await r.call(`/stream/td:${i}`, withToken(t, signed(`td:${i}`)));
+    assert.equal(res.status, 200, `stream ${i}`);
+    assert.equal((await res.json()).codec, "flac");
+    assert.equal(res.headers.get("X-Stash-Lossless"), `${i}/unlimited`);
+  }
+  assert.equal(r.used(), 3);
+  assert.equal(r.used(`t:${tidOf(t)}`), 3);
+  const plain = await r.call("/stream/td:9", signed("td:9"));
+  assert.equal(plain.status, 429, "without the token the install is over its free limit");
+});
+
+test("bad signature, another key, garbage and a wrong tier get the normal quota, never an error", async () => {
+  const good = token(KEYS.privateKey);
+  const [head, sig] = good.split(".");
+  const flipped = Buffer.from(sig, "base64url"); flipped[7] ^= 1;
+  for (const t of [`${head}.${flipped.toString("base64url")}`, token(keypair().privateKey), "garbage", "x.y", token(KEYS.privateKey, { tier: "pro" })]) {
+    const r = supporterRelay();
+    const first = await r.call("/stream/td:1", withToken(t, signed("td:1")));
+    assert.equal(first.status, 200, t);
+    assert.equal(first.headers.get("X-Stash-Lossless"), "1/1", t);
+    const second = await r.call("/stream/td:2", withToken(t, signed("td:2")));
+    assert.equal(second.status, 429, t);
+    assert.equal((await second.json()).error, "daily_lossless_cap", t);
+  }
+});
+
+test("a revoked tid gets the normal quota (and ?aac=1 its AAC fallback)", async () => {
+  const r = supporterRelay();
+  const t = token(KEYS.privateKey);
+  assert.equal((await r.call("/stream/td:1", withToken(t, signed("td:1")))).status, 200);
+  r.qdb.prepare("INSERT INTO revoked_tokens(tid,revoked_at,reason) VALUES(?,?,'posted publicly')").run(tidOf(t), now());
+  const res = await r.call("/stream/td:2", withToken(t, signed("td:2")));
+  assert.equal(res.status, 429);
+  assert.deepEqual(await res.json(), { error: "daily_lossless_cap", used: 1, limit: 1, resetsAt: nextResetSec(now()) });
+  const aac = await r.call("/stream/td:3?aac=1", withToken(t, signed("td:3")));
+  assert.equal((await aac.json()).codec, "aac");
+  assert.equal(aac.headers.get("X-Stash-Lossless"), "1/1");
+});
+
+test("SUPPORTER_DAILY_CAP: at the token's ceiling the install is back on its free limit", async () => {
+  const r = supporterRelay({ SUPPORTER_DAILY_CAP: "2", FREE_LOSSLESS_DAILY: "3" });
+  const t = token(KEYS.privateKey);
+  for (let i = 1; i <= 2; i++) assert.equal((await r.call(`/stream/td:${i}`, withToken(t, signed(`td:${i}`)))).headers.get("X-Stash-Lossless"), `${i}/unlimited`);
+  const free = await r.call("/stream/td:3", withToken(t, signed("td:3")));
+  assert.equal(free.status, 200);
+  assert.equal(free.headers.get("X-Stash-Lossless"), "3/3", "the install's own count against the free limit");
+  assert.equal(r.used(`t:${tidOf(t)}`), 2, "a free answer leaves the token's row alone");
+  const capped = await r.call("/stream/td:4", withToken(t, signed("td:4")));
+  assert.equal(capped.status, 429);
+  assert.equal((await capped.json()).error, "daily_lossless_cap");
+  assert.deepEqual(await (await r.call("/quota", withToken(t, signed("quota")))).json(), { used: 3, limit: 3, resetsAt: nextResetSec(now()), supporter: false });
+});
+
+test("supporters still meet the network cap", async () => {
+  const r = supporterRelay({ IP_SALT: "salt", NETWORK_DAILY_CAP: "2" });
+  const t = token(KEYS.privateKey);
+  const ip = { "CF-Connecting-IP": "203.0.113.9" };
+  assert.equal((await r.call("/stream/td:1", withToken(t, { ...ip, ...signed("td:1") }))).status, 200);
+  assert.equal((await r.call("/stream/td:2", withToken(t, { ...ip, ...signed("td:2") }))).status, 200);
+  const res = await r.call("/stream/td:3", withToken(t, { ...ip, ...signed("td:3") }));
+  assert.equal(res.status, 429);
+  assert.deepEqual(await res.json(), { error: "network_daily_cap" });
+});
+
+test("GET /quota with a valid token: supporter true, limit null, header <used>/unlimited", async () => {
+  const r = supporterRelay();
+  const t = token(KEYS.privateKey);
+  await r.call("/stream/td:1", withToken(t, signed("td:1")));
+  const res = await r.call("/quota", withToken(t, signed("quota")));
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { used: 1, limit: null, resetsAt: nextResetSec(now()), supporter: true });
+  assert.equal(res.headers.get("X-Stash-Lossless"), "1/unlimited");
+  assert.deepEqual(await (await r.call("/quota", signed("quota"))).json(), { used: 1, limit: 1, resetsAt: nextResetSec(now()), supporter: false }, "without the token");
 });

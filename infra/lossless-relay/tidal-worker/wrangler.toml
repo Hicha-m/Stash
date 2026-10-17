@@ -22,6 +22,12 @@ EDGE_BASE = "https://stash-tidal-edge.stashfm.deno.net" # tidal-edge on Deno Dep
 # The daily lossless counter shared with the Qobuz relay (QUOTA_DB below): free FLAC answers per verified install
 # per UTC day, Qobuz and Tidal together. Over it: 429 daily_lossless_cap (?aac=1 gets AAC instead).
 FREE_LOSSLESS_DAILY = "500"
+# Supporters (X-Stash-Entitlement token from the tip jar, src/quota.js): unlimited lossless, verified with this
+# Ed25519 public key (standard base64 of the raw 32 bytes; public by design, the private half is the tip jar's
+# secret). SUPPORTER_DAILY_CAP is the per-token safety ceiling: past it that day the token counts as free.
+# The network, global and fair-share limits still apply to supporters. Same values as the Qobuz relay.
+ENTITLEMENT_PUBLIC_KEY = "IbghbSB8gJcuHbpSEf8tRKfCwzBfB14eBPew3nVkQFQ="
+SUPPORTER_DAILY_CAP = "5000"
 REQUIRE_INSTALL = "0" # "1": /stream without X-Stash-Install/-Ts/-Auth is a 401 (flip once every app signs)
 
 [[d1_databases]]
@@ -32,7 +38,7 @@ migrations_dir = "migrations"
 
 # The shared daily lossless counter (src/quota.js), one database for both relays. Its schema lives in
 # infra/lossless-quota/ (migrate with `--config infra/lossless-quota/wrangler.toml`, from the repo root);
-# test/fixtures/quota_0001_init.sql is a copy for the tests. Unbound = counter off.
+# test/fixtures/quota_*.sql are copies for the tests. Unbound = counter off.
 [[d1_databases]]
 binding = "QUOTA_DB"
 database_name = "stash-quota"
