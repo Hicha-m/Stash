@@ -31,7 +31,7 @@ class LosslessRelayClientTest {
         config = mockk()
         every { config.relayKey } returns relayKey
         coEvery { config.installId() } returns INSTALL_ID
-        client = LosslessRelayClient(OkHttpClient(), config).also { it.clock = { now } }
+        client = LosslessRelayClient(OkHttpClient(), RelaySigner(config)).also { it.clock = { now } }
     }
     @After fun tearDown() { server.shutdown() }
 

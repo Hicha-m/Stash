@@ -24,7 +24,7 @@ class LosslessRelayClientOutcomesTest {
 
     @Before fun setUp() {
         server = MockWebServer(); server.start()
-        client = LosslessRelayClient(OkHttpClient(), config).also { it.clock = { now } }
+        client = LosslessRelayClient(OkHttpClient(), RelaySigner(config)).also { it.clock = { now } }
     }
 
     @After fun tearDown() = server.shutdown()
