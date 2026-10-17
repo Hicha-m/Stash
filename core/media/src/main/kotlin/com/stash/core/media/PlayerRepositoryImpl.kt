@@ -3382,7 +3382,7 @@ class PlayerRepositoryImpl @Inject constructor(
 
         /** Shown when an All Songs file can't be played because it isn't where the scan found it. */
         internal const val SCANNED_FILE_MISSING_MESSAGE =
-            "That file isn't there anymore. Rescan your folders in Library › On this device."
+            "That file isn't there anymore. Rescan your folders: Library, then the disk icon at the top."
 
         /**
          * The Back button restarts a song played past this, as Media3's own seekToPrevious (the

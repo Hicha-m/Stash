@@ -39,6 +39,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.Close
@@ -58,6 +59,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.PlaylistAddCheck
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Search
@@ -106,6 +108,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -659,8 +662,20 @@ private fun LibraryContent(
             }
         }
 
-        // Compact header: shuffle, Import (+), search, and sort/filter icons, on the right.
-        // No "Library" title: the tab bar already says where you are.
+        // "On this device" opens from the header's disk icon, not a chip: it's a different place
+        // (files in folders you picked), not another view of the library. The disk icon (or Back)
+        // returns to the library page you came from.
+        val deviceTabActive = state.activeTab == LibraryTab.DEVICE
+        var lastLibraryTab by rememberSaveable { mutableStateOf(LibraryTab.TRACKS) }
+        LaunchedEffect(state.activeTab) {
+            if (state.activeTab != LibraryTab.DEVICE) lastLibraryTab = state.activeTab
+        }
+        androidx.activity.compose.BackHandler(enabled = deviceTabActive && !selection.isActive) {
+            onTabSelected(lastLibraryTab)
+        }
+
+        // Compact header: On this device, shuffle, Import (+), search, and sort/filter icons, on the
+        // right. No "Library" title: the tab bar already says where you are.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -673,7 +688,34 @@ private fun LibraryContent(
             // at: the liked list on the Liked tab (issue #402 — it used to
             // shuffle the whole library there), the whole library elsewhere.
             val likedTabActive = state.activeTab == LibraryTab.LIKED
-            val deviceTabActive = state.activeTab == LibraryTab.DEVICE
+            IconButton(
+                onClick = { onTabSelected(if (deviceTabActive) lastLibraryTab else LibraryTab.DEVICE) },
+                modifier = Modifier.semantics { this.selected = deviceTabActive },
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .background(
+                            color = if (deviceTabActive) {
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                            } else {
+                                Color.Transparent
+                            },
+                            shape = CircleShape,
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Filled.Save,
+                        contentDescription = "On this device",
+                        tint = if (deviceTabActive) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            LocalContentColor.current
+                        },
+                    )
+                }
+            }
             IconButton(
                 onClick = when {
                     likedTabActive -> onShuffleLiked
@@ -754,18 +796,18 @@ private fun LibraryContent(
             )
         }
 
-        // -- Category chips (pinned): Songs / Playlists / Artists / Albums --
+        // -- Category chips (pinned): Songs / Playlists / Artists / Albums. None is lit while On
+        // this device (the header's disk icon) is open; a chip tap goes back to the library.
         val chipTabs = listOf(
             "Songs" to LibraryTab.TRACKS,
             "Liked" to LibraryTab.LIKED,
             "Playlists" to LibraryTab.PLAYLISTS,
             "Artists" to LibraryTab.ARTISTS,
             "Albums" to LibraryTab.ALBUMS,
-            "On this device" to LibraryTab.DEVICE,
         )
         com.stash.core.ui.components.CrispChipRow(
             chips = chipTabs.map { it.first },
-            selected = chipTabs.first { it.second == state.activeTab }.first,
+            selected = chipTabs.firstOrNull { it.second == state.activeTab }?.first.orEmpty(),
             onSelect = { label -> onTabSelected(chipTabs.first { it.first == label }.second) },
             modifier = Modifier.padding(vertical = 4.dp),
         )
@@ -791,7 +833,10 @@ private fun LibraryContent(
 
         // -- Content area --
         val anyServiceConnected = state.spotifyConnected || state.youTubeConnected
-        if (state.isLoading) {
+        if (deviceTabActive) {
+            // Outside the pager: swiping is for the library's own pages.
+            Box(modifier = Modifier.fillMaxSize().weight(1f)) { deviceContent() }
+        } else if (state.isLoading) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -921,7 +966,7 @@ private fun LibraryContent(
                         onClearFilters = clearSearch,
                         alphabetical = alphabetical,
                     )
-                    LibraryTab.DEVICE -> deviceContent()
+                    LibraryTab.DEVICE -> Unit // shown above, outside the pager
                 }
             }
         }
