@@ -81,6 +81,20 @@ test("prune gives a dead account another chance after six hours; a fresh kill st
     assert.deepEqual(await db.prepare("SELECT state, dead_reason FROM accounts WHERE label = 'fresh'").first(), { state: "dead", dead_reason: "401" });
 });
 
+test("prune never revives an account Qobuz blocked (USER_BLOCKED), however long ago; a 401 still gets its second chance", async () => {
+    const db = fakeD1();
+    await ensureAccounts(db, ["blocked", "token"]);
+    await db.prepare("UPDATE accounts SET last_used_at = ?1").bind(T0 - 30 * 86400).run();
+    await killAccount(db, "blocked", "USER_BLOCKED");
+    await killAccount(db, "token", "401");
+    await prune(db, T0);
+    await prune(db, T0 + 7 * 3600);
+    assert.deepEqual(await db.prepare("SELECT state, dead_reason FROM accounts WHERE label = 'blocked'").first(), { state: "dead", dead_reason: "USER_BLOCKED" });
+    assert.deepEqual(await db.prepare("SELECT state, dead_reason FROM accounts WHERE label = 'token'").first(), { state: "live", dead_reason: "" });
+    assert.equal(await selectAccount(db, T0 + 8 * 3600, CAPS), "token");
+    assert.equal(await selectAccount(db, T0 + 8 * 3600 + 1, CAPS), "token"); // never the blocked one
+});
+
 test("quota upserts per day and key", async () => {
     const db = fakeD1();
     await db.batch([bumpQuotaStmt(db, "2026-09-01", "global"), bumpQuotaStmt(db, "2026-09-01", "global"), bumpQuotaStmt(db, "2026-09-01", "i:x")]);
