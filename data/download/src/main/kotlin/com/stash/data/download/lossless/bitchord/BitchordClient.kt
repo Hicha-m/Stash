@@ -473,8 +473,9 @@ class BitchordClient @Inject constructor(
 
     /**
      * One GET. With [signPayload] (a `/stream` to the owner's relay) the request carries the
-     * install headers ([RelaySigner], message `<install>:td:<numeric id>:<ts>`); a 401 that
-     * names the relay's time re-signs once on that clock, like a Qobuz mint.
+     * install headers ([RelaySigner], message `<install>:td:<numeric id>:<ts>`) and a stored
+     * supporter token; a 401 that names the relay's time re-signs once on that clock, like a
+     * Qobuz mint.
      */
     private suspend fun get(url: HttpUrl, token: String?, signPayload: String? = null): Reply {
         var mayRetrySkew = true
@@ -483,6 +484,7 @@ class BitchordClient @Inject constructor(
                 .header("Accept", "application/json")
                 .apply { if (token != null) header("X-Access-Token", token) }
             val signed = signPayload != null && signer.sign(b, signPayload, nowMs())
+            if (signPayload != null) signer.entitle(b)
             val reply = httpClient.newCall(b.build()).execute().use { r ->
                 if (r.code == 401 && signed && mayRetrySkew && signer.adoptServerTime(r, nowMs())) {
                     null

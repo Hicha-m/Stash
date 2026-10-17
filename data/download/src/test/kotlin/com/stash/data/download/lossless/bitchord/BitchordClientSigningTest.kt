@@ -8,6 +8,7 @@ import com.stash.data.download.lossless.TrackQuery
 import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessConfigFetcher
 import com.stash.data.download.lossless.relay.RelaySigner
+import com.stash.data.download.lossless.relay.supporter
 import com.stash.data.download.lossless.relay.TidalRelay
 import io.mockk.coEvery
 import io.mockk.every
@@ -45,6 +46,7 @@ class BitchordClientSigningTest {
     private val relayKey = MutableStateFlow<String?>("k-secret")
     private val tidalRelay = MutableStateFlow<TidalRelay?>(null)
     private var userEndpoint: String? = null
+    private var supporterToken: String? = null
     private lateinit var client: BitchordClient
 
     private val query = TrackQuery(artist = "Daft Punk", title = "Get Lucky", isrc = "USQX91300108", durationMs = 248_000)
@@ -61,7 +63,7 @@ class BitchordClientSigningTest {
             every { relayKey } returns this@BitchordClientSigningTest.relayKey
             coEvery { installId() } returns INSTALL_ID
         }
-        client = BitchordClient(OkHttpClient(), prefs, config, FakeDao(), RelaySigner(config), LosslessQuota.inMemory { now })
+        client = BitchordClient(OkHttpClient(), prefs, config, FakeDao(), RelaySigner(config, supporter { supporterToken }), LosslessQuota.inMemory { now })
         client.nowMs = { now }
     }
 
@@ -94,13 +96,26 @@ class BitchordClientSigningTest {
         assertThat(stream.getHeader("X-Stash-Auth")).isEqualTo(hmac("$INSTALL_ID:td:4711:1700000000"))
     }
 
-    @Test fun `a user's own server never gets install headers`() = runBlocking {
+    @Test fun `a user's own server never gets install headers or a supporter token`() = runBlocking {
         userEndpoint = base()
+        supporterToken = "tok.sig"
         server.enqueue(MockResponse().setBody(SEARCH_HIT))
         server.enqueue(MockResponse().setBody(FLAC))
         client.lookup(query)
         take()
-        assertThat(take().getHeader("X-Stash-Auth")).isNull()
+        val stream = take()
+        assertThat(stream.getHeader("X-Stash-Auth")).isNull()
+        assertThat(stream.getHeader(RelaySigner.ENTITLEMENT_HEADER)).isNull()
+    }
+
+    @Test fun `a supporter token rides the owner's stream, never its search or a user's server`() = runBlocking {
+        supporterToken = "tok.sig"
+        tidalRelay.value = TidalRelay(base(), null)
+        server.enqueue(MockResponse().setBody(SEARCH_HIT))
+        server.enqueue(MockResponse().setBody(FLAC))
+        client.lookup(query)
+        assertThat(take().getHeader(RelaySigner.ENTITLEMENT_HEADER)).isNull()
+        assertThat(take().getHeader(RelaySigner.ENTITLEMENT_HEADER)).isEqualTo("tok.sig")
     }
 
     @Test fun `no relay key means an unsigned stream`() = runBlocking {

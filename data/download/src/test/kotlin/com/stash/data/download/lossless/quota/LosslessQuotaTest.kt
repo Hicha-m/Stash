@@ -153,6 +153,13 @@ class LosslessQuotaTest {
         assertThat(withTimeoutOrNull(100) { quota.noticeEvents.first() }).isNull()
     }
 
+    @Test fun `a heads-up raised before a supporter claim lifted the limit is dropped`() = runTest {
+        quota.onHeaders("500/500", "$RESET")
+        quota.onQuotaBody("""{"used":500,"limit":null,"resetsAt":$RESET,"supporter":true}""")
+        assertThat(quota.isSpent()).isFalse()
+        assertThat(withTimeoutOrNull(100) { quota.noticeEvents.first() }).isNull()
+    }
+
     @Test fun `a heads-up whose day has reset before it is shown is dropped`() = runTest {
         quota.onHeaders("500/500", "$RESET")
         now = RESET * 1000

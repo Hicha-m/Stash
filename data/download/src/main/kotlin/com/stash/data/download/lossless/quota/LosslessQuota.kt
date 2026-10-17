@@ -111,9 +111,10 @@ class LosslessQuota internal constructor(
     /**
      * Heads-ups at [WARN_LEFT] left and at the limit, once per UTC day each. Buffered (conflated)
      * until the app collects it, so one raised in the background shows on return; one whose day
-     * has reset by then is dropped.
+     * has reset by then, or raised before a supporter claim lifted the limit, is dropped.
      */
-    val noticeEvents: Flow<LosslessQuotaNotice> = notices.receiveAsFlow().filter { nowMs() < it.resetsAtMs }
+    val noticeEvents: Flow<LosslessQuotaNotice> = notices.receiveAsFlow()
+        .filter { nowMs() < it.resetsAtMs && current()?.unlimited != true }
 
     init {
         if (store == null) loaded.complete(Unit) else scope.launch { load(store) }

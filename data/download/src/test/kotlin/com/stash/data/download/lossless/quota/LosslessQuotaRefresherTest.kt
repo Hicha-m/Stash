@@ -4,6 +4,7 @@ import com.google.common.truth.Truth.assertThat
 import com.stash.data.download.lossless.relay.LosslessConfigFetcher
 import com.stash.data.download.lossless.relay.RelayEntry
 import com.stash.data.download.lossless.relay.RelaySigner
+import com.stash.data.download.lossless.relay.supporter
 import com.stash.data.download.lossless.relay.TidalRelay
 import io.mockk.coEvery
 import io.mockk.every
@@ -34,11 +35,12 @@ class LosslessQuotaRefresherTest {
         coEvery { installId() } returns INSTALL_ID
     }
     private val quota = LosslessQuota.inMemory { now }
+    private var supporterToken: String? = null
     private lateinit var refresher: LosslessQuotaRefresher
 
     @Before fun setUp() {
         server.start()
-        refresher = LosslessQuotaRefresher(OkHttpClient(), config, RelaySigner(config), quota).also {
+        refresher = LosslessQuotaRefresher(OkHttpClient(), config, RelaySigner(config, supporter { supporterToken }), quota).also {
             it.nowMs = { now }
             it.configWaitMs = 200
         }
@@ -107,6 +109,40 @@ class LosslessQuotaRefresherTest {
         assertThat(refresher.refreshIfStale()).isTrue()
         server.takeRequest()
         assertThat(server.takeRequest().getHeader("X-Stash-Ts")).isEqualTo("1792239000")
+    }
+
+    @Test fun `refreshNow asks even with today's value, carrying the supporter token`() = runBlocking {
+        relays.value = listOf(RelayEntry(base()))
+        quota.onHeaders("500/500", "$RESET")
+        supporterToken = "tok.sig"
+        server.enqueue(MockResponse().setBody("""{"used":500,"limit":null,"resetsAt":$RESET,"supporter":true}"""))
+
+        assertThat(refresher.refreshNow()).isTrue()
+        assertThat(server.takeRequest().getHeader(RelaySigner.ENTITLEMENT_HEADER)).isEqualTo("tok.sig")
+        assertThat(quota.current()).isEqualTo(LosslessAllowance(500, null, RESET))
+        assertThat(quota.isSpent()).isFalse()
+    }
+
+    @Test fun `a removed token's refreshNow brings the free limit back, without the header`() = runBlocking {
+        relays.value = listOf(RelayEntry(base()))
+        quota.onHeaders("620/unlimited", "$RESET")
+        server.enqueue(MockResponse().setBody("""{"used":620,"limit":500,"resetsAt":$RESET,"supporter":false}"""))
+
+        assertThat(refresher.refreshNow()).isTrue()
+        assertThat(server.takeRequest().getHeader(RelaySigner.ENTITLEMENT_HEADER)).isNull()
+        assertThat(quota.isSpent()).isTrue()
+    }
+
+    @Test fun `a cold start with a token the relays have not confirmed today asks once`() = runBlocking {
+        relays.value = listOf(RelayEntry(base()))
+        quota.onHeaders("500/500", "$RESET") // spent before the claim; the claim's refresh failed
+        supporterToken = "tok.sig"
+        server.enqueue(MockResponse().setBody("""{"used":500,"limit":null,"resetsAt":$RESET,"supporter":true}"""))
+        assertThat(refresher.refreshIfStale()).isTrue()
+
+        // Confirmed: the next cold start has nothing to ask.
+        assertThat(refresher.refreshIfStale()).isFalse()
+        assertThat(server.requestCount).isEqualTo(1)
     }
 
     private companion object {

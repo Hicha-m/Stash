@@ -22,11 +22,12 @@ class LosslessRelayClientOutcomesTest {
     private val quota = LosslessQuota.inMemory { now }
     private val config: LosslessConfigFetcher = mockk {
         every { relayKey } returns MutableStateFlow<String?>(null)
+        every { relays } returns MutableStateFlow(emptyList())
     }
 
     @Before fun setUp() {
         server = MockWebServer(); server.start()
-        client = LosslessRelayClient(OkHttpClient(), RelaySigner(config), quota).also { it.clock = { now } }
+        client = LosslessRelayClient(OkHttpClient(), RelaySigner(config, supporter()), quota).also { it.clock = { now } }
     }
 
     @After fun tearDown() = server.shutdown()

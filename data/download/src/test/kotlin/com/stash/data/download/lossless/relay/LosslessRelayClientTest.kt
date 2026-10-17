@@ -24,6 +24,9 @@ class LosslessRelayClientTest {
     private lateinit var config: LosslessConfigFetcher
     /** Null by default: the existing tests exercise the unsigned path. */
     private val relayKey = MutableStateFlow<String?>(null)
+    /** The signed config's relays; the tests' base is a user's own endpoint unless added here. */
+    private val relays = MutableStateFlow<List<RelayEntry>>(emptyList())
+    private var supporterToken: String? = null
     private var now = 1_000_000L
     private val quota = LosslessQuota.inMemory { now }
     private val base get() = server.url("/").toString().trimEnd('/')
@@ -32,8 +35,9 @@ class LosslessRelayClientTest {
         server = MockWebServer(); server.start()
         config = mockk()
         every { config.relayKey } returns relayKey
+        every { config.relays } returns relays
         coEvery { config.installId() } returns INSTALL_ID
-        client = LosslessRelayClient(OkHttpClient(), RelaySigner(config), quota).also { it.clock = { now } }
+        client = LosslessRelayClient(OkHttpClient(), RelaySigner(config, supporter { supporterToken }), quota).also { it.clock = { now } }
     }
     @After fun tearDown() { server.shutdown() }
 
@@ -292,6 +296,26 @@ class LosslessRelayClientTest {
         assertThat(client.isCooled(base)).isFalse()
         assertThat(purpose.searchIncomplete).isTrue()
         assertThat(purpose.pacedRetryAfterSec).isNull() // not paced: a lossy fallback may still run
+    }
+
+    @Test fun `a supporter token goes to the signed config's relays only`() = runTest {
+        supporterToken = "tok.sig"
+        server.enqueue(MockResponse().setBody("""{"url":"https://cdn.example/f.flac"}"""))
+        server.enqueue(MockResponse().setBody("""{"url":"https://cdn.example/f.flac"}"""))
+
+        client.mint(base, 42, 27) // not in the config: a user's own endpoint
+        relays.value = listOf(RelayEntry(base))
+        client.mint(base, 42, 27)
+
+        assertThat(server.takeRequest().getHeader(RelaySigner.ENTITLEMENT_HEADER)).isNull()
+        assertThat(server.takeRequest().getHeader(RelaySigner.ENTITLEMENT_HEADER)).isEqualTo("tok.sig")
+    }
+
+    @Test fun `no supporter token, no entitlement header, even on the config's relay`() = runTest {
+        relays.value = listOf(RelayEntry(base))
+        server.enqueue(MockResponse().setBody("""{"url":"https://cdn.example/f.flac"}"""))
+        client.mint(base, 42, 27)
+        assertThat(server.takeRequest().getHeader(RelaySigner.ENTITLEMENT_HEADER)).isNull()
     }
 
     private companion object {

@@ -1,6 +1,7 @@
 package com.stash.data.download.lossless.relay
 
 import android.util.Log
+import com.stash.core.data.supporter.SupporterRepository
 import java.util.UUID
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -24,10 +25,14 @@ import okhttp3.Response
  *
  * Callers pass their own clock (each client has a test seam for it); the offset is the one
  * piece of state, so a skew learned from either relay fixes both.
+ *
+ * [entitle] adds the Ko-fi supporter token ([SupporterRepository]) the same way: owner relays
+ * only, decided by the caller, since a Qobuz mint may also go to a user's own endpoint.
  */
 @Singleton
 class RelaySigner @Inject constructor(
     private val config: LosslessConfigFetcher,
+    private val supporter: SupporterRepository,
 ) {
     /**
      * Relay time minus device time, seconds; added to every signed timestamp. In memory only:
@@ -57,6 +62,23 @@ class RelaySigner @Inject constructor(
     }
 
     /**
+     * Adds `X-Stash-Entitlement: <token>` to [b] when a supporter token is stored. Call it for
+     * the owner's relays only (the signed config's), never a user's own server. The relays
+     * check the token; a bad one is counted as free, so nothing here needs to judge it.
+     */
+    suspend fun entitle(b: Request.Builder) {
+        val token = supporter.tokenNow() ?: return
+        // The repository only stores header-safe tokens; never let a bad one throw out of a request.
+        runCatching { b.header(ENTITLEMENT_HEADER, token) }
+    }
+
+    /** True when a supporter token is stored, i.e. [entitle] would add it. */
+    suspend fun entitled(): Boolean = supporter.tokenNow() != null
+
+    /** True when [base] is one of the signed config's Qobuz relays (not a user's own endpoint). */
+    fun isOwnerRelay(base: String): Boolean = config.relays.value.any { it.base == base }
+
+    /**
      * On a 401 carrying `X-Stash-Server-Time` (epoch seconds, sent for signature / timestamp
      * failures), record the device's offset from it. False when the header is absent or junk:
      * the 401 is then handled exactly as before.
@@ -68,7 +90,8 @@ class RelaySigner @Inject constructor(
         return true
     }
 
-    private companion object {
-        const val TAG = "RelaySigner"
+    companion object {
+        private const val TAG = "RelaySigner"
+        const val ENTITLEMENT_HEADER = "X-Stash-Entitlement"
     }
 }

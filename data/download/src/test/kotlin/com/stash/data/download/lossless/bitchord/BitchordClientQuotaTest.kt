@@ -8,6 +8,7 @@ import com.stash.data.download.lossless.TrackQuery
 import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessConfigFetcher
 import com.stash.data.download.lossless.relay.RelaySigner
+import com.stash.data.download.lossless.relay.supporter
 import com.stash.data.download.lossless.relay.TidalRelay
 import io.mockk.coEvery
 import io.mockk.every
@@ -70,7 +71,7 @@ class BitchordClientQuotaTest {
             every { tidalRelay } returns MutableStateFlow(TidalRelay(base, null))
             every { relayKey } returns MutableStateFlow(null)
         }
-        client = BitchordClient(OkHttpClient(), prefs, config, dao, RelaySigner(config), quota)
+        client = BitchordClient(OkHttpClient(), prefs, config, dao, RelaySigner(config, supporter()), quota)
         client.nowMs = { now }
     }
 

@@ -53,10 +53,25 @@ class LosslessQuotaRefresher @Inject constructor(
         scope.launch { refreshIfStale() }
     }
 
-    /** True when a quota endpoint answered and the allowance was recorded. Never throws. */
-    internal suspend fun refreshIfStale(): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * True when a quota endpoint answered and the allowance was recorded. Never throws.
+     *
+     * Besides a stale day, a stored supporter token the relays have not confirmed (a claim whose
+     * refresh failed offline) asks too: a spent day skips every lossless rung, so no relay
+     * answer would otherwise lift the limit.
+     */
+    internal suspend fun refreshIfStale(): Boolean = refresh(force = false)
+
+    /**
+     * Asks a quota endpoint now, whatever is stored: after a supporter claim or its removal, so
+     * the Settings line and the spent state follow the relays' answer for the new token.
+     */
+    suspend fun refreshNow(): Boolean = refresh(force = true)
+
+    private suspend fun refresh(force: Boolean): Boolean = withContext(Dispatchers.IO) {
         quota.awaitLoaded()
-        if (!quota.needsColdRefresh()) return@withContext false
+        val unconfirmedSupporter = signer.entitled() && quota.current()?.unlimited != true
+        if (!force && !quota.needsColdRefresh() && !unconfirmedSupporter) return@withContext false
         // The signed config loads from its cache in parallel at startup: give it a moment.
         withTimeoutOrNull(configWaitMs) {
             combine(config.relayKey, config.relays, config.tidalRelay) { key, relays, tidal ->
@@ -79,6 +94,8 @@ class LosslessQuotaRefresher @Inject constructor(
                 .header("Accept", "application/json")
                 .apply { if (token != null) header("X-Access-Token", token) }
             if (!signer.sign(b, "quota", nowMs())) return false
+            // Both targets are the owner's: a supporter token makes the answer `supporter:true`.
+            signer.entitle(b)
             try {
                 httpClient.newCall(b.build()).execute().use { r ->
                     if (r.code == 401 && mayRetrySkew && signer.adoptServerTime(r, nowMs())) {
