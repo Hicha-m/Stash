@@ -183,6 +183,24 @@ test("a codeless refusal, then a dead second account: the dead one is retired, t
     assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first()).n, 1);
 });
 
+test("a codeless refusal with every other account unavailable → 503 busy with Retry-After, never a 404 the device would keep", async () => {
+    const e = env({ IP_SALT: "salt-1" });
+    assert.equal((await handle(mintReq(41, 27), e, qobuz([200, GOOD]), NOW)).status, 200); // rows for a and b; a served
+    await e.DB.prepare("UPDATE accounts SET cooling_until = ?1 WHERE label = 'b'").bind(NOW + 300).run();
+    await e.DB.prepare("UPDATE accounts SET last_used_at = 0 WHERE label = 'a'").run();
+    const q = qobuz([200, { ...GOOD, sample: true }]);
+    const r = await handle(mintReq(42, 27), e, q, NOW + 1);
+    assert.equal(r.status, 503);
+    assert.equal(r.headers.get("Retry-After"), "60");
+    assert.deepEqual(await r.json(), { error: "busy" });
+    assert.equal(q.calls.length, 1);
+    // One network unit for the call, no install or global spend for an answer it didn't get; nobody cooled further.
+    assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first()).n, 1);
+    assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'i:install-0001'").first()).n, 1); // the earlier 200 only
+    assert.equal(e.DB.raw.prepare("SELECT n FROM quota WHERE key LIKE 'n:%'").get().n, 2);
+    assert.equal((await e.DB.prepare("SELECT cooling_until FROM accounts WHERE label = 'a'").first()).cooling_until, 0);
+});
+
 test("the account cooled by a cross-check sits out the next miss", async () => {
     const e = env(); const q = qobuz([200, { ...GOOD, sample: true }], [200, GOOD], [200, { ...GOOD, url: "https://cdn.example/g.flac?etsp=" + (NOW + 3599) }]);
     assert.equal((await handle(mintReq(42, 27), e, q, NOW)).status, 200);
