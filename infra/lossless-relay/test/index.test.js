@@ -214,6 +214,23 @@ test("a codeless refusal with every other account unavailable → 503 busy with 
     assert.equal((await e.DB.prepare("SELECT cooling_until FROM accounts WHERE label = 'a'").first()).cooling_until, 0);
 });
 
+test("without IP_SALT the uncross-checked refusal is still a 503, with no empty D1 batch", async () => {
+    const e = env();
+    const batch = e.DB.batch.bind(e.DB);
+    e.DB.batch = async (s) => { if (!s.length) throw new Error("D1: empty batch"); return batch(s); };
+    assert.equal((await handle(mintReq(41, 27), e, qobuz([200, GOOD]), NOW)).status, 200);
+    await e.DB.prepare("UPDATE accounts SET cooling_until = ?1 WHERE label = 'b'").bind(NOW + 300).run();
+    await e.DB.prepare("UPDATE accounts SET last_used_at = 0 WHERE label = 'a'").run();
+    const errors = [];
+    const orig = console.error;
+    console.error = (x) => errors.push(x);
+    let r;
+    try { r = await handle(mintReq(42, 27), e, qobuz([200, { ...GOOD, sample: true }]), NOW + 1); } finally { console.error = orig; }
+    assert.equal(r.status, 503);
+    assert.equal(r.headers.get("Retry-After"), "60");
+    assert.deepEqual(errors, []); // answered on purpose, not by the catch-all
+});
+
 test("the account cooled by a cross-check sits out the next miss", async () => {
     const e = env(); const q = qobuz([200, { ...GOOD, sample: true }], [200, GOOD], [200, { ...GOOD, url: "https://cdn.example/g.flac?etsp=" + (NOW + 3599) }]);
     assert.equal((await handle(mintReq(42, 27), e, q, NOW)).status, 200);

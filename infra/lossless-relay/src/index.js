@@ -189,7 +189,8 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         // on the device as "not available" for good, so answer busy and let it ask again later. The
         // refusal was a real Qobuz call, so it costs the network one unit, like a transient. (A one-account
         // pool has no second opinion to wait for: its refusal stands, below.)
-        await env.DB.batch(networkStmts(env.DB, day, keys));
+        const charge = networkStmts(env.DB, day, keys);
+        if (charge.length) await env.DB.batch(charge); // none without IP_SALT, and D1 refuses an empty batch
         return json({ error: "busy" }, 503, { "Retry-After": "60" });
     }
     if (refusedBy) {
