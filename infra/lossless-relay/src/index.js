@@ -23,7 +23,7 @@ import { verifyMint } from "./auth.js";
 import { mintFromQobuz } from "./qobuz.js";
 import {
     getCached, putCachedStmt, readQuota, readQuotas, bumpQuotaStmt,
-    selectAccount, ensureAccounts, coolAccount, coolAccountStmt, refundAccountStmt, killAccount, prune, dayKey,
+    selectAccount, ensureAccounts, coolAccount, coolAccountStmt, killAccount, prune, dayKey,
 } from "./db.js";
 
 /** The lossless formats the client asks for (LosslessQualityTier → 6 / 7 / 27). Data Saver's 5 (MP3 320) is answered 404 below. */
@@ -164,8 +164,8 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         if (r.kind === "ok" || r.kind === "locked") {
             const free404 = r.kind === "locked" && r.reason === "404" && Boolean(tag) && used[keys.free404] < caps.free404
                 && (!tag48 || used[keys.free404w] < caps.free404w);
+            // A free 404 keeps the account slot selectAccount stamped: it was a real Qobuz call.
             const writes = spendStmts(env.DB, day, keys, tag, free404);
-            if (free404) writes.push(refundAccountStmt(env.DB, label, nowSec));
             if (r.kind === "ok" && refusedBy) {
                 // Another account served what refusedBy would not: the refusal was about that account.
                 // Cool it, never kill it (a per-track signal must not retire an account, 2026-09-05).
@@ -205,19 +205,18 @@ export function pacedWaitSec(used, caps, nowSec) {
  * Normally it also spends the shared `global` cap and the network's `n:` cap.
  *
  * `free404`: Qobuz answered 404, i.e. it has never heard of the id, and the network still has some
- * of its daily allowance of those. Such a lookup bumps `nf:<network>` instead of `global` and `n:`,
- * and the caller hands the account's hourly/daily slot back (refundAccountStmt). Before 2026-10-11
- * every 404 spent the global cap: the relay key is public and any 1-12 digit id passes, so one
- * script asking for random ids could burn the day's whole pool and leave every real listener on
- * 503 until midnight UTC. Past the allowance a 404 counts like any other answer, so the network's
- * daily cap still bounds what one caller takes.
+ * of its daily allowance of those (`nf:`, and for IPv6 its /48's `wf:`). Such a lookup bumps those
+ * tallies instead of the network's `n:`/`w:` caps: honest clients ask for dead ids, and that must
+ * not eat their network's day. It still spends `global`, and keeps the account's hourly/daily slot,
+ * because it was a real Qobuz call (2026-10-17 audit: refunding both left 404 traffic bounded by
+ * nothing but the per-network allowance, so made-up ids hit Qobuz without limit, scaling with
+ * networks). Past the allowance a 404 counts like any other answer, so the network's daily cap still
+ * bounds what one caller takes.
  */
 function spendStmts(db, day, keys, tag, free404) {
-    const writes = [bumpQuotaStmt(db, day, keys.install, tag)];
+    const writes = [bumpQuotaStmt(db, day, keys.install, tag), bumpQuotaStmt(db, day, "global")];
     if (free404) return [...writes, ...[keys.free404, keys.free404w].filter(Boolean).map((k) => bumpQuotaStmt(db, day, k))];
-    writes.push(bumpQuotaStmt(db, day, "global"));
-    writes.push(...networkStmts(db, day, keys));
-    return writes;
+    return [...writes, ...networkStmts(db, day, keys)];
 }
 
 /** The caller's network counters: its `n:` cap and, for IPv6, its /48's `w:` aggregate. Empty without IP_SALT. */
@@ -279,7 +278,7 @@ function vars(env) {
         install: n(env.INSTALL_DAILY_CAP, 100),
         // Per network (only with IP_SALT): a few installs' worth, so a household or a carrier NAT still fits.
         network: n(env.NETWORK_DAILY_CAP, 400),
-        // Qobuz 404s (ids it doesn't know) a network gets each day without spending the global or account caps.
+        // Qobuz 404s (ids it doesn't know) a network gets each day without spending its own network cap.
         free404: n(env.NETWORK_FREE_404_DAILY, 50),
     };
     return {

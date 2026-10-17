@@ -442,17 +442,33 @@ test("a network's daily cap stops a script rotating install ids (and IPv6 addres
     assert.equal((await handle(mintReq(100, 27, { install: "rotating-y", ip: "2001:db8:aa:bb00::5" }), e, q, NOW + 12)).headers.get("X-Stash-Cache"), "HIT");
 });
 
-test("a Qobuz 404 (an id it doesn't know) spends neither the global cap nor the account's slots, only the install's quota and the network's allowance", async () => {
+test("a Qobuz 404 (an id it doesn't know) spares the network's cap but spends the account's slot and the global cap: it was a real Qobuz call", async () => {
     const e = env({ IP_SALT: "salt-1" });
     const q = qobuz([404, ""], [404, ""]);
     assert.equal((await handle(mintReq(987654321, 27), e, q, NOW)).status, 404);
     assert.equal((await handle(mintReq(987654322, 27), e, q, NOW + 1)).status, 404);
-    assert.equal(await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first(), null);
+    assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first()).n, 2);
     assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'i:install-0001'").first()).n, 2);
     assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key LIKE 'nf:%'").first()).n, 2);
     assert.equal(await e.DB.prepare("SELECT n FROM quota WHERE key LIKE 'n:%'").first(), null);
     const accts = (await e.DB.prepare("SELECT label, hour_n, day_n FROM accounts ORDER BY label").all()).results;
-    assert.deepEqual(accts, [{ label: "a", hour_n: 0, day_n: 0 }, { label: "b", hour_n: 0, day_n: 0 }]);
+    assert.deepEqual(accts, [{ label: "a", hour_n: 1, day_n: 1 }, { label: "b", hour_n: 1, day_n: 1 }]);
+});
+
+test("made-up ids are bounded by the account caps and the global cap: once the pool is spent, 404 probes get 503 with no Qobuz call", async () => {
+    // Many networks, each inside its own free-404 allowance: before 2026-10-17 nothing bounded this.
+    const e = env({ IP_SALT: "salt-1", ACCOUNT_HOURLY_CAP: "2" });
+    const q = qobuz(...Array(20).fill([404, ""]));
+    const statuses = [];
+    for (let i = 0; i < 6; i++) statuses.push((await handle(mintReq(5000 + i, 27, { install: `probe-net-${i}`, ip: `198.51.100.${i + 1}` }), e, q, NOW + i)).status);
+    assert.deepEqual(statuses, [404, 404, 404, 404, 503, 503]); // 2 accounts × 2 an hour
+    assert.equal(q.calls.length, 4);
+    const g = env({ IP_SALT: "salt-1", GLOBAL_DAILY_CAP: "3" });
+    const gq = qobuz(...Array(20).fill([404, ""]));
+    const gs = [];
+    for (let i = 0; i < 5; i++) gs.push((await handle(mintReq(5000 + i, 27, { install: `probe-net-${i}`, ip: `198.51.100.${i + 1}` }), g, gq, NOW + i)).status);
+    assert.deepEqual(gs, [404, 404, 404, 503, 503]);
+    assert.equal(gq.calls.length, 3);
 });
 
 test("random ids can't burn the pool: past its allowance a network's 404s count again, and its daily cap ends them", async () => {
@@ -460,9 +476,9 @@ test("random ids can't burn the pool: past its allowance a network's 404s count 
     const q = qobuz(...Array(20).fill([404, ""]));
     const statuses = [];
     for (let i = 0; i < 8; i++) statuses.push((await handle(mintReq(1000 + i, 27, { install: `junk-id-${i}` }), e, q, NOW + i)).status);
-    // 2 free, 3 counted, then the network cap (429). The global cap of 10 is never reached.
+    // 2 free, 3 counted, then the network cap (429). All five reached Qobuz, so all five spent the global cap.
     assert.deepEqual(statuses, [404, 404, 404, 404, 404, 429, 429, 429]);
-    assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first()).n, 3);
+    assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first()).n, 5);
     // Everyone else still gets FLAC.
     assert.equal((await handle(mintReq(42, 27, { ip: "198.51.100.7" }), e, qobuz([200, GOOD]), NOW + 20)).status, 200);
 });
@@ -473,7 +489,7 @@ test("without IP_SALT there is no network tally, so a Qobuz 404 counts as before
     assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first()).n, 1);
 });
 
-test("a rights refusal (a real track) still spends the global and network caps: only Qobuz's 404 is free", async () => {
+test("a rights refusal (a real track) still spends the global and network caps: only Qobuz's 404 spares the network", async () => {
     const e = env({ IP_SALT: "salt-1" });
     assert.equal((await handle(mintReq(42, 27), e, qobuz([200, RIGHTS_LOCK]), NOW)).status, 404);
     assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first()).n, 1);

@@ -76,19 +76,6 @@ RETURNING label`).bind(nowSec, hourKey(nowSec), dayKey(nowSec), caps.hourly, cap
     return row ? row.label : null;
 }
 
-/**
- * Statement (not executed): hands back the hourly and daily slot selectAccount stamped on `label`, for a lookup
- * that must not count against the account caps (Qobuz's 404 for an id it doesn't know, see index.js). Only
- * while the stamp's hour/day is still current, never below 0. last_used_at stays, so the LRU still moves on.
- */
-export function refundAccountStmt(db, label, nowSec) {
-    return db.prepare(`
-UPDATE accounts SET
-  hour_n = CASE WHEN hour_key = ?2 AND hour_n > 0 THEN hour_n - 1 ELSE hour_n END,
-  day_n  = CASE WHEN day_key  = ?3 AND day_n  > 0 THEN day_n  - 1 ELSE day_n  END
-WHERE label = ?1`).bind(label, hourKey(nowSec), dayKey(nowSec));
-}
-
 /** Give every label in the secret a state row. INSERT OR IGNORE writes nothing for a known label. */
 export async function ensureAccounts(db, labels) {
     if (labels.length === 0) return;
