@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 57,
-    "identityHash": "cda0c558a6fa9a0f964aaed940c00164",
+    "identityHash": "7964ee2f1f46dcbb51056834e5f39ced",
     "entities": [
       {
         "tableName": "tracks",
@@ -2331,6 +2331,68 @@
         ]
       },
       {
+        "tableName": "tidal_match_cache",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `tidal_id` TEXT, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `artwork` TEXT, `confidence` REAL NOT NULL, `searched_at` INTEGER NOT NULL, `lossless_miss_at` INTEGER, `aac_miss_at` INTEGER, PRIMARY KEY(`key`))",
+        "fields": [
+          {
+            "fieldPath": "key",
+            "columnName": "key",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "tidalId",
+            "columnName": "tidal_id",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "artist",
+            "columnName": "artist",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "artwork",
+            "columnName": "artwork",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "confidence",
+            "columnName": "confidence",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "searchedAt",
+            "columnName": "searched_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "losslessMissAt",
+            "columnName": "lossless_miss_at",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "aacMissAt",
+            "columnName": "aac_miss_at",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "key"
+          ]
+        }
+      },
+      {
         "tableName": "scan_folders",
         "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `tree_uri` TEXT NOT NULL, `display_name` TEXT NOT NULL, `added_at` INTEGER NOT NULL)",
         "fields": [
@@ -2379,7 +2441,7 @@
       },
       {
         "tableName": "scanned_songs",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `folder_id` INTEGER NOT NULL, `uri` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `album` TEXT NOT NULL, `duration_ms` INTEGER NOT NULL, `file_format` TEXT NOT NULL, `file_size_bytes` INTEGER NOT NULL, `last_modified` INTEGER NOT NULL, `date_added` INTEGER NOT NULL, `album_art_path` TEXT, FOREIGN KEY(`folder_id`) REFERENCES `scan_folders`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `folder_id` INTEGER NOT NULL, `uri` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `album` TEXT NOT NULL, `duration_ms` INTEGER NOT NULL, `file_format` TEXT NOT NULL, `file_size_bytes` INTEGER NOT NULL, `last_modified` INTEGER NOT NULL, `date_added` INTEGER NOT NULL, FOREIGN KEY(`folder_id`) REFERENCES `scan_folders`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
         "fields": [
           {
             "fieldPath": "id",
@@ -2446,11 +2508,6 @@
             "columnName": "date_added",
             "affinity": "INTEGER",
             "notNull": true
-          },
-          {
-            "fieldPath": "albumArtPath",
-            "columnName": "album_art_path",
-            "affinity": "TEXT"
           }
         ],
         "primaryKey": {
@@ -2496,7 +2553,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'cda0c558a6fa9a0f964aaed940c00164')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '7964ee2f1f46dcbb51056834e5f39ced')"
     ]
   }
 }
