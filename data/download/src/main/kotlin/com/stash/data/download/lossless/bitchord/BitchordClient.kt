@@ -113,8 +113,9 @@ sealed interface TidalLookup {
  *    track has no FLAC (the server rejects lossy itself). `client=media3` pins the
  *    server's DASH-vs-progressive sniffing to "native DASH client" so it never
  *    swaps the Tidal MPD for a Deezer progressive file meant for browsers.
- *  - 503 (`no_account` / `upstream_unavailable`) and 429 mean the shared account pool
- *    is saturated: see [busyUntilMs].
+ *  - 503 (`busy` / `tidal_relay_paused` / `global_daily_cap`) and 429
+ *    (`network_daily_cap`) mean the shared account pool is saturated: see [busyUntilMs].
+ *    Both carry `Retry-After` (seconds), which sets how long the circuit stays open.
  *  - Auth: when the server sets `ACCESS_TOKEN`, either the base carries it as a
  *    path prefix (`https://host/<token>`, BitChord's own format) or it goes in
  *    `X-Access-Token`. The `/dash/` and `/audio/` URLs it hands back are HMAC-signed
@@ -123,7 +124,7 @@ sealed interface TidalLookup {
  * Request budget: every `/search` and `/stream` spends quota on a small shared pool of
  * Tidal accounts, so answers are cached per song in Room ([TidalMatchDao]; matches 30 days,
  * misses 14 days — never the stream URL itself), concurrent identical lookups share one
- * request, and a busy pool pauses every caller on this device for a few minutes.
+ * request, and a busy pool pauses every caller on this device for as long as the relay asks.
  *
  * Matching reuses [QobuzCandidateMatcher] — the scorer the Qobuz rung uses — on
  * neutral fields, so ISRC equality, title/artist normalisation, version words and
@@ -410,7 +411,7 @@ class BitchordClient @Inject constructor(
         data class Ok(val body: String) : Reply
         /** 404: the relay's definitive "no such song / no FLAC / no AAC". */
         data object NotFound : Reply
-        /** 503 (no pooled account free) or 429 (slow down): back off until [untilMs]. */
+        /** 503 (no pooled account free) or 429 (slow down): back off until [untilMs] (from Retry-After). */
         data class Busy(val untilMs: Long) : Reply
         /** Anything else (5xx, other 4xx): transient, never cached as a miss. */
         data class Error(val code: Int) : Reply
@@ -428,12 +429,12 @@ class BitchordClient @Inject constructor(
                 val now = nowMs()
                 return when (r.code) {
                     404 -> Reply.NotFound
-                    503 -> Reply.Busy(now + BUSY_BACKOFF_MS)
-                    429 -> {
-                        val after = r.header("Retry-After")?.trim()?.toLongOrNull()?.times(1000L)
-                            ?.coerceIn(MIN_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS) ?: BUSY_BACKOFF_MS
-                        Reply.Busy(now + after)
-                    }
+                    // The relay says how long: 15 s when only seat pacing blocks, 30 s for its
+                    // per-network limiter, 300 / 600 s when capped or paused. A flat 5 min turned
+                    // a 15 s pacing blip into a device-wide Tidal blackout.
+                    503 -> Reply.Busy(now + retryAfterMs(r, BUSY_MIN_RETRY_AFTER_MS, BUSY_MAX_RETRY_AFTER_MS))
+                    // network_daily_cap answers Retry-After 3600, hence the 1 h ceiling.
+                    429 -> Reply.Busy(now + retryAfterMs(r, MIN_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS))
                     else -> Reply.Error(r.code)
                 }
             }
@@ -442,6 +443,10 @@ class BitchordClient @Inject constructor(
             return Reply.Ok(body.string())
         }
     }
+
+    /** Retry-After (seconds) clamped to [[min], [max]]; absent or junk (an HTTP-date too) → [BUSY_BACKOFF_MS]. */
+    private fun retryAfterMs(r: okhttp3.Response, min: Long, max: Long): Long =
+        r.header("Retry-After")?.trim()?.toLongOrNull()?.times(1000L)?.coerceIn(min, max) ?: BUSY_BACKOFF_MS
 
     internal companion object {
         const val TAG = "BitchordClient"
@@ -455,11 +460,17 @@ class BitchordClient @Inject constructor(
         const val MATCH_TTL_MS = 30L * 24 * 60 * 60_000
         /** A definitive miss (no match, no lossless, no AAC) is trusted this long. */
         const val MISS_TTL_MS = 14L * 24 * 60 * 60_000
-        /** Pool busy (503 / no_account): leave the relay alone this long. */
+        /** Pool busy (503 / 429) with no usable Retry-After: leave the relay alone this long. */
         const val BUSY_BACKOFF_MS = 5 * 60_000L
-        /** Bounds on a 429's Retry-After, so a junk header can neither hammer nor park us for a day. */
+        /** Bounds on a 503's Retry-After: the relay's shortest pacing wait up to a long pause. */
+        const val BUSY_MIN_RETRY_AFTER_MS = 15_000L
+        const val BUSY_MAX_RETRY_AFTER_MS = 15 * 60_000L
+        /**
+         * Bounds on a 429's Retry-After, so a junk header can neither hammer nor park us for a day.
+         * The ceiling covers `network_daily_cap` (Retry-After 3600).
+         */
         const val MIN_RETRY_AFTER_MS = 30_000L
-        const val MAX_RETRY_AFTER_MS = 15 * 60_000L
+        const val MAX_RETRY_AFTER_MS = 60 * 60_000L
         /** Duration bucket for the title key: a few seconds' drift between catalogs is one song. */
         const val DURATION_BUCKET_S = 10L
 

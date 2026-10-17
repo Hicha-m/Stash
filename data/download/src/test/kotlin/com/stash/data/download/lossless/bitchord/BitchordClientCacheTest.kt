@@ -131,7 +131,7 @@ class BitchordClientCacheTest {
         assertThat(searches.get()).isEqualTo(3)
     }
 
-    @Test fun `503 opens the busy circuit for five minutes and is not cached as a miss`() = runBlocking {
+    @Test fun `503 without Retry-After opens the busy circuit for five minutes and is not cached as a miss`() = runBlocking {
         searchReply = { MockResponse().setResponseCode(503).setBody("""{"error":"no_account"}""") }
         assertThat(client.lookup(query)).isInstanceOf(TidalLookup.Busy::class.java)
         assertThat(client.isBusy()).isTrue()
@@ -143,6 +143,36 @@ class BitchordClientCacheTest {
         searchReply = { ok(SEARCH_HIT) }
         assertThat(client.lookup(query)).isInstanceOf(TidalLookup.Found::class.java)
         assertThat(searches.get()).isEqualTo(2)
+    }
+
+    @Test fun `503 honours Retry-After so a 15 s pacing busy is not a 5-minute blackout`() = runBlocking {
+        searchReply = { MockResponse().setResponseCode(503).setHeader("Retry-After", "15").setBody("""{"error":"busy"}""") }
+        assertThat(client.lookup(query)).isInstanceOf(TidalLookup.Busy::class.java)
+        now += 14_999
+        assertThat(client.isBusy()).isTrue()
+        now += 1
+        assertThat(client.isBusy()).isFalse()
+        searchReply = { ok(SEARCH_HIT) }
+        assertThat(client.lookup(query)).isInstanceOf(TidalLookup.Found::class.java)
+        assertThat(searches.get()).isEqualTo(2)
+    }
+
+    @Test fun `503 Retry-After is clamped to between 15 s and 15 min`() = runBlocking {
+        searchReply = { MockResponse().setResponseCode(503).setHeader("Retry-After", "1").setBody("""{"error":"busy"}""") }
+        val short = client.lookup(query) as TidalLookup.Busy
+        assertThat(short.untilMs - now).isEqualTo(BitchordClient.BUSY_MIN_RETRY_AFTER_MS)
+
+        now = short.untilMs
+        searchReply = { MockResponse().setResponseCode(503).setHeader("Retry-After", "86400").setBody("""{"error":"tidal_relay_paused"}""") }
+        val long = client.lookup(query) as TidalLookup.Busy
+        assertThat(long.untilMs - now).isEqualTo(BitchordClient.BUSY_MAX_RETRY_AFTER_MS)
+    }
+
+    @Test fun `429 network_daily_cap on search honours an hour-long Retry-After`() = runBlocking {
+        searchReply = { MockResponse().setResponseCode(429).setHeader("Retry-After", "3600").setBody("""{"error":"network_daily_cap"}""") }
+        val busy = client.lookup(query) as TidalLookup.Busy
+        assertThat(busy.untilMs - now).isEqualTo(3_600_000L)
+        assertThat(dao.rows).isEmpty()
     }
 
     @Test fun `429 honours Retry-After`() = runBlocking {
