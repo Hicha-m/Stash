@@ -5,6 +5,7 @@ import { fakeD1, QUOTA_MIGRATIONS } from "./fake-d1.js";
 import worker, { handle, networkOf, network48Of, refusalNamesTrack } from "../src/index.js";
 import { bumpQuotaStmt } from "../src/db.js";
 import { hooks } from "../src/quota.js";
+import { keypair, token, tidOf } from "./entitlement-keys.js";
 
 const NOW = 1788282000; // 2026-09-01T17:00:00Z
 const KEY = "k-secret";
@@ -734,4 +735,89 @@ test("the hourly cron also prunes week-old usage rows", async () => {
     put.run(new Date().toISOString().slice(0, 10));
     await worker.scheduled({}, e);
     assert.equal(e.QUOTA_DB.raw.prepare("SELECT COUNT(*) AS n FROM usage").get().n, 1);
+});
+
+// ---- Supporter tokens (X-Stash-Entitlement) end to end, with a test keypair ----
+
+const KEYS = keypair();
+const supporter = (over = {}) => token(KEYS.privateKey, { iat: NOW - 60, ...over });
+const withToken = (req, t) => { const r = new Request(req); r.headers.set("X-Stash-Entitlement", t); return r; };
+const supporterEnv = (over = {}) => quotaEnv({ ENTITLEMENT_PUBLIC_KEY: KEYS.publicKey, FREE_LOSSLESS_DAILY: "1", INSTALL_DAILY_CAP: "1", ...over });
+/** Track `id` minted fresh every time (no cache), so every answer is a Qobuz call. */
+const fresh = (n) => qobuz(...Array.from({ length: n }, (_, i) => [200, { ...GOOD, url: `https://cdn.example/${i}.flac?etsp=${NOW + 3599}` }]));
+
+test("a valid token: unlimited past FREE_LOSSLESS_DAILY and INSTALL_DAILY_CAP, header <used>/unlimited, both rows counted", async () => {
+    const e = supporterEnv(); const t = supporter(); const q = fresh(4);
+    for (let i = 1; i <= 4; i++) {
+        const r = await handle(withToken(mintReq(100 + i, 27), t), e, q, NOW);
+        assert.equal(r.status, 200, `mint ${i}`);
+        assert.equal(r.headers.get("X-Stash-Lossless"), `${i}/unlimited`);
+    }
+    assert.equal(usage(e), 4);
+    assert.equal(usage(e, "t:" + tidOf(t)), 4);
+    assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'i:install-0001'").first()).n, 4, "the relay's install row still counts");
+    // Without the token the same install is over both caps again.
+    const plain = await handle(mintReq(200, 27), e, fresh(1), NOW);
+    assert.equal(plain.status, 429);
+    assert.equal((await plain.json()).error, "daily_lossless_cap");
+});
+
+test("a bad token is never an error: bad signature, another key, garbage, wrong tier all get the normal quota", async () => {
+    const other = keypair();
+    const good = supporter();
+    const [head, sig] = good.split(".");
+    const flipped = Buffer.from(sig, "base64url"); flipped[5] ^= 1;
+    for (const t of [`${head}.${flipped.toString("base64url")}`, token(other.privateKey, { iat: NOW - 60 }), "garbage", supporter({ tier: "free" })]) {
+        const e = supporterEnv({ INSTALL_DAILY_CAP: "100" });
+        const first = await handle(withToken(mintReq(42, 27), t), e, qobuz([200, GOOD]), NOW);
+        assert.equal(first.status, 200, t);
+        assert.equal(first.headers.get("X-Stash-Lossless"), "1/1", t);
+        const second = await handle(withToken(mintReq(42, 27), t), e, qobuz(), NOW);
+        assert.equal(second.status, 429, t);
+        assert.equal((await second.json()).error, "daily_lossless_cap", t);
+    }
+});
+
+test("a revoked tid gets the normal quota", async () => {
+    const e = supporterEnv({ INSTALL_DAILY_CAP: "100" }); const t = supporter(); const q = fresh(2);
+    assert.equal((await handle(withToken(mintReq(42, 27), t), e, q, NOW)).status, 200);
+    e.QUOTA_DB.raw.prepare("INSERT INTO revoked_tokens (tid, revoked_at, reason) VALUES (?, ?, 'shared publicly')").run(tidOf(t), NOW);
+    const r = await handle(withToken(mintReq(43, 27), t), e, q, NOW + 1);
+    assert.equal(r.status, 429);
+    assert.deepEqual(await r.json(), { error: "daily_lossless_cap", used: 1, limit: 1, resetsAt: RESET });
+    const s = await handle(withToken(quotaReq({ ts: NOW + 2 }), t), e, q, NOW + 2);
+    assert.deepEqual(await s.json(), { used: 1, limit: 1, resetsAt: RESET, supporter: false });
+});
+
+test("SUPPORTER_DAILY_CAP: at the token's ceiling the install is back on its free 500 and the relay's install cap", async () => {
+    const e = supporterEnv({ SUPPORTER_DAILY_CAP: "3", FREE_LOSSLESS_DAILY: "5", INSTALL_DAILY_CAP: "4" }); const t = supporter(); const q = fresh(5);
+    for (let i = 1; i <= 3; i++) assert.equal((await handle(withToken(mintReq(100 + i, 27), t), e, q, NOW)).headers.get("X-Stash-Lossless"), `${i}/unlimited`);
+    const asFree = await handle(withToken(mintReq(104, 27), t), e, q, NOW);
+    assert.equal(asFree.status, 200);
+    assert.equal(asFree.headers.get("X-Stash-Lossless"), "4/5", "the install's own count and the free limit");
+    assert.equal(usage(e, "t:" + tidOf(t)), 3, "a free answer leaves the token's row alone");
+    const capped = await handle(withToken(mintReq(105, 27), t), e, q, NOW);
+    assert.equal(capped.status, 429);
+    assert.deepEqual(await capped.json(), { error: "rate_limited" }, "INSTALL_DAILY_CAP applies again");
+    assert.deepEqual(await (await handle(withToken(quotaReq(), t), e, q, NOW)).json(), { used: 4, limit: 5, resetsAt: RESET, supporter: false });
+});
+
+test("supporters still meet the network cap", async () => {
+    const e = supporterEnv({ IP_SALT: "salt", NETWORK_DAILY_CAP: "2" }); const t = supporter(); const q = fresh(3);
+    assert.equal((await handle(withToken(mintReq(101, 27), t), e, q, NOW)).status, 200);
+    assert.equal((await handle(withToken(mintReq(102, 27), t), e, q, NOW)).status, 200);
+    const r = await handle(withToken(mintReq(103, 27), t), e, q, NOW);
+    assert.equal(r.status, 429);
+    assert.deepEqual(await r.json(), { error: "rate_limited" });
+});
+
+test("GET /v1/quota with a valid token: supporter true, limit null, header <used>/unlimited", async () => {
+    const e = supporterEnv(); const t = supporter();
+    await handle(withToken(mintReq(42, 27), t), e, qobuz([200, GOOD]), NOW);
+    const r = await handle(withToken(quotaReq(), t), e, qobuz(), NOW);
+    assert.equal(r.status, 200);
+    assert.deepEqual(await r.json(), { used: 1, limit: null, resetsAt: RESET, supporter: true });
+    assert.equal(r.headers.get("X-Stash-Lossless"), "1/unlimited");
+    assert.deepEqual(await (await handle(quotaReq(), e, qobuz(), NOW)).json(), { used: 1, limit: 1, resetsAt: RESET, supporter: false }, "without the token");
+    assert.equal(usage(e), 1);
 });

@@ -18,6 +18,8 @@
  * State: D1 (accounts' rotation state, the shared mint cache, daily quotas), plus QUOTA_DB: the daily
  * lossless counter shared with the Tidal relay (src/quota.js). A lossless mint answered (a cache HIT
  * included) costs the install one unit; at FREE_LOSSLESS_DAILY it is answered 429 daily_lossless_cap.
+ * A valid supporter token (optional header X-Stash-Entitlement, on mints and /v1/quota) lifts that limit and
+ * INSTALL_DAILY_CAP, up to SUPPORTER_DAILY_CAP a day per token; the network, /48 and global caps still apply.
  * Secrets: RELAY_KEY, RELAY_KEY_PREV (optional), QOBUZ_ACCOUNTS, QOBUZ_ACCOUNTS_EXTRA and
  *          QOBUZ_ACCOUNTS_RECOVERED, QOBUZ_ACCOUNTS_RECOVERED_2 and QOBUZ_ACCOUNTS_RECOVERED_3 (optional additive arrays).
  *          Deploy: see README.md.
@@ -147,7 +149,9 @@ async function mint(request, url, env, fetchImpl, nowSec) {
     // rotates it meets the network cap instead. An IPv6 caller also meets its /48's aggregate cap
     // (network48Of): one free tunnel-broker /48 holds 256 /56s, each with its own network cap.
     // Every counter, and the free-404 tallies (spendStmts), come back in one read. No IP_SALT, no
-    // network tag: the network caps are off.
+    // network tag: the network caps are off. A supporter (a valid token under its own daily ceiling, see
+    // quota.js) skips only the install cap, which would otherwise stop "unlimited" at INSTALL_DAILY_CAP; the
+    // network, /48 and global caps still apply to supporters (owner's decision, 2026-10-17).
     const tag = ipTag(env, network);
     const tag48 = ipTag(env, network48Of(h("CF-Connecting-IP")));
     const keys = {
@@ -155,7 +159,7 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         network48: tag48 && "w:" + tag48, free404w: tag48 && "wf:" + tag48,
     };
     const used = await readQuotas(env.DB, day, Object.values(keys).filter(Boolean));
-    if (used[keys.install] >= caps.install || (tag && used[keys.network] >= caps.network) || (tag48 && used[keys.network48] >= caps.network48)) {
+    if ((!standing?.supporter && used[keys.install] >= caps.install) || (tag && used[keys.network] >= caps.network) || (tag48 && used[keys.network48] >= caps.network48)) {
         return json({ error: "rate_limited" }, 429, { "Retry-After": "3600" });
     }
 
