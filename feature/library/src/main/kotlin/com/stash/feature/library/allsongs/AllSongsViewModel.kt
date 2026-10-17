@@ -271,6 +271,9 @@ class AllSongsViewModel @Inject constructor(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    // Removed while it was being scanned (Remove doesn't wait for the scan): its
+                    // songs went with it and the next insert hit the missing folder. Not a failure.
+                    if (dao.getFolders().none { it.id == folder.id }) continue
                     Log.w(TAG, "scan failed for folder ${folder.id}", e)
                     failed++
                 }

@@ -39,8 +39,9 @@ enum class FileDeletion { DELETED, GONE, FAILED }
 
 /**
  * Walks a user-chosen SAF tree for playable audio files and syncs `scanned_songs` with it.
- * One ContentResolver query per directory (no per-file DocumentFile IPC); tag reads bounded by
- * Semaphore(4); a rescan reads tags only for new files and files whose size or modified time moved.
+ * One ContentResolver query per directory (no per-file DocumentFile IPC); tags are read four files
+ * at a time and saved in batches; a rescan reads tags only for new files and files whose size or
+ * modified time moved.
  */
 @Singleton
 class AllSongsScanner @Inject constructor(
@@ -98,23 +99,29 @@ class AllSongsScanner @Inject constructor(
 
         plan.gone.chunked(500).forEach { dao.deleteByUris(folder.id, it) }
 
-        val sem = Semaphore(4)
-        val (fresh, changed) = coroutineScope {
-            val fresh = plan.fresh.map { f ->
-                async { sem.withPermit { readTags(folder.id, f, dateAdded = System.currentTimeMillis()) } }
-            }
-            // Re-read in place: the row keeps its id (a queue holding the song still finds it) and
-            // the day it was first found.
-            val changed = plan.changed.map { (stamp, f) ->
-                async { sem.withPermit { readTags(folder.id, f, dateAdded = stamp.dateAdded).copy(id = stamp.id) } }
-            }
-            fresh.awaitAll() to changed.awaitAll()
+        // Read and saved a batch at a time, not all at the end: on a big folder the songs show up
+        // while the scan runs, and a scan stopped part way (Library closed) keeps every batch it
+        // finished instead of starting over next time.
+        plan.fresh.chunked(TAG_BATCH).forEach { batch ->
+            dao.insertSongs(readEach(batch) { f -> readTags(folder.id, f, dateAdded = System.currentTimeMillis()) })
         }
-        fresh.chunked(200).forEach { dao.insertSongs(it) }
-        changed.chunked(200).forEach { dao.updateSongs(it) }
+        // Re-read in place: the row keeps its id (a queue holding the song still finds it) and
+        // the day it was first found.
+        plan.changed.chunked(TAG_BATCH).forEach { batch ->
+            dao.updateSongs(
+                readEach(batch) { (stamp, f) -> readTags(folder.id, f, dateAdded = stamp.dateAdded).copy(id = stamp.id) },
+            )
+        }
         fillMissingArt(folder.id)
-        ScanResult(added = fresh.size, updated = changed.size, removed = plan.gone.size, incomplete = !listing.complete)
+        ScanResult(added = plan.fresh.size, updated = plan.changed.size, removed = plan.gone.size, incomplete = !listing.complete)
     }
+
+    /** [read] for every item of [items], [TAG_READERS] files at a time (each is a retriever opening a file). */
+    private suspend fun <T> readEach(items: List<T>, read: suspend (T) -> ScannedSongEntity): List<ScannedSongEntity> =
+        coroutineScope {
+            val sem = Semaphore(TAG_READERS)
+            items.map { item -> async { sem.withPermit { read(item) } } }.awaitAll()
+        }
 
     private class Listing(val files: List<ListedFile>, val complete: Boolean)
 
@@ -148,6 +155,14 @@ class AllSongsScanner @Inject constructor(
             }
             isRoot = false
             cursor.use { c ->
+                // A provider still fetching this folder (a network or cloud one) or one that hit an
+                // error answers with what it has so far: a partial list, not a sign files were deleted.
+                val extras = c.extras
+                if (extras != null &&
+                    (extras.getBoolean(DocumentsContract.EXTRA_LOADING, false) || extras.containsKey(DocumentsContract.EXTRA_ERROR))
+                ) {
+                    complete = false
+                }
                 while (c.moveToNext()) {
                     val docId = c.getString(0) ?: continue
                     val name = c.getString(1) ?: continue
@@ -224,7 +239,7 @@ class AllSongsScanner @Inject constructor(
         dao.getArtRefs(folderId).filter { it.art !in present }.map { it.id }
             .chunked(500).forEach { dao.clearAlbumArt(it) }
 
-        val sem = Semaphore(4)
+        val sem = Semaphore(TAG_READERS)
         coroutineScope {
             dao.getUnarted(folderId).map { row ->
                 async {
@@ -266,6 +281,12 @@ class AllSongsScanner @Inject constructor(
     }
 
     private companion object {
+
+        /** Files whose tags are read at once. */
+        const val TAG_READERS = 4
+
+        /** Files read and saved per batch: small enough to show progress, big enough to keep the readers busy. */
+        const val TAG_BATCH = 100
 
         val COLUMNS = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
