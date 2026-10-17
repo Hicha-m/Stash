@@ -84,7 +84,7 @@ class StreamingPrefetchTest {
         testScope.advanceUntilIdle()
 
         coVerify(exactly = 0) { trackDao.getById(any()) }
-        coVerify(exactly = 0) { streamResolver.resolve(any()) }
+        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any(), any()) }
         verify(exactly = 0) { streamUrlCache.put(any(), any()) }
     }
 
@@ -104,7 +104,7 @@ class StreamingPrefetchTest {
         testScope.advanceUntilIdle()
 
         coVerify(exactly = 0) { trackDao.getById(any()) }
-        coVerify(exactly = 0) { streamResolver.resolve(any()) }
+        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any(), any()) }
         verify(exactly = 0) { streamUrlCache.put(any(), any()) }
     }
 
@@ -116,7 +116,7 @@ class StreamingPrefetchTest {
         coEvery { streamingPreference.current() } returns true
         coEvery { streamUrlCache.get(99L) } returns null
         coEvery { trackDao.getById(99L) } returns nextTrack
-        coEvery { streamResolver.resolve(nextTrack) } returns resolved
+        coEvery { streamResolver.resolve(nextTrack, speculative = true) } returns resolved
 
         orchestrator.onPlaybackProgress(
             scope = testScope,
@@ -126,7 +126,7 @@ class StreamingPrefetchTest {
         )
         testScope.advanceUntilIdle()
 
-        coVerify(exactly = 1) { streamResolver.resolve(nextTrack) }
+        coVerify(exactly = 1) { streamResolver.resolve(nextTrack, speculative = true) }
         verify(exactly = 1) { streamUrlCache.put(99L, resolved) }
     }
 
@@ -151,7 +151,7 @@ class StreamingPrefetchTest {
         )
         testScope.advanceUntilIdle()
 
-        coVerify(exactly = 0) { streamResolver.resolve(any()) }
+        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any(), any()) }
         verify(exactly = 0) { streamUrlCache.put(any(), any()) }
     }
 
@@ -179,7 +179,7 @@ class StreamingPrefetchTest {
         )
         testScope.advanceUntilIdle()
 
-        coVerify(exactly = 0) { streamResolver.resolve(any()) }
+        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any(), any()) }
     }
 
     @Test
@@ -191,7 +191,7 @@ class StreamingPrefetchTest {
         coEvery { streamingPreference.current() } returns true
         coEvery { streamUrlCache.get(99L) } returns null
         coEvery { trackDao.getById(99L) } returns nextTrack
-        coEvery { streamResolver.resolve(nextTrack) } returns null // simulate failure
+        coEvery { streamResolver.resolve(nextTrack, speculative = true) } returns null // simulate failure
 
         orchestrator.onPlaybackProgress(
             scope = testScope,
@@ -210,7 +210,7 @@ class StreamingPrefetchTest {
         )
         testScope.advanceUntilIdle()
 
-        coVerify(exactly = 1) { streamResolver.resolve(nextTrack) }
+        coVerify(exactly = 1) { streamResolver.resolve(nextTrack, speculative = true) }
     }
 
     @Test
@@ -222,7 +222,7 @@ class StreamingPrefetchTest {
         coEvery { streamingPreference.current() } returns true
         coEvery { streamUrlCache.get(99L) } returns null
         coEvery { trackDao.getById(99L) } returns nextTrack
-        coEvery { streamResolver.resolve(nextTrack) } returns
+        coEvery { streamResolver.resolve(nextTrack, speculative = true) } returns
             StreamUrl(url = "https://cdn/x?etsp=1", expiresAtMs = 1_000L)
 
         orchestrator.onPlaybackProgress(
@@ -243,7 +243,7 @@ class StreamingPrefetchTest {
         )
         testScope.advanceUntilIdle()
 
-        coVerify(exactly = 2) { streamResolver.resolve(nextTrack) }
+        coVerify(exactly = 2) { streamResolver.resolve(nextTrack, speculative = true) }
     }
 
     @Test
@@ -259,7 +259,7 @@ class StreamingPrefetchTest {
         )
         testScope.advanceUntilIdle()
 
-        coVerify(exactly = 0) { streamResolver.resolve(any()) }
+        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any(), any()) }
     }
 
     @Test
@@ -277,7 +277,7 @@ class StreamingPrefetchTest {
         )
         testScope.advanceUntilIdle()
 
-        coVerify(exactly = 0) { streamResolver.resolve(any()) }
+        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any(), any()) }
     }
 
     private fun streamableTrack(id: Long): TrackEntity = TrackEntity(
