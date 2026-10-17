@@ -1,6 +1,7 @@
 package com.stash.data.download.lossless.relay
 
 import com.google.common.truth.Truth.assertThat
+import com.stash.data.download.lossless.quota.LosslessQuota
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
@@ -24,6 +25,7 @@ class LosslessRelayClientTest {
     /** Null by default: the existing tests exercise the unsigned path. */
     private val relayKey = MutableStateFlow<String?>(null)
     private var now = 1_000_000L
+    private val quota = LosslessQuota.inMemory { now }
     private val base get() = server.url("/").toString().trimEnd('/')
 
     @Before fun setUp() {
@@ -31,7 +33,7 @@ class LosslessRelayClientTest {
         config = mockk()
         every { config.relayKey } returns relayKey
         coEvery { config.installId() } returns INSTALL_ID
-        client = LosslessRelayClient(OkHttpClient(), RelaySigner(config)).also { it.clock = { now } }
+        client = LosslessRelayClient(OkHttpClient(), RelaySigner(config), quota).also { it.clock = { now } }
     }
     @After fun tearDown() { server.shutdown() }
 
@@ -269,6 +271,27 @@ class LosslessRelayClientTest {
         assertThat(withContext(LosslessDownloadPurpose()) { client.mint(base, 42, 27) }).isEqualTo(RelayMint.Unavailable)
         now += LosslessRelayClient.BUSY_COOLDOWN_MS + 1
         assertThat(client.isCooled(base)).isTrue()
+    }
+
+    // ── Daily lossless allowance ─────────────────────────────────────────────────────────
+
+    @Test fun `every answer's lossless headers reach the quota`() = runTest {
+        server.enqueue(MockResponse().setBody("""{"url":"https://cdn.example/f.flac?etsp=1"}""")
+            .setHeader("X-Stash-Lossless", "412/500").setHeader("X-Stash-Lossless-Reset", "1792281600"))
+        client.mint(base, 42, 27)
+        assertThat(quota.current()?.used).isEqualTo(412)
+        assertThat(quota.current()?.limit).isEqualTo(500)
+    }
+
+    @Test fun `429 daily_lossless_cap is Spent, records the cap, and neither cools nor reads as a miss`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(429).setHeader("Retry-After", "3600")
+            .setBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":${now / 1000 + 3600}}"""))
+        val purpose = LosslessDownloadPurpose()
+        assertThat(withContext(purpose) { client.mint(base, 42, 27) }).isEqualTo(RelayMint.Spent)
+        assertThat(quota.isSpent()).isTrue()
+        assertThat(client.isCooled(base)).isFalse()
+        assertThat(purpose.searchIncomplete).isTrue()
+        assertThat(purpose.pacedRetryAfterSec).isNull() // not paced: a lossy fallback may still run
     }
 
     private companion object {

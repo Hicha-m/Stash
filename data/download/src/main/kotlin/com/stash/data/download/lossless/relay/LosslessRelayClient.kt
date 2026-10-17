@@ -1,6 +1,7 @@
 package com.stash.data.download.lossless.relay
 
 import android.util.Log
+import com.stash.data.download.lossless.quota.LosslessQuota
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -38,6 +39,12 @@ sealed interface RelayMint {
      * first. Not a sick relay — no cooldown. [retryAfterSec] is when the pace line catches up.
      */
     data class Paced(val retryAfterSec: Long) : RelayMint
+    /**
+     * 429 `daily_lossless_cap`: this install's lossless allowance for the day is used up
+     * ([LosslessQuota] now says so). The count is shared by every relay, so no other base is
+     * asked, and the base is not cooled: nothing is wrong with it.
+     */
+    object Spent : RelayMint
 }
 
 /**
@@ -109,6 +116,7 @@ internal data class RelayFileResponse(
 class LosslessRelayClient @Inject constructor(
     sharedClient: OkHttpClient,
     private val signer: RelaySigner,
+    private val quota: LosslessQuota,
 ) {
     /**
      * Derived client so the relay's short timeouts don't leak onto the shared
@@ -192,6 +200,9 @@ class LosslessRelayClient @Inject constructor(
             val req = b.get().build()
             return httpClient.newCall(req).execute().use { r ->
                 val body = r.body?.string().orEmpty()
+                // Every answer may carry the day's lossless count; the cap answer also has it in its body.
+                quota.onResponse(r)
+                val capped = r.code == 429 && quota.onCapBody(body, r.header("Retry-After")?.trim()?.toLongOrNull())
                 when (r.code) {
                     // A signed mint refused with the relay's time attached: our clock is off.
                     // Adopt the offset and ask once more; a second 401 cools like any other.
@@ -220,6 +231,12 @@ class LosslessRelayClient @Inject constructor(
                     404 -> {
                         note(base, startedAt, "404 not available")
                         RelayMint.NoMatch
+                    }
+                    429 if capped -> {
+                        // A stream or a download alike: not "no lossless version" for this track.
+                        download?.searchIncomplete = true
+                        note(base, startedAt, "429 daily lossless cap")
+                        RelayMint.Spent
                     }
                     // Only a labelled download is ever paced; any other 429 is a limit and cools below.
                     429 if download != null && body.contains("\"paced\"") -> {

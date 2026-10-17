@@ -5,6 +5,7 @@ import com.stash.core.data.db.dao.TidalMatchDao
 import com.stash.core.data.db.entity.TidalMatchEntity
 import com.stash.data.download.lossless.LosslessSourcePreferences
 import com.stash.data.download.lossless.TrackQuery
+import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessConfigFetcher
 import com.stash.data.download.lossless.relay.RelaySigner
 import com.stash.data.download.lossless.relay.TidalRelay
@@ -60,7 +61,7 @@ class BitchordClientSigningTest {
             every { relayKey } returns this@BitchordClientSigningTest.relayKey
             coEvery { installId() } returns INSTALL_ID
         }
-        client = BitchordClient(OkHttpClient(), prefs, config, FakeDao(), RelaySigner(config))
+        client = BitchordClient(OkHttpClient(), prefs, config, FakeDao(), RelaySigner(config), LosslessQuota.inMemory { now })
         client.nowMs = { now }
     }
 
