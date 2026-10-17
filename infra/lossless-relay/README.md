@@ -20,13 +20,46 @@ actives thanks to the shared mint cache; see spec §6.
   `X-Stash-Purpose: stream | download`. Answers:
   - `200` a mint (`X-Stash-Cache: HIT | MISS`).
   - `404` not available: Qobuz doesn't know the id, refuses it, or the format isn't lossless.
-  - `429` a cap: `rate_limited` (install, network or /48 daily cap, or the per-minute limiter) or
-    `paced` (a download ahead of the day's pace); both carry `Retry-After`.
+  - `429` a cap: `rate_limited` (install, network or /48 daily cap, or the per-minute limiter),
+    `paced` (a download ahead of the day's pace), or `daily_lossless_cap` (the shared daily lossless
+    counter, below); all carry `Retry-After`.
   - `503` busy, with `Retry-After`: the global cap is spent, no account is free, or a refusal could not
     be cross-checked because no second account was free (it used to be a 404 the app kept for good).
   - `401` a bad signature or a timestamp outside ±300 s, with `X-Stash-Server-Time: <epoch seconds>`
     so the app can correct a skewed clock and retry.
+- `GET /v1/quota`: today's daily lossless count for the install (below). Signed like a mint, over
+  `<install>:quota:<ts>`; behind the same per-minute limiter; never counted.
 - `GET /v1/status`: reachability probe.
+
+## Daily lossless counter (shared with the Tidal relay)
+
+Design: [`../../docs/superpowers/specs/2026-10-17-lossless-daily-counter-design.md`](../../docs/superpowers/specs/2026-10-17-lossless-daily-counter-design.md).
+Every install gets `FREE_LOSSLESS_DAILY` (default 500) lossless answers per UTC day, **Qobuz and Tidal together**:
+both relays count in one D1 database, `stash-quota` (binding `QUOTA_DB`, schema and migrate command in
+[`../lossless-quota/`](../lossless-quota/README.md)), table `usage(day, subject, n)`, subject `i:<install id>`.
+Code: `src/quota.js` (an identical copy lives in `tidal-worker/src/quota.js`).
+
+- **Counts (one unit):** a `200` mint for a lossless format (6, 7, 27), a mint-cache `HIT` included. **Never:** format
+  5 (Data Saver, answered 404), any 404, 401, 429, 503, `/v1/quota`, `/v1/status`.
+- **Check:** after the signature and the per-minute limiter, before the cache. At the limit:
+  `429 {"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":<epoch s>}` with `Retry-After` = seconds to
+  `resetsAt` (the next UTC midnight), no Qobuz call. The app should then skip the lossless rungs until `resetsAt`.
+- **Headers** on every counted `200`, the `daily_lossless_cap` 429 and `/v1/quota`:
+  `X-Stash-Lossless: <used>/<limit>` (`used` after this answer; `<used>/unlimited` for a supporter) and
+  `X-Stash-Lossless-Reset: <epoch s>`. The relay sets no CORS headers, so there is no expose list to extend.
+- **`GET /v1/quota`:** headers `X-Stash-Install`, `X-Stash-Ts`, `X-Stash-Auth` =
+  `hex(HMAC-SHA256(RELAY_KEY, "<install>:quota:<ts>"))` (key as its UTF-8 string, ±300 s, like a mint). Answers
+  `200 {"used":n,"limit":500,"resetsAt":T,"supporter":false}` (`limit: null` for a supporter) with the headers;
+  `401` + `X-Stash-Server-Time` for a bad signature; `404 {"error":"quota_off"}` when the counter is off (also what
+  an older relay without the route answers: `not_found`).
+- **Supporters (step 3, not built):** `entitlementOf(request, env)` in `src/quota.js` returns null today. When it
+  returns an entitlement the cap is skipped (the answer is still counted).
+- **Off switch:** no `QUOTA_DB` binding → the counter is skipped (one `QUOTA_DB not bound` warning per isolate). A D1
+  error on the counter also skips it for that request: the counter never stops a mint. A race can serve one or two
+  past the limit.
+- `INSTALL_DAILY_CAP` (`rate_limited`, also counts 404s, but not cache hits) stays as this relay's own per-install cap and
+  abuse telemetry; the network, /48, global and account caps are unchanged and still apply.
+- The hourly cron prunes `usage` rows older than 7 days.
 
 ## Caps and what each answer costs
 
