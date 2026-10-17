@@ -111,6 +111,13 @@ class StreamSourceRegistry internal constructor(
         track: TrackEntity,
         allowYouTube: Boolean = true,
         allowYtDlp: Boolean = true,
+        /**
+         * A look-ahead resolve (next-up prefetch) that the user may never play. It never
+         * makes the Tidal relay search: when Qobuz misses and Tidal's answer for the track is
+         * not cached, it returns null (nothing cached, no lossy fallback) and leaves the
+         * track to the real play, which asks Tidal. The shared Tidal pool is small.
+         */
+        speculative: Boolean = false,
     ): StreamUrl? {
         // Single-flight. A foreground tap and the next-up prefetch landing on the
         // same track within a few hundred ms each ran their OWN full resolver
@@ -124,7 +131,7 @@ class StreamSourceRegistry internal constructor(
         // Keyed on the FLAGS as well as the id: background fill calls with
         // allowYouTube/allowYtDlp = false deliberately accept a narrower source
         // set, and must never be handed a foreground result (or vice versa).
-        val key = resolveKey(track.id, allowYouTube, allowYtDlp)
+        val key = resolveKey(track.id, allowYouTube, allowYtDlp, speculative)
         inFlightResolves[key]?.let { return it.await() }
 
         val fresh = resolveScope.async(start = CoroutineStart.LAZY) {
@@ -146,7 +153,7 @@ class StreamSourceRegistry internal constructor(
             // find this track", and RefreshingDataSource's open() threw a
             // non-IOException Media3 never retries. doResolve still records it.
             withTimeoutOrNull(LazyResolvingDataSource.RESOLVE_DEADLINE_MS) {
-                doResolve(track, allowYouTube, allowYtDlp)
+                doResolve(track, allowYouTube, allowYtDlp, speculative)
             }
         }
         val existing = inFlightResolves.putIfAbsent(key, fresh)
@@ -197,14 +204,15 @@ class StreamSourceRegistry internal constructor(
     /** In-flight resolves, keyed by [resolveKey]; entries self-remove on completion. */
     private val inFlightResolves = ConcurrentHashMap<String, Deferred<StreamUrl?>>()
 
-    private fun resolveKey(trackId: Long, allowYouTube: Boolean, allowYtDlp: Boolean) =
-        "$trackId:$allowYouTube:$allowYtDlp"
+    private fun resolveKey(trackId: Long, allowYouTube: Boolean, allowYtDlp: Boolean, speculative: Boolean) =
+        "$trackId:$allowYouTube:$allowYtDlp:$speculative"
 
     /** The resolver-chain walk itself; reached only via [resolve]'s single-flight. */
     private suspend fun doResolve(
         track: TrackEntity,
         allowYouTube: Boolean,
         allowYtDlp: Boolean,
+        speculative: Boolean,
     ): StreamUrl? {
         val startedNs = System.nanoTime()
         // The Lossless switch (Settings › Audio & Quality) governs streaming as well as
@@ -257,7 +265,14 @@ class StreamSourceRegistry internal constructor(
                 // (returns null at once) when no server is configured.
                 val tidalRung = tidal
                 if (allowYtDlp && lossless && tidalRung != null) {
-                    add("tidal" to { t: TrackEntity -> tidalRung.resolve(t) })
+                    // Speculative and Tidal would have to be asked: stop the walk here
+                    // (see [resolve]'s `speculative`), so no lossy URL is cached for a
+                    // track Tidal may serve when it is really played.
+                    if (speculative && tidalRung.needsRelay(track)) {
+                        add(TIDAL_DEFERRED to { _: TrackEntity -> null })
+                    } else {
+                        add("tidal" to { t: TrackEntity -> tidalRung.resolve(t) })
+                    }
                 }
                 // AAC 320 fallback (96 under Save Data). Foreground/next-up only: a
                 // speculative full-queue fill must not turn into one metadata
@@ -291,7 +306,8 @@ class StreamSourceRegistry internal constructor(
         // consults JioSaavn first (its rank is unchanged), then the fast lane, and
         // only then the yt-dlp-capable rung. Foreground resolves only: the
         // speculative background fill keeps its cheap sequential chain.
-        val hedged = allowYouTube && allowYtDlp && resolvers.size > 1 && resolvers.last().first == "youtube"
+        val hedged = allowYouTube && allowYtDlp && resolvers.size > 1 && resolvers.last().first == "youtube" &&
+            resolvers.none { it.first == TIDAL_DEFERRED }
 
         // For the diagnostics bundle's "Recent resolves": the rung that served, set at each
         // exit below. Still null when the walk ends means every rung missed.
@@ -311,6 +327,11 @@ class StreamSourceRegistry internal constructor(
 
                 for ((name, fn) in resolvers) {
                     if (hedged && (name == "jiosaavn" || name == "youtube")) continue // consulted below
+                    if (name == TIDAL_DEFERRED) {
+                        Log.i(TAG, "speculative resolve of ${track.id} stops before Tidal; the real play asks it")
+                        servedBy = "none (speculative; Tidal waits for the play)"
+                        return@coroutineScope null
+                    }
                     val result = quietly(name, track) { fn(track) }
                     // Feed the Home lossless-offline banner signal: a qbdlx null here
                     // is a miss (dead credential OR catalog gap; the streak threshold
@@ -379,5 +400,6 @@ class StreamSourceRegistry internal constructor(
 
     private companion object {
         private const val TAG = "StreamSourceRegistry"
+        private const val TIDAL_DEFERRED = "tidal-deferred"
     }
 }

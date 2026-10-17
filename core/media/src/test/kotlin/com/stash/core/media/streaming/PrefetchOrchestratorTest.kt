@@ -52,7 +52,7 @@ class PrefetchOrchestratorTest {
         )
         coEvery { trackDao.getById(5L) } returns track
         coEvery {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true)
+            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
         } returns null
 
         orchestrator().onPlaybackProgress(
@@ -64,7 +64,7 @@ class PrefetchOrchestratorTest {
         advanceUntilIdle()
 
         coVerify(exactly = 1) {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true)
+            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
         }
     }
 
@@ -90,7 +90,7 @@ class PrefetchOrchestratorTest {
             isStreamableCheckedAt = null,
         )
         coEvery { trackDao.getById(6L) } returns track
-        coEvery { streamResolver.resolve(track) } returns null
+        coEvery { streamResolver.resolve(track, speculative = true) } returns null
 
         orchestrator().onPlaybackProgress(
             scope = this,
@@ -100,7 +100,7 @@ class PrefetchOrchestratorTest {
         )
         advanceUntilIdle()
 
-        coVerify(exactly = 1) { streamResolver.resolve(track) }
+        coVerify(exactly = 1) { streamResolver.resolve(track, speculative = true) }
     }
 
     @Test
@@ -127,7 +127,7 @@ class PrefetchOrchestratorTest {
         )
         advanceUntilIdle()
 
-        coVerify(exactly = 0) { streamResolver.resolve(any()) }
-        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any()) }
+        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { streamResolver.resolve(any(), any(), any(), any()) }
     }
 }

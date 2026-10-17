@@ -7,6 +7,7 @@ import com.stash.data.download.lossless.RateLimitState
 import com.stash.data.download.lossless.TrackQuery
 import com.stash.data.download.lossless.bitchord.BitchordClient
 import com.stash.data.download.lossless.bitchord.BitchordStream
+import com.stash.data.download.lossless.bitchord.TidalLookup
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
@@ -40,11 +41,12 @@ class TidalAacResolverTest {
         coEvery { client.isConfigured() } returns true
         coEvery { rateLimiter.stateOf(any()) } returns RateLimitState(2.0, 0L, broken, 0L, 0)
         coEvery { rateLimiter.acquire(id) } returns acquire
+        coEvery { client.lookup(any(), any(), true) } returns TidalLookup.NeedsRelay
     }
 
     @Test fun `AAC answer maps to an aac m4a SourceResult at 320 kbps`() = runTest {
         ready()
-        coEvery { client.resolve(query, allowAac = true) } returns aac
+        coEvery { client.lookup(query, allowAac = true, cacheOnly = false) } returns TidalLookup.Found(aac)
         val r = resolver.resolve(query)!!
         assertThat(r.sourceId).isEqualTo(id)
         assertThat(r.format.codec).isEqualTo("aac")
@@ -53,13 +55,13 @@ class TidalAacResolverTest {
         assertThat(r.format.bitsPerSample).isEqualTo(0)
         assertThat(r.isDash).isFalse()
         assertThat(r.downloadUrl).isEqualTo(aac.url)
-        coVerify(exactly = 1) { client.resolve(any(), any()) }
+        coVerify(exactly = 1) { client.lookup(any(), any(), false) }
         coVerify { rateLimiter.reportSuccess(id) }
     }
 
     @Test fun `a FLAC answer is ignored - the lossless chain owns FLAC`() = runTest {
         ready()
-        coEvery { client.resolve(query, allowAac = true) } returns aac.copy(codec = "flac", isDash = true, bitDepth = 24)
+        coEvery { client.lookup(query, allowAac = true, cacheOnly = false) } returns TidalLookup.Found(aac.copy(codec = "flac", isDash = true, bitDepth = 24))
         assertThat(resolver.resolve(query)).isNull()
     }
 
@@ -67,32 +69,47 @@ class TidalAacResolverTest {
         ready()
         coEvery { client.isConfigured() } returns false
         assertThat(resolver.resolve(query)).isNull()
-        coVerify(exactly = 0) { client.resolve(any(), any()) }
+        coVerify(exactly = 0) { client.lookup(any(), any(), false) }
     }
 
     @Test fun `rate limited means no lookup`() = runTest {
         ready(acquire = false)
         assertThat(resolver.resolve(query)).isNull()
-        coVerify(exactly = 0) { client.resolve(any(), any()) }
+        coVerify(exactly = 0) { client.lookup(any(), any(), false) }
     }
 
     @Test fun `open breaker means no lookup`() = runTest {
         ready(broken = true)
         assertThat(resolver.resolve(query)).isNull()
-        coVerify(exactly = 0) { client.resolve(any(), any()) }
+        coVerify(exactly = 0) { client.lookup(any(), any(), false) }
     }
 
     @Test fun `switch off means no AAC request`() = runTest {
         ready(switchOn = false)
         assertThat(resolver.resolve(query)).isNull()
-        coVerify(exactly = 0) { client.resolve(any(), any()) }
+        coVerify(exactly = 0) { client.lookup(any(), any(), false) }
         coVerify(exactly = 0) { rateLimiter.acquire(any()) }
     }
 
     @Test fun `a thrown resolve counts as a failure and returns null`() = runTest {
         ready()
-        coEvery { client.resolve(query, allowAac = true) } throws IllegalStateException("boom")
+        coEvery { client.lookup(query, allowAac = true, cacheOnly = false) } throws IllegalStateException("boom")
         assertThat(resolver.resolve(query)).isNull()
         coVerify { rateLimiter.reportFailure(id) }
+    }
+
+    @Test fun `a cached AAC miss costs no token and no request`() = runTest {
+        ready()
+        coEvery { client.lookup(any(), any(), true) } returns TidalLookup.NoMatch
+        assertThat(resolver.resolve(query)).isNull()
+        coVerify(exactly = 0) { rateLimiter.acquire(any()) }
+        coVerify(exactly = 0) { client.lookup(any(), any(), false) }
+    }
+
+    @Test fun `a busy pool reports rate-limited`() = runTest {
+        ready()
+        coEvery { client.lookup(query, allowAac = true, cacheOnly = false) } returns TidalLookup.Busy(1L)
+        assertThat(resolver.resolve(query)).isNull()
+        coVerify { rateLimiter.reportRateLimited(id) }
     }
 }

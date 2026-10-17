@@ -101,10 +101,11 @@ import com.stash.core.data.db.entity.TrackTagEntity
         SyncUndoMembershipEntity::class,
         ArtistImageEntity::class,
         SharedMixEntity::class,
+        com.stash.core.data.db.entity.TidalMatchEntity::class,
         ScanFolderEntity::class,
         ScannedSongEntity::class,
     ],
-    version = 57,
+    version = 58,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -143,6 +144,8 @@ abstract class StashDatabase : RoomDatabase() {
     abstract fun lastFmCacheDao(): LastFmCacheDao
 
     abstract fun spotifyResolutionDao(): SpotifyResolutionDao
+
+    abstract fun tidalMatchDao(): com.stash.core.data.db.dao.TidalMatchDao
 
     abstract fun flacUpgradeQueueDao(): FlacUpgradeQueueDao
 
@@ -1456,25 +1459,44 @@ abstract class StashDatabase : RoomDatabase() {
         }
 
         /**
-         * v55 -> v56: All Songs. `scan_folders` (the SAF trees the user picked) and
-         * `scanned_songs` (what the scanner found in them, deleted with their folder).
-         * Both live apart from `tracks`: nothing here is a library song.
-         *
-         * Converges from EITHER v55 that exists in the wild:
-         *  - master's v55 (has the tracks index, no scan tables), and
-         *  - the All Songs PR's debug builds, which also called themselves v55 but
-         *    carried the scan tables (without `last_modified`) and NOT the tracks index.
-         * So it (re)creates master's index idempotently, then drops and recreates the
-         * two scan tables. They are a cache of what is on disk; the next scan refills
-         * them, so dropping loses nothing a user made except the folder list, which
-         * only those debug builds had.
+         * v55 -> v56 adds `tidal_match_cache` ([com.stash.core.data.db.entity.TidalMatchEntity]):
+         * what the shared Tidal relay answered per song, so plays, syncs and upgrade sweeps stop
+         * re-asking it. A new, empty table; no existing row changes.
          */
         val MIGRATION_55_56 = object : Migration(55, 56) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `tidal_match_cache` (" +
+                        "`key` TEXT NOT NULL, `tidal_id` TEXT, `title` TEXT NOT NULL, " +
+                        "`artist` TEXT NOT NULL, `artwork` TEXT, `confidence` REAL NOT NULL, " +
+                        "`searched_at` INTEGER NOT NULL, `lossless_miss_at` INTEGER, " +
+                        "`aac_miss_at` INTEGER, PRIMARY KEY(`key`))",
+                )
+            }
+        }
+
+        /**
+         * v56 -> v57: All Songs, Library's "On this device" chip. `scan_folders` (the SAF trees the
+         * user picked) and `scanned_songs` (what the scanner found in them, deleted with their
+         * folder). Both live apart from `tracks`: nothing here is a library song.
+         *
+         * From master's v56 this only adds the two tables. It also converges the All Songs PR's
+         * debug builds (the `.debug` app only; never released), which numbered these tables 55
+         * and 56 before master shipped its own v55 and v56:
+         *  - its first debug v55 (scan tables without `last_modified`, no tracks index) arrives
+         *    here through master's 55 -> 56;
+         *  - its debug v56 had the scan tables but not master's `tidal_match_cache`.
+         * So it creates master's index and table when they're missing, then drops and recreates
+         * the two scan tables. They are a cache of what is on disk; the next scan refills them,
+         * so dropping loses nothing but those debug builds' folder list.
+         */
+        val MIGRATION_56_57 = object : Migration(56, 57) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_tracks_canonical_title_canonical_artist` " +
                         "ON `tracks` (`canonical_title`, `canonical_artist`)",
                 )
+                createTidalMatchCacheIfMissing(db)
                 // Child first: scanned_songs holds the FK onto scan_folders.
                 db.execSQL("DROP TABLE IF EXISTS `scanned_songs`")
                 db.execSQL("DROP TABLE IF EXISTS `scan_folders`")
@@ -1507,15 +1529,46 @@ abstract class StashDatabase : RoomDatabase() {
         }
 
         /**
-         * v56 -> v57: `scanned_songs.album_art_path`, the embedded cover of a scanned song.
-         * NULL on every existing row: the next scan looks for each one's cover and fills it in
-         * ("" when the file has none), so nothing needs backfilling here.
+         * v57 -> v58: `scanned_songs.album_art_path`, the file name of a scanned song's embedded
+         * cover. NULL on every existing row ("not looked at yet"): the next scan fills it in, so
+         * nothing is backfilled here.
+         *
+         * Also converges the All Songs PR's debug v57 (the `.debug` app only), which already had
+         * this column but not master's `tidal_match_cache`: the column is added only when it's
+         * missing and the table only when it's absent, so that build's folders and songs stay.
          */
-        val MIGRATION_56_57 = object : Migration(56, 57) {
+        val MIGRATION_57_58 = object : Migration(57, 58) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL("ALTER TABLE `scanned_songs` ADD COLUMN `album_art_path` TEXT")
+                createTidalMatchCacheIfMissing(db)
+                if (!db.hasColumn("scanned_songs", "album_art_path")) {
+                    db.execSQL("ALTER TABLE `scanned_songs` ADD COLUMN `album_art_path` TEXT")
+                }
             }
         }
+
+        /**
+         * Master's v56 `tidal_match_cache`, for the steps above that heal the All Songs PR's debug
+         * databases (they skipped master's 55 -> 56). Must stay identical to [MIGRATION_55_56]'s
+         * table; the migration tests validate both against the exported schema.
+         */
+        private fun createTidalMatchCacheIfMissing(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `tidal_match_cache` (" +
+                    "`key` TEXT NOT NULL, `tidal_id` TEXT, `title` TEXT NOT NULL, " +
+                    "`artist` TEXT NOT NULL, `artwork` TEXT, `confidence` REAL NOT NULL, " +
+                    "`searched_at` INTEGER NOT NULL, `lossless_miss_at` INTEGER, " +
+                    "`aac_miss_at` INTEGER, PRIMARY KEY(`key`))",
+            )
+        }
+
+        /** True when [table] has a column named [column] (false when the table doesn't exist). */
+        private fun SupportSQLiteDatabase.hasColumn(table: String, column: String): Boolean =
+            query("PRAGMA table_info(`$table`)").use { c ->
+                val name = c.getColumnIndexOrThrow("name")
+                var found = false
+                while (!found && c.moveToNext()) found = c.getString(name) == column
+                found
+            }
 
         /**
          * The complete migration chain, shared by every builder of a
@@ -1587,6 +1640,7 @@ abstract class StashDatabase : RoomDatabase() {
                 MIGRATION_54_55,
                 MIGRATION_55_56,
                 MIGRATION_56_57,
+                MIGRATION_57_58,
             )
         }
     }

@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 56,
-    "identityHash": "8afe42ce9c75351718816338ab64c6f7",
+    "identityHash": "c376bb625c463e5322819d64121d668c",
     "entities": [
       {
         "tableName": "tracks",
@@ -2331,73 +2331,19 @@
         ]
       },
       {
-        "tableName": "scan_folders",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `tree_uri` TEXT NOT NULL, `display_name` TEXT NOT NULL, `added_at` INTEGER NOT NULL)",
+        "tableName": "tidal_match_cache",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `tidal_id` TEXT, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `artwork` TEXT, `confidence` REAL NOT NULL, `searched_at` INTEGER NOT NULL, `lossless_miss_at` INTEGER, `aac_miss_at` INTEGER, PRIMARY KEY(`key`))",
         "fields": [
           {
-            "fieldPath": "id",
-            "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "treeUri",
-            "columnName": "tree_uri",
+            "fieldPath": "key",
+            "columnName": "key",
             "affinity": "TEXT",
             "notNull": true
           },
           {
-            "fieldPath": "displayName",
-            "columnName": "display_name",
-            "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "addedAt",
-            "columnName": "added_at",
-            "affinity": "INTEGER",
-            "notNull": true
-          }
-        ],
-        "primaryKey": {
-          "autoGenerate": true,
-          "columnNames": [
-            "id"
-          ]
-        },
-        "indices": [
-          {
-            "name": "index_scan_folders_tree_uri",
-            "unique": true,
-            "columnNames": [
-              "tree_uri"
-            ],
-            "orders": [],
-            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_scan_folders_tree_uri` ON `${TABLE_NAME}` (`tree_uri`)"
-          }
-        ]
-      },
-      {
-        "tableName": "scanned_songs",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `folder_id` INTEGER NOT NULL, `uri` TEXT NOT NULL, `title` TEXT NOT NULL, `artist` TEXT NOT NULL, `album` TEXT NOT NULL, `duration_ms` INTEGER NOT NULL, `file_format` TEXT NOT NULL, `file_size_bytes` INTEGER NOT NULL, `last_modified` INTEGER NOT NULL, `date_added` INTEGER NOT NULL, FOREIGN KEY(`folder_id`) REFERENCES `scan_folders`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
-        "fields": [
-          {
-            "fieldPath": "id",
-            "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "folderId",
-            "columnName": "folder_id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "uri",
-            "columnName": "uri",
-            "affinity": "TEXT",
-            "notNull": true
+            "fieldPath": "tidalId",
+            "columnName": "tidal_id",
+            "affinity": "TEXT"
           },
           {
             "fieldPath": "title",
@@ -2412,86 +2358,44 @@
             "notNull": true
           },
           {
-            "fieldPath": "album",
-            "columnName": "album",
-            "affinity": "TEXT",
+            "fieldPath": "artwork",
+            "columnName": "artwork",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "confidence",
+            "columnName": "confidence",
+            "affinity": "REAL",
             "notNull": true
           },
           {
-            "fieldPath": "durationMs",
-            "columnName": "duration_ms",
+            "fieldPath": "searchedAt",
+            "columnName": "searched_at",
             "affinity": "INTEGER",
             "notNull": true
           },
           {
-            "fieldPath": "fileFormat",
-            "columnName": "file_format",
-            "affinity": "TEXT",
-            "notNull": true
+            "fieldPath": "losslessMissAt",
+            "columnName": "lossless_miss_at",
+            "affinity": "INTEGER"
           },
           {
-            "fieldPath": "fileSizeBytes",
-            "columnName": "file_size_bytes",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "lastModified",
-            "columnName": "last_modified",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "dateAdded",
-            "columnName": "date_added",
-            "affinity": "INTEGER",
-            "notNull": true
+            "fieldPath": "aacMissAt",
+            "columnName": "aac_miss_at",
+            "affinity": "INTEGER"
           }
         ],
         "primaryKey": {
-          "autoGenerate": true,
+          "autoGenerate": false,
           "columnNames": [
-            "id"
+            "key"
           ]
-        },
-        "indices": [
-          {
-            "name": "index_scanned_songs_uri",
-            "unique": true,
-            "columnNames": [
-              "uri"
-            ],
-            "orders": [],
-            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_scanned_songs_uri` ON `${TABLE_NAME}` (`uri`)"
-          },
-          {
-            "name": "index_scanned_songs_folder_id",
-            "unique": false,
-            "columnNames": [
-              "folder_id"
-            ],
-            "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_scanned_songs_folder_id` ON `${TABLE_NAME}` (`folder_id`)"
-          }
-        ],
-        "foreignKeys": [
-          {
-            "table": "scan_folders",
-            "onDelete": "CASCADE",
-            "onUpdate": "NO ACTION",
-            "columns": [
-              "folder_id"
-            ],
-            "referencedColumns": [
-              "id"
-            ]
-          }
-        ]
+        }
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '8afe42ce9c75351718816338ab64c6f7')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'c376bb625c463e5322819d64121d668c')"
     ]
   }
 }

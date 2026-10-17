@@ -55,7 +55,20 @@ sealed interface RelayMint {
  * answers "paced", [LosslessRelayClient] records it here and the caller defers the track
  * (waits for FLAC) instead of taking a lossy copy that would stay lossy forever.
  */
-class LosslessDownloadPurpose : AbstractCoroutineContextElement(Key) {
+class LosslessDownloadPurpose(
+    /**
+     * The FLAC upgrade worker (a sweep, or a Library batch): the one bulk path that can walk a
+     * whole library. The Tidal rung spends its own small hourly budget on it
+     * ([com.stash.data.download.lossless.tidal.TidalLosslessSource.SWEEP_BUDGET_PER_HOUR]).
+     */
+    val upgradeSweep: Boolean = false,
+) : AbstractCoroutineContextElement(Key) {
+    /**
+     * Set when a lossless source could not really search this track (pool busy, an error,
+     * its breaker open). The sweep must then not file the track as "no lossless version".
+     */
+    @Volatile var searchIncomplete: Boolean = false
+
     /** Set when the relay paced this work; the seconds until it may try again. */
     @Volatile var pacedRetryAfterSec: Long? = null
 
