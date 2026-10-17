@@ -474,6 +474,18 @@ test("successful stream answers are shared only until shortly before the Tidal U
   assert.ok(entry.expires_at > Math.floor(Date.now() / 1000));
 });
 
+test("?aac is normalised to '', '1' or 'only' before the cache key: junk values share the plain namespace", async () => {
+  const f = fixture({ accounts: [liveAccount(), liveAccount(), liveAccount()], tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", AAC_BTS) });
+  await withFetch(null, f.fetchTidal, async () => {
+    for (const q of ["", "?aac=0", "?aac=x1", "?aac=ONLY", "?aac=only1"]) {
+      const r = await worker.fetch(authorizedRequest(`/stream/td:5${q}`), f.env);
+      assert.deepEqual(await r.json(), { error: "lossless_unavailable" }, q);
+    }
+  });
+  assert.equal(f.calls.length, 1, "every junk ?aac is a cache hit on the plain answer");
+  assert.deepEqual([...f.responseCache.keys()], ["stream:US:5:aac=:web=app"]);
+});
+
 test("track-level lossless refusals are cached across app requests", async () => {
   const accounts = [liveAccount(), { ...liveAccount(), id: "second-account" }];
   const f = fixture({ accounts, tidalResponse: async () => playbackInfo("HIGH", "application/vnd.tidal.bts", "{}") });

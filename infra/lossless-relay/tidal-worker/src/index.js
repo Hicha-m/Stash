@@ -229,7 +229,7 @@ function searchError() { return json({ error: "upstream_error" }, 502); }
  */
 async function stream(trackId, request, env, quota = {}) {
   const url = new URL(request.url);
-  const aac = url.searchParams.get("aac") || "";
+  const aac = aacMode(url);
   const web = url.searchParams.get("web") === "1" ? "web" : "app";
   const key = `stream:${env.TIDAL_COUNTRY_CODE || "US"}:${trackId}:aac=${aac}:web=${web}`;
   const cached = await cachedJson(env, key);
@@ -252,15 +252,21 @@ async function stream(trackId, request, env, quota = {}) {
   return { response, upstream: true };
 }
 
+/** ?aac as one of "", "1", "only": anything else is "", so callers cannot mint unbounded cache namespaces. */
+function aacMode(url) {
+  const aac = url.searchParams.get("aac");
+  return aac === "1" || aac === "only" ? aac : "";
+}
+
 async function streamUncached(trackId, request, env) {
   // ?aac=1: when no account can play the track losslessly, answer with Tidal's AAC
   // stream (labelled codec "aac") instead of lossless_unavailable. Opt-in so the
   // download path, which must never save AAC as FLAC, keeps the lossless-only answer.
   // ?aac=only (the web player): ask Tidal for its 320 kbps AAC straight away, for any
   // track. A browser can only play Tidal's progressive file; Hi-Res comes as DASH.
-  const aacMode = new URL(request.url).searchParams.get("aac");
-  const aacOnly = aacMode === "only";
-  const allowAac = aacMode === "1" || aacOnly;
+  const aac = aacMode(new URL(request.url));
+  const aacOnly = aac === "only";
+  const allowAac = aac === "1" || aacOnly;
   // Upstream budget: one playbackinfo call per seat taken. A second seat is only tried
   // after a seat-level failure (failed refresh, Tidal 5xx), never for a
   // track-level answer: with this client ID CD-only tracks always come back HIGH (AAC),
