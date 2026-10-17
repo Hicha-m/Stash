@@ -17,6 +17,7 @@ TIDAL_SOFT_OPEN_PERCENT = "50"
 TIDAL_SOFT_OPEN_SECONDS = "600"
 GLOBAL_DAILY_CAP = "34667"
 NETWORK_DAILY_CAP = "2000"
+NETWORK_SEARCH_DAILY_CAP = "2000" # uncached (upstream) searches per network per day; cache hits are free
 EDGE_BASE = "https://stash-tidal-edge.stashfm.deno.net" # tidal-edge on Deno Deploy (Tidal's CDN refuses Cloudflare); ?web=1 signs links for it with the EDGE_SECRET secret
 
 [[d1_databases]]
@@ -30,6 +31,14 @@ migrations_dir = "migrations"
 name = "REQUEST_RL"
 namespace_id = "1002"
 simple = { limit = 40, period = 60 }
+
+# Per-network fair share of the seats: only requests about to take a seat (search/stream cache
+# miss, hires lookup) count. The whole pool makes ~12 upstream calls/min, so one network must
+# not take them all. Over it: 503 busy, Retry-After 30.
+[[ratelimits]]
+name = "UPSTREAM_RL"
+namespace_id = "1003"
+simple = { limit = 6, period = 60 }
 
 [triggers]
 crons = ["17 * * * *"]

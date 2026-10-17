@@ -135,17 +135,57 @@ async function search(url, request, env) {
   const key = `search:${country}:${await cacheDigest(query)}`;
   const cached = await cachedJson(env, key);
   if (cached) return cached;
+  // Cache hits are free; a miss is the only search that costs Tidal, so only a miss is metered.
+  const quota = await admitSearch(request, env);
+  if (quota.denial) return quota.denial;
   if (await softOpenBlocks(env)) return busy();
-  const response = await searchUncached(query, country, request, env);
+  if (!await upstreamAllowed(request, env)) return busy(UPSTREAM_RL_RETRY_AFTER);
+  const response = await searchUncached(query, country, request, env, () => spendSearch(env, quota));
   if (response.status === 200) await cacheJson(env, key, response, RESPONSE_CACHE_TTL);
   return response;
 }
 
-async function searchUncached(query, cc, request, env) {
+/**
+ * Per-network daily search quota (key s:<networkTag>). Uncached searches used to spend no
+ * daily quota at all, so one network could keep every seat busy; this bounds it like streams.
+ * Without IP_SALT there is no network tag and only the rate limiters apply.
+ */
+async function admitSearch(request, env) {
+  const day = new Date().toISOString().slice(0, 10);
+  const tag = networkTag(env, networkOf(request.headers.get("CF-Connecting-IP")));
+  if (!tag) return { day, tag };
+  const used = await dailyUsed(env, day, [`s:${tag}`]);
+  if ((used[`s:${tag}`] || 0) >= positive(env.NETWORK_SEARCH_DAILY_CAP, 2000)) {
+    return { denial: json({ error: "network_daily_cap" }, 429, { "Retry-After": "3600" }) };
+  }
+  return { day, tag };
+}
+
+async function spendSearch(env, quota) {
+  if (quota.tag) await bumpDailyQuotaStmt(env.DB, quota.day, `s:${quota.tag}`).run();
+}
+
+const UPSTREAM_RL_RETRY_AFTER = 30;
+
+/**
+ * Fair share of the seats: the pool makes ~12 upstream calls/min in total while REQUEST_RL lets
+ * one network send 40 requests/min, so UPSTREAM_RL (keyed like REQUEST_RL) bounds how many of a
+ * network's requests may take a seat. Consulted only on the way to a seat; no binding = no limit.
+ */
+async function upstreamAllowed(request, env) {
+  if (!env.UPSTREAM_RL) return true;
+  const { success } = await env.UPSTREAM_RL.limit({ key: networkOf(request.headers.get("CF-Connecting-IP")) });
+  return success;
+}
+
+/** @param onSeat called once, when the first seat is taken: the search now reaches Tidal. */
+async function searchUncached(query, cc, request, env, onSeat = async () => {}) {
   let data;
+  let charged = false;
   for (let attempt = 0; attempt < 2; attempt++) {
     const selected = await takeAccount(env);
     if (!selected) return noSeat(env);
+    if (!charged) { charged = true; await onSeat(); }
     const account = await refreshIfNeeded(selected, env);
     if (!account) { await coolAccount(env, selected.id, 300); continue; }
     const r = await tidalFetch(`/search/tracks?query=${encodeURIComponent(query)}&limit=30&offset=0&countryCode=${cc}`, account, env);
@@ -190,6 +230,7 @@ async function stream(trackId, request, env) {
   const cached = await cachedJson(env, key);
   if (cached) return cached;
   if (await softOpenBlocks(env)) return busy();
+  if (!await upstreamAllowed(request, env)) return busy(UPSTREAM_RL_RETRY_AFTER);
   const response = await streamUncached(trackId, request, env);
   let body;
   try { body = await response.clone().json(); } catch { return response; }
@@ -243,7 +284,7 @@ async function streamUncached(trackId, request, env) {
       continue;
     }
     const info = await data.json();
-    if (aacOnly) return aacInfo(info, await trackHires(trackId, env));
+    if (aacOnly) return aacInfo(info, await trackHires(trackId, env, request));
     if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
       // The normal answer for a CD-only track with this client, not a seat problem.
       return allowAac ? aacInfo(info) : json({ error: "lossless_unavailable" }, 404);
@@ -370,11 +411,13 @@ function earliestTidalExpiry(manifest) {
  * quota is untouched. No free seat → unknown, and the next play asks again.
  * @returns {Promise<boolean|undefined>} undefined when unknown; never throws.
  */
-async function trackHires(trackId, env) {
+async function trackHires(trackId, env, request) {
   try {
     const row = await env.DB.prepare("SELECT hires FROM tidal_hires_cache WHERE track_id=? AND checked_at>? LIMIT 1")
       .bind(String(trackId), now() - HIRES_TTL).first();
     if (row) return row.hires === 1;
+    // Over the fair share: hires stays unknown rather than refusing a stream already answered.
+    if (!await upstreamAllowed(request, env)) return undefined;
     const seat = await takeAccount(env);
     if (!seat) return undefined;
     const account = await refreshIfNeeded(seat, env);
@@ -614,10 +657,7 @@ async function admitStream(request, env) {
   const network = networkOf(request.headers.get("CF-Connecting-IP"));
   const tag = networkTag(env, network);
   const keys = ["global", ...(tag ? [`n:${tag}`] : [])];
-  const { results = [] } = await env.DB.prepare(
-    "SELECT key, n FROM tidal_daily_quotas WHERE day = ?1 AND key IN (SELECT value FROM json_each(?2))",
-  ).bind(day, JSON.stringify(keys)).all();
-  const used = Object.fromEntries(results.map((row) => [row.key, row.n]));
+  const used = await dailyUsed(env, day, keys);
   const globalCap = positive(env.GLOBAL_DAILY_CAP, 34667);
   const networkCap = positive(env.NETWORK_DAILY_CAP, 2000);
   if ((used.global || 0) >= globalCap) {
@@ -634,6 +674,14 @@ async function spendStream(request, env, quota) {
   const statements = [bumpDailyQuotaStmt(env.DB, quota.day, "global")];
   if (tag) statements.push(bumpDailyQuotaStmt(env.DB, quota.day, `n:${tag}`));
   await env.DB.batch(statements);
+}
+
+/** Today's counters for `keys` in tidal_daily_quotas, as { key: n } (absent = 0). */
+async function dailyUsed(env, day, keys) {
+  const { results = [] } = await env.DB.prepare(
+    "SELECT key, n FROM tidal_daily_quotas WHERE day = ?1 AND key IN (SELECT value FROM json_each(?2))",
+  ).bind(day, JSON.stringify(keys)).all();
+  return Object.fromEntries(results.map((row) => [row.key, row.n]));
 }
 
 function bumpDailyQuotaStmt(db, day, key) {

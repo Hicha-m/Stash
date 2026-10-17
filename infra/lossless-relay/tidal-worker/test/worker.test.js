@@ -313,7 +313,7 @@ test("per-network daily cap is salted, shared across installs, and isolates othe
   assert.equal([...f.dailyQuotas.values()].reduce((sum, n) => sum + n, 0), 4);
 });
 
-test("search spends an account slot but not global or network daily stream quota", async () => {
+test("search spends an account slot and the network search quota, never the stream quotas", async () => {
   const f = fixture();
   f.env.IP_SALT = "test-salt";
   await withFetch(null, f.fetchTidal, async () => {
@@ -321,7 +321,75 @@ test("search spends an account slot but not global or network daily stream quota
     assert.equal(response.status, 200);
   });
   assert.equal(f.accountCaps.length, 1);
+  const tag = networkTag(f.env, networkOf("192.0.2.15"));
+  assert.deepEqual([...f.dailyQuotas.entries()], [[`${new Date().toISOString().slice(0, 10)}:s:${tag}`, 1]]);
+});
+
+test("uncached searches are capped per network per day; cache hits are free and other networks unaffected", async () => {
+  const f = fixture({ accounts: Array.from({ length: 6 }, (_, i) => ({ ...liveAccount(), id: `s-${i}` })) });
+  f.env.IP_SALT = "test-salt";
+  f.env.NETWORK_SEARCH_DAILY_CAP = "2";
+  const from = (ip) => ({ "CF-Connecting-IP": ip });
+  await withFetch(null, f.fetchTidal, async () => {
+    assert.equal((await worker.fetch(authorizedRequest("/search?q=one", "GET", from("192.0.2.15")), f.env)).status, 200);
+    assert.equal((await worker.fetch(authorizedRequest("/search?q=two", "GET", from("192.0.2.15")), f.env)).status, 200);
+    const over = await worker.fetch(authorizedRequest("/search?q=three", "GET", from("192.0.2.15")), f.env);
+    assert.equal(over.status, 429);
+    assert.equal(over.headers.get("retry-after"), "3600");
+    assert.deepEqual(await over.json(), { error: "network_daily_cap" });
+    assert.equal((await worker.fetch(authorizedRequest("/search?q=one", "GET", from("192.0.2.15")), f.env)).status, 200, "a cache hit is free");
+    assert.equal((await worker.fetch(authorizedRequest("/search?q=three", "GET", from("192.0.2.16")), f.env)).status, 200);
+  });
+  assert.equal(f.accountCaps.length, 3, "the refused search never took a seat");
+  const day = new Date().toISOString().slice(0, 10);
+  assert.equal(f.dailyQuotas.get(`${day}:s:${networkTag(f.env, networkOf("192.0.2.15"))}`), 2);
+});
+
+test("a search that finds no seat spends no search quota", async () => {
+  const f = fixture({ accounts: [] });
+  f.env.IP_SALT = "test-salt";
+  await withFetch(null, f.fetchTidal, async () => {
+    assert.equal((await worker.fetch(authorizedRequest("/search?q=x", "GET", { "CF-Connecting-IP": "192.0.2.15" }), f.env)).status, 503);
+  });
   assert.equal(f.dailyQuotas.size, 0);
+});
+
+test("UPSTREAM_RL: over a network's fair share a cache miss is busy (Retry-After 30) before any seat; hits and health still answer", async () => {
+  const f = fixture({ accounts: [liveAccount(), liveAccount(), liveAccount()], tidalResponse: async (url) => (url.includes("/search/")
+    ? new Response(JSON.stringify({ items: [{ id: 1, title: "x" }] }), { status: 200 })
+    : losslessResponse()) });
+  const keys = [];
+  let allow = true;
+  f.env.UPSTREAM_RL = { limit: async ({ key }) => { keys.push(key); return { success: allow }; } };
+  const ip = { "CF-Connecting-IP": "2001:db8:abcd:12:3456::1" };
+  await withFetch(null, f.fetchTidal, async () => {
+    assert.equal((await worker.fetch(authorizedRequest("/search?q=cached", "GET", ip), f.env)).status, 200);
+    allow = false;
+    for (const path of ["/search?q=fresh", "/stream/td:321"]) {
+      const r = await worker.fetch(authorizedRequest(path, "GET", ip), f.env);
+      assert.equal(r.status, 503, path);
+      assert.equal(r.headers.get("retry-after"), "30");
+      assert.deepEqual(await r.json(), { error: "busy" });
+    }
+    assert.equal((await worker.fetch(authorizedRequest("/search?q=cached", "GET", ip), f.env)).status, 200, "a cache hit takes no seat, so it is not limited");
+    assert.equal((await worker.fetch(new Request("https://relay.example/health"), f.env)).status, 200);
+  });
+  assert.equal(f.accountCaps.length, 1);
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(keys, ["2001:db8:abcd:0/56", "2001:db8:abcd:0/56", "2001:db8:abcd:0/56"], "keyed by network, consulted only on a cache miss");
+});
+
+test("UPSTREAM_RL refusing the hires lookup leaves hires unknown and still answers the stream", async () => {
+  let n = 0;
+  const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: aacWithMeta(() => new Response(JSON.stringify({ audioQuality: "HI_RES_LOSSLESS" }), { status: 200 })) });
+  f.env.UPSTREAM_RL = { limit: async () => ({ success: n++ === 0 }) }; // the playback call passes, the lookup does not
+  await withFetch(null, f.fetchTidal, async () => {
+    const r = await worker.fetch(authorizedRequest("/stream/td:42?aac=only"), f.env);
+    assert.equal(r.status, 200);
+    assert.equal("hires" in await r.json(), false);
+  });
+  assert.equal(metaCalls(f).length, 0);
+  assert.equal(f.accountCaps.length, 1);
 });
 
 test("search maps Tidal catalog entries to the relay contract", async () => {
