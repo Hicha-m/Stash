@@ -296,6 +296,30 @@ test("global daily stream cap allows requests to the cap and blocks the next one
   assert.equal(f.dailyQuotas.get(`${day}:${networkKey}`), 2);
 });
 
+test("cache hits never charge or hit the global cap; the network key is charged for every answer", async () => {
+  const expiry = Math.floor(Date.now() / 1000) + 1800;
+  const cachedFlac = JSON.stringify({ mimeType: "audio/flac", codecs: "flac", urls: [`https://cdn.example/t.flac?token=${expiry}~sig`] });
+  const f = fixture({ accounts: [liveAccount(), liveAccount()], tidalResponse: async () => playbackInfo("LOSSLESS", "application/vnd.tidal.bts", cachedFlac) });
+  f.env.GLOBAL_DAILY_CAP = "1";
+  f.env.NETWORK_DAILY_CAP = "10";
+  f.env.IP_SALT = "test-salt";
+  const day = new Date().toISOString().slice(0, 10);
+  await withFetch(null, f.fetchTidal, async () => {
+    assert.equal((await worker.fetch(authorizedRequest("/stream/td:321", "GET", { "CF-Connecting-IP": "192.0.2.15" }), f.env)).status, 200);
+    for (const ip of ["192.0.2.16", "192.0.2.17", "192.0.2.15"]) {
+      assert.equal((await worker.fetch(authorizedRequest("/stream/td:321", "GET", { "CF-Connecting-IP": ip }), f.env)).status, 200, `cache hit from ${ip}`);
+    }
+    const miss = await worker.fetch(authorizedRequest("/stream/td:999", "GET", { "CF-Connecting-IP": "192.0.2.16" }), f.env);
+    assert.equal(miss.status, 503);
+    assert.deepEqual(await miss.json(), { error: "global_daily_cap" });
+  });
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.accountCaps.length, 1, "the capped miss took no seat");
+  assert.equal(f.dailyQuotas.get(`${day}:global`), 1, "only the upstream answer charged global");
+  assert.equal(f.dailyQuotas.get(`${day}:n:${networkTag(f.env, networkOf("192.0.2.15"))}`), 2);
+  assert.equal(f.dailyQuotas.get(`${day}:n:${networkTag(f.env, networkOf("192.0.2.16"))}`), 1, "the refused miss charged nothing");
+});
+
 test("per-network daily cap is salted, shared across installs, and isolates other networks", async () => {
   const accounts = Array.from({ length: 4 }, (_, i) => ({ ...liveAccount(), id: `account-${i}` }));
   const f = fixture({ accounts, tidalResponse: async () => losslessResponse() });

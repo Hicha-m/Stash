@@ -45,10 +45,10 @@ export default {
         if (env.TIDAL_RELAY_PAUSED === "1") return paused();
         const quota = await admitStream(request, env);
         if (quota.denial) return quota.denial;
-        const response = await stream(streamMatch[1], request, env);
+        const { response, upstream } = await stream(streamMatch[1], request, env, quota);
         // Like Qobuz's answered-mint quota: successful streams and definitive
         // track misses count once per caller request; upstream/account failures do not.
-        if (response.status === 200 || response.status === 404) await spendStream(request, env, quota);
+        if (response.status === 200 || response.status === 404) await spendStream(request, env, quota, upstream);
         return response;
       }
       const dashMatch = path.match(/^\/dash\/td\/(\d+)(?:\.mpd|\/init\.mp4)$/);
@@ -222,18 +222,23 @@ async function searchUncached(query, cc, request, env, onSeat = async () => {}) 
 /** An upstream search refusal: uncached here, and a transient error (not a miss) to the app. */
 function searchError() { return json({ error: "upstream_error" }, 502); }
 
-async function stream(trackId, request, env) {
+/**
+ * @returns {{response: Response, upstream: boolean}} upstream = the answer cost Tidal a call
+ * (a cache miss), the only kind the global daily cap is charged for.
+ */
+async function stream(trackId, request, env, quota = {}) {
   const url = new URL(request.url);
   const aac = url.searchParams.get("aac") || "";
   const web = url.searchParams.get("web") === "1" ? "web" : "app";
   const key = `stream:${env.TIDAL_COUNTRY_CODE || "US"}:${trackId}:aac=${aac}:web=${web}`;
   const cached = await cachedJson(env, key);
-  if (cached) return cached;
-  if (await softOpenBlocks(env)) return busy();
-  if (!await upstreamAllowed(request, env)) return busy(UPSTREAM_RL_RETRY_AFTER);
+  if (cached) return { response: cached, upstream: false };
+  if (quota.globalFull) return { response: globalCapped(), upstream: false };
+  if (await softOpenBlocks(env)) return { response: busy(), upstream: false };
+  if (!await upstreamAllowed(request, env)) return { response: busy(UPSTREAM_RL_RETRY_AFTER), upstream: false };
   const response = await streamUncached(trackId, request, env);
   let body;
-  try { body = await response.clone().json(); } catch { return response; }
+  try { body = await response.clone().json(); } catch { return { response, upstream: true }; }
   if (response.status === 404 && body.error === "lossless_unavailable") {
     await cacheJson(env, key, response, RESPONSE_CACHE_TTL);
   } else if (response.status === 404 && body.error === "not_available") {
@@ -243,7 +248,7 @@ async function stream(trackId, request, env) {
     const ttl = expiresAt - now() - STREAM_CACHE_SAFETY;
     if (ttl > 0) await cacheJson(env, key, response, ttl);
   }
-  return response;
+  return { response, upstream: true };
 }
 
 async function streamUncached(trackId, request, env) {
@@ -652,6 +657,11 @@ async function bumpSeat(env, id) {
     WHERE id=?3`).bind(hour, day, id, now()).run().catch(() => {});
 }
 
+/**
+ * Per-network cap for every answered stream (cache hit or not). The global cap protects Tidal,
+ * so it only gates cache misses (stream() checks quota.globalFull): cheap cached answers from
+ * many networks must not be able to exhaust it and switch Tidal off for everyone.
+ */
 async function admitStream(request, env) {
   const day = new Date().toISOString().slice(0, 10);
   const network = networkOf(request.headers.get("CF-Connecting-IP"));
@@ -660,20 +670,20 @@ async function admitStream(request, env) {
   const used = await dailyUsed(env, day, keys);
   const globalCap = positive(env.GLOBAL_DAILY_CAP, 34667);
   const networkCap = positive(env.NETWORK_DAILY_CAP, 2000);
-  if ((used.global || 0) >= globalCap) {
-    return { denial: json({ error: "global_daily_cap" }, 503, { "Retry-After": "600" }) };
-  }
   if (tag && (used[`n:${tag}`] || 0) >= networkCap) {
     return { denial: json({ error: "network_daily_cap" }, 429, { "Retry-After": "3600" }) };
   }
-  return { day, tag };
+  return { day, tag, globalFull: (used.global || 0) >= globalCap };
 }
 
-async function spendStream(request, env, quota) {
+function globalCapped() { return json({ error: "global_daily_cap" }, 503, { "Retry-After": "600" }); }
+
+/** Network key for every answered stream; `global` only when the answer came from Tidal. */
+async function spendStream(request, env, quota, upstream) {
   const tag = quota.tag || networkTag(env, networkOf(request.headers.get("CF-Connecting-IP")));
-  const statements = [bumpDailyQuotaStmt(env.DB, quota.day, "global")];
+  const statements = upstream ? [bumpDailyQuotaStmt(env.DB, quota.day, "global")] : [];
   if (tag) statements.push(bumpDailyQuotaStmt(env.DB, quota.day, `n:${tag}`));
-  await env.DB.batch(statements);
+  if (statements.length) await env.DB.batch(statements);
 }
 
 /** Today's counters for `keys` in tidal_daily_quotas, as { key: n } (absent = 0). */
