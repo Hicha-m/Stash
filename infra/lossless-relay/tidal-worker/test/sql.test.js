@@ -108,6 +108,73 @@ test("real SQL: a playback 429 takes the same escalating path", async () => {
   assert.equal(db.prepare("SELECT endpoint FROM tidal_upstream_429_events").get().endpoint, "playbackinfo");
 });
 
+const playable = () => new Response(JSON.stringify({ audioQuality: "LOSSLESS", manifestMimeType: "application/vnd.tidal.bts",
+  manifest: Buffer.from(JSON.stringify({ codecs: "flac", urls: ["https://cdn.example/a.flac"] })).toString("base64") }), { status: 200 });
+const isAuth = (url) => url.startsWith("https://auth.tidal.com/");
+const refreshed = () => new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 });
+
+test("real SQL: a 401 that survives a successful refresh is an escalating strike, never a kill", async () => {
+  const db = database();
+  addSeat(db, "a");
+  const r = relay(db, (url) => (isAuth(url) ? refreshed() : new Response("{}", { status: 401 })));
+  const first = await r.call("/stream/td:1");
+  assert.equal(first.status, 503);
+  assert.deepEqual(await first.json(), { error: "busy" });
+  let s = seat(db, "a");
+  assert.equal(s.state, "live");
+  assert.equal(s.access_token, "fresh", "the refresh itself was kept");
+  assert.equal(s.strikes, 1);
+  assert.ok(Math.abs(s.cooling_until - now() - 120) <= 1);
+  db.prepare("UPDATE tidal_accounts SET cooling_until=?,last_call_at=0 WHERE id='a'").run(now() - 1);
+  assert.equal((await r.call(`/search?q=${Math.random()}`)).status, 503);
+  s = seat(db, "a");
+  assert.equal(s.state, "live", "two auth blips in a row still leave the seat in the pool");
+  assert.equal(s.strikes, 2);
+  assert.ok(Math.abs(s.cooling_until - now() - 240) <= 1);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM tidal_upstream_429_events").get().n, 0, "429 events are for real 429s only");
+});
+
+test("real SQL: a refresh rejected with invalid_grant/invalid_client retires the seat and the next serves", async () => {
+  for (const error of ["invalid_grant", "invalid_client"]) {
+    const db = database();
+    addSeat(db, "a");
+    addSeat(db, "b", { last_used_at: 10 });
+    const r = relay(db, (url) => {
+      if (isAuth(url)) return new Response(JSON.stringify({ error }), { status: 400 });
+      return r.calls.filter((u) => !isAuth(u)).length === 1 ? new Response("{}", { status: 401 }) : playable();
+    });
+    assert.equal((await r.call("/stream/td:1")).status, 200, error);
+    assert.equal(seat(db, "a").state, "dead");
+    assert.equal(seat(db, "a").dead_reason, "refresh_invalid");
+    assert.equal(seat(db, "a").refresh_lock_until, 0);
+    assert.equal(seat(db, "b").state, "live");
+  }
+});
+
+test("real SQL: a refresh failing any other way (5xx, network, other 4xx error) cools 300 s and never kills", async () => {
+  for (const auth of [() => new Response("", { status: 503 }), () => { throw new TypeError("network down"); },
+    () => new Response(JSON.stringify({ error: "temporarily_unavailable" }), { status: 400 })]) {
+    const db = database();
+    addSeat(db, "a");
+    const r = relay(db, (url) => (isAuth(url) ? auth() : new Response("{}", { status: 401 })));
+    assert.equal((await r.call("/stream/td:1")).status, 503);
+    const s = seat(db, "a");
+    assert.equal(s.state, "live");
+    assert.equal(s.strikes, 0);
+    assert.equal(s.refresh_lock_until, 0);
+    assert.ok(Math.abs(s.cooling_until - now() - 300) <= 1);
+  }
+});
+
+test("real SQL: an expired token whose refresh is rejected as invalid retires the seat before any API call", async () => {
+  const db = database();
+  addSeat(db, "a", { token_expires_at: 0 });
+  const r = relay(db, (url) => (isAuth(url) ? new Response(JSON.stringify({ error: "invalid_grant" }), { status: 401 }) : searchOk()));
+  assert.equal((await r.call("/search?q=x")).status, 503);
+  assert.equal(seat(db, "a").state, "dead");
+  assert.equal(r.calls.filter((u) => !isAuth(u)).length, 0);
+});
+
 test("migration 0008 drops cached not_available answers and keeps everything else", () => {
   const db = database({
     before(d) {

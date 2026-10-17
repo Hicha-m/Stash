@@ -195,8 +195,9 @@ async function searchUncached(query, cc, request, env, onSeat = async () => {}) 
     }
     if (r.status === 401) {
       const denial = await r.clone().json().catch(() => ({}));
-      if (denial.subStatus !== 4005) { await killAccount(env, selected.id, "401"); continue; }
-      return searchError();
+      if (denial.subStatus === 4005) return searchError();
+      await onSessionRefused(env, selected, "search");
+      return busy();
     }
     if (r.status >= 500) { await coolAccount(env, selected.id, 300); continue; }
     // Never a 200: search() caches 200s for 5 days and the app files an empty answer as
@@ -276,8 +277,8 @@ async function streamUncached(trackId, request, env) {
     if (data.status === 401) {
       const denial = await data.clone().json().catch(() => ({}));
       if (denial.subStatus === 4005) return json({ error: "not_available" }, 404);
-      await killAccount(env, account.id, "401");
-      continue;
+      await onSessionRefused(env, account, "playbackinfo");
+      return busy();
     }
     if (!data.ok) {
       if (data.status === 429) {
@@ -352,15 +353,29 @@ async function softOpenBlocks(env) {
   } catch { return false; }
 }
 
-/**
- * A Tidal 429 on a seat: log it and cool the seat for an escalating spell. Tidal's 429 is a
- * short burst limit with no Retry-After, so the first strike rests the seat
- * TIDAL_429_COOLDOWN_SECONDS (default 120); each strike while still "hot" doubles it, up to
- * TIDAL_429_COOLDOWN_MAX_SECONDS (default 960). A seat whose last cooldown ended more than
- * TIDAL_429_FORGIVE_SECONDS (default 1800) ago starts again at the first strike.
- */
+/** A Tidal 429 on a seat: log it (event row + warning) and strike the seat. */
 async function onUpstream429(env, account, endpoint) {
   await recordUpstream429(env, account, endpoint);
+  await strikeSeat(env, account);
+}
+
+/**
+ * A non-4005 401 that survived tidalFetch's refresh + retry. A strike, never a kill: the session
+ * was just refreshed (or could not be), so this is a Tidal auth blip, and killing on it retired
+ * the whole pool in a few requests. Only a refresh Tidal rejects as invalid retires a seat.
+ */
+async function onSessionRefused(env, account, endpoint) {
+  console.warn(`tidal_session_refused ${JSON.stringify({ account: String(account.id).slice(-4), endpoint })}`);
+  await strikeSeat(env, account);
+}
+
+/**
+ * Cools a seat for an escalating spell. Tidal's 429 is a short burst limit with no Retry-After,
+ * so the first strike rests the seat TIDAL_429_COOLDOWN_SECONDS (default 120); each strike while
+ * still "hot" doubles it, up to TIDAL_429_COOLDOWN_MAX_SECONDS (default 960). A seat whose last
+ * cooldown ended more than TIDAL_429_FORGIVE_SECONDS (default 1800) ago starts again at strike 1.
+ */
+async function strikeSeat(env, account) {
   const t = now();
   await env.DB.prepare(`UPDATE tidal_accounts SET
       strikes=CASE WHEN cooling_until<?1-?4 THEN 1 ELSE strikes+1 END,
@@ -431,6 +446,10 @@ async function trackHires(trackId, env, request) {
     const r = await tidalFetch(`/tracks/${trackId}?countryCode=${cc}`, account, env);
     if (r.status === 429) {
       await onUpstream429(env, seat, "metadata");
+      return undefined;
+    }
+    if (r.status === 401 && (await r.clone().json().catch(() => ({}))).subStatus !== 4005) {
+      await onSessionRefused(env, seat, "metadata");
       return undefined;
     }
     if (!r.ok) return undefined;
@@ -740,9 +759,12 @@ async function refreshAccount(account, env) {
   }
   const form = new URLSearchParams({ client_id: env.TIDAL_CLIENT_ID, refresh_token: claimed.refresh_token, grant_type: "refresh_token", scope: SCOPE });
   if (env.TIDAL_CLIENT_SECRET) form.set("client_secret", env.TIDAL_CLIENT_SECRET);
-  const r = await fetch(`${AUTH}/token`, { method: "POST", headers: oauthHeaders(), body: form });
-  if (!r.ok) {
+  const r = await fetch(`${AUTH}/token`, { method: "POST", headers: oauthHeaders(), body: form }).catch(() => null);
+  if (!r?.ok) {
     await env.DB.prepare("UPDATE tidal_accounts SET refresh_lock_until=0 WHERE id=? AND generation=?").bind(claimed.id, claimed.generation).run();
+    // Only Tidal's own OAuth verdict retires a seat; 5xx/network failures are cooled by the caller.
+    const error = r && (r.status === 400 || r.status === 401) ? (await r.json().catch(() => ({}))).error : null;
+    if (["invalid_grant", "invalid_client"].includes(error)) await killAccount(env, claimed.id, "refresh_invalid");
     return null;
   }
   const d = await r.json();
@@ -764,7 +786,12 @@ async function tidalFetch(path, account, env) {
     const error = await r.clone().json().catch(() => ({}));
     if (error.subStatus === 4005) return r;
     const fresh = await refreshAccount(account, env);
-    if (!fresh) return r;
+    // Refresh failed (lock contention, 5xx, network, or rejected and the seat retired): a seat-level
+    // failure like a Tidal 5xx, so callers cool it / try another seat instead of reading a 401.
+    if (!fresh) {
+      await coolAccount(env, account.id, 300);
+      return json({ error: "refresh_failed" }, 503);
+    }
     await bumpSeat(env, account.id); // the retry is a second upstream call on this seat
     r = await fetch(`${API}${path}`, { headers: tidalHeaders(fresh.access_token), signal: AbortSignal.timeout(9000) });
   }

@@ -543,7 +543,7 @@ test("a LOSSLESS answer to the HI_RES_LOSSLESS request is served as FLAC", async
   assert.equal(f.calls.length, 1);
 });
 
-test("an invalid-session account is quarantined and the next account serves", async () => {
+test("a 401 whose refresh cannot complete cools that seat (never kills it) and the next account serves", async () => {
   const accounts = [liveAccount(), { ...liveAccount(), id: "reserve-account", access_token: "reserve-token" }];
   const f = fixture({ accounts, tidalResponse: async (_url, options) => {
     if (options.headers.authorization === "Bearer test-tidal-access-token") return new Response("{}", { status: 401 });
@@ -553,8 +553,9 @@ test("an invalid-session account is quarantined and the next account serves", as
   await withFetch(null, f.fetchTidal, async () => {
     const response = await worker.fetch(authorizedRequest("/stream/td:321"), f.env);
     assert.equal(response.status, 200);
-    assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("state='dead'") && args[1] === "test-account"));
   });
+  assert.ok(f.dbWrites.some(({ sql, args }) => sql.includes("SET cooling_until=?") && args[1] === "test-account"));
+  assert.equal(f.dbWrites.some(({ sql }) => sql.includes("state='dead'")), false);
 });
 
 test("Tidal subStatus 4005 is a track-level not_available: no second seat, account never retired", async () => {
