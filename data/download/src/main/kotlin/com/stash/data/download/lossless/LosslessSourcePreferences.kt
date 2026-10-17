@@ -51,12 +51,15 @@ class LosslessSourcePreferences @Inject constructor(
     private val minQualityKey = stringPreferencesKey("min_quality")
     private val enabledKey = booleanPreferencesKey("enabled")
     private val customLosslessEndpointKey = stringPreferencesKey("custom_lossless_endpoint")
+    private val bitchordEndpointKey = stringPreferencesKey("bitchord_endpoint")
+    private val bitchordAccessTokenKey = stringPreferencesKey("bitchord_access_token")
     private val captchaCookieKey = stringPreferencesKey("squid_wtf_captcha_verified_at")
     private val captchaCookieSetAtKey = longPreferencesKey("squid_wtf_captcha_set_at_ms")
     private val bannerDismissedKey = booleanPreferencesKey("home_banner_dismissed")
     private val losslessOfflineDismissedKey = booleanPreferencesKey("lossless_offline_dismissed")
     private val qualityTierKey = stringPreferencesKey("lossless_quality_tier")
     private val youtubeFallbackKey = booleanPreferencesKey("youtube_fallback_enabled")
+    private val tidalAacFallbackKey = booleanPreferencesKey("tidal_aac_fallback")
     // Retained only so [purgeRetiredSourceKeys] can delete them from existing
     // installs; the antra and arcod sources were removed.
     private val antraSessionKey = stringPreferencesKey("antra_session_cookie")
@@ -118,6 +121,45 @@ class LosslessSourcePreferences @Inject constructor(
         }
     }
 
+    /**
+     * The user's own self-hosted BitChord Lossless Relay (Tidal), or null = the Tidal
+     * rung is off. Same normalisation as [customLosslessEndpoint] (https only, no
+     * query, no trailing slash), so a path prefix survives: BitChord's own
+     * `https://host/<ACCESS_TOKEN>` form works as-is. The APK ships no default —
+     * a BitChord server spends ONE person's Tidal account, so it is never shared
+     * through the signed runtime config. Deduped and fail-closed.
+     */
+    val bitchordEndpoint: Flow<String?> = context.losslessDataStore.data.map { prefs ->
+        prefs[bitchordEndpointKey]?.takeIf { it.isNotBlank() }
+    }.distinctUntilChanged().catch { emit(null) }
+
+    suspend fun bitchordEndpointNow(): String? = bitchordEndpoint.first()
+
+    suspend fun setBitchordEndpoint(raw: String?) {
+        val v = normaliseEndpoint(raw)
+        context.losslessDataStore.edit { prefs ->
+            if (v == null) prefs.remove(bitchordEndpointKey) else prefs[bitchordEndpointKey] = v
+        }
+    }
+
+    /**
+     * The server's `ACCESS_TOKEN`, sent as `X-Access-Token` — or null when the
+     * server runs open, or the token is already the endpoint's path prefix. A
+     * secret: never logged, never in the diagnostics bundle.
+     */
+    val bitchordAccessToken: Flow<String?> = context.losslessDataStore.data.map { prefs ->
+        prefs[bitchordAccessTokenKey]?.takeIf { it.isNotBlank() }
+    }.distinctUntilChanged().catch { emit(null) }
+
+    suspend fun bitchordAccessTokenNow(): String? = bitchordAccessToken.first()
+
+    suspend fun setBitchordAccessToken(raw: String?) {
+        val v = raw?.trim()?.takeIf { it.isNotEmpty() }
+        context.losslessDataStore.edit { prefs ->
+            if (v == null) prefs.remove(bitchordAccessTokenKey) else prefs[bitchordAccessTokenKey] = v
+        }
+    }
+
     suspend fun setEnabled(value: Boolean) {
         context.losslessDataStore.edit { prefs -> prefs[enabledKey] = value }
         // WAITING_FOR_LOSSLESS only makes sense under "lossless on +
@@ -136,6 +178,20 @@ class LosslessSourcePreferences @Inject constructor(
      * silent-fallback behaviour exactly; the legacy yt-dlp tier picker
      * (MAX/BEST/HIGH/NORMAL/LOW) governs the fallback's quality.
      */
+    /**
+     * Tidal's 320 kbps AAC when a song has no lossless version, for streaming and
+     * downloads. Default ON; OFF keeps Tidal FLAC-only.
+     */
+    val tidalAacFallback: Flow<Boolean> = context.losslessDataStore.data.map { prefs ->
+        prefs[tidalAacFallbackKey] ?: true
+    }
+
+    suspend fun tidalAacFallbackNow(): Boolean = tidalAacFallback.first()
+
+    suspend fun setTidalAacFallback(value: Boolean) {
+        context.losslessDataStore.edit { prefs -> prefs[tidalAacFallbackKey] = value }
+    }
+
     val youtubeFallbackEnabled: Flow<Boolean> = context.losslessDataStore.data.map { prefs ->
         prefs[youtubeFallbackKey] ?: false
     }
@@ -362,6 +418,7 @@ class LosslessSourcePreferences @Inject constructor(
          */
         val DEFAULT_PRIORITY: List<String> = listOf(
             "qbdlx_qobuz",
+            "tidal_bitchord",
             "squid_qobuz",
             "kennyy_qobuz",
         )

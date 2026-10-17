@@ -14,7 +14,9 @@
  *   GET /v1/status                            reachability probe for the Settings "Test" button
  *
  * State: D1 (accounts' rotation state, the shared mint cache, daily quotas).
- * Secrets: RELAY_KEY, RELAY_KEY_PREV (optional), QOBUZ_ACCOUNTS, QOBUZ_ACCOUNTS_EXTRA (optional). Deploy: see README.md.
+ * Secrets: RELAY_KEY, RELAY_KEY_PREV (optional), QOBUZ_ACCOUNTS, QOBUZ_ACCOUNTS_EXTRA and
+ *          QOBUZ_ACCOUNTS_RECOVERED, QOBUZ_ACCOUNTS_RECOVERED_2 and QOBUZ_ACCOUNTS_RECOVERED_3 (optional additive arrays).
+ *          Deploy: see README.md.
  */
 import { createHmac } from "node:crypto";
 import { verifyMint } from "./auth.js";
@@ -134,14 +136,14 @@ async function mint(request, url, env, fetchImpl, nowSec) {
     const accounts = parseAccounts(env);
     // Every label needs a D1 row BEFORE selection, or the LRU never reaches an account added to the
     // secret while the old ones are still under their caps. Once per isolate per secret value.
-    const accountSecretVersion = JSON.stringify([env.QOBUZ_ACCOUNTS || "", env.QOBUZ_ACCOUNTS_EXTRA || ""]);
+    const accountSecretVersion = JSON.stringify([env.QOBUZ_ACCOUNTS || "", env.QOBUZ_ACCOUNTS_EXTRA || "", env.QOBUZ_ACCOUNTS_RECOVERED || "", env.QOBUZ_ACCOUNTS_RECOVERED_2 || "", env.QOBUZ_ACCOUNTS_RECOVERED_3 || ""]);
     if (ensured.get(env.DB) !== accountSecretVersion) {
         await ensureAccounts(env.DB, accounts.map((a) => a.label));
         ensured.set(env.DB, accountSecretVersion);
     }
     let refusedBy = null; // an account that refused this track without naming the track
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        const label = await selectAccount(env.DB, nowSec, caps, refusedBy, accounts.map((a) => a.label));
+        const label = await selectAccount(env.DB, nowSec, caps, refusedBy, accounts.map((a) => a.label), caps.uncappedLabels, caps.noCooldownLabels);
         const account = accounts.find((a) => a.label === label);
         if (!account) break; // nothing live under its caps → 503 below (or the 404 a refusal already earned)
         const r = await mintFromQobuz(fetchImpl, account, trackId, formatId, nowSec);
@@ -252,6 +254,11 @@ function vars(env) {
         free404: n(env.NETWORK_FREE_404_DAILY, 50),
         hourly: n(env.ACCOUNT_HOURLY_CAP, 20),
         daily: n(env.ACCOUNT_DAILY_CAP, 200),
+        // These account labels bypass only the per-account hourly/daily selection limits.
+        // Global, install, network, and request-rate caps continue to apply.
+        uncappedLabels: String(env.ACCOUNT_UNCAPPED_LABELS || "").split(",").map((label) => label.trim()).filter(Boolean),
+        // Normally transient upstream errors cool an account for five minutes; these labels skip that delay.
+        noCooldownLabels: String(env.ACCOUNT_NO_COOLDOWN_LABELS || "").split(",").map((label) => label.trim()).filter(Boolean),
         // "0" is a legitimate headroom, so read it without n()'s > 0 rule.
         paceHeadroomPct: Number.isFinite(Number.parseInt(env.DOWNLOAD_PACE_HEADROOM_PCT, 10)) ? Number.parseInt(env.DOWNLOAD_PACE_HEADROOM_PCT, 10) : 10,
     };
@@ -259,7 +266,7 @@ function vars(env) {
 
 /** Account secrets are operator-written JSON arrays; malformed values degrade to no entries, not a 500 loop. */
 function parseAccounts(env) {
-    return [env.QOBUZ_ACCOUNTS, env.QOBUZ_ACCOUNTS_EXTRA].flatMap((raw) => {
+    return [env.QOBUZ_ACCOUNTS, env.QOBUZ_ACCOUNTS_EXTRA, env.QOBUZ_ACCOUNTS_RECOVERED, env.QOBUZ_ACCOUNTS_RECOVERED_2, env.QOBUZ_ACCOUNTS_RECOVERED_3].flatMap((raw) => {
         try {
             const a = JSON.parse(raw || "[]");
             return Array.isArray(a) ? a.filter((x) => x && x.label && x.token && x.app_id && x.app_secret) : [];

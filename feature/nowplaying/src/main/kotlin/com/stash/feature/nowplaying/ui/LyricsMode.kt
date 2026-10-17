@@ -20,6 +20,7 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.SyncAlt
@@ -354,6 +355,8 @@ internal fun LyricsMenuButton(
     /** The output playing now and its offset, or null while the output isn't known. */
     outputOffset: LyricsOutputOffset? = null,
     onOutputOffsetChange: (Long) -> Unit = {},
+    gettingWordSynced: Boolean = false,
+    onGetWordSynced: () -> Unit = {},
 ) {
     var open by remember { mutableStateOf(false) }
     var showOffsetDialog by remember { mutableStateOf(false) }
@@ -409,6 +412,14 @@ internal fun LyricsMenuButton(
                     toggleableState = ToggleableState(liveEnabled)
                 },
             )
+            if (items.wordSynced) {
+                DropdownMenuItem(
+                    text = { Text(if (gettingWordSynced) "Looking\u2026" else "Get word-synced lyrics") },
+                    leadingIcon = { Icon(Icons.Default.AutoAwesome, contentDescription = null) },
+                    enabled = !gettingWordSynced,
+                    onClick = { open = false; onGetWordSynced() },
+                )
+            }
             if (items.saveToFile) {
                 DropdownMenuItem(
                     text = { Text(if (savingToFile) "Saving…" else "Save with song file") },

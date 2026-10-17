@@ -118,6 +118,27 @@ class AggregatorRateLimiter @Inject constructor() {
             rateLimitTripsBreaker = false, // a Qobuz 429 = "slow down", not "broken"
         )
 
+        // Tidal via the BitChord relay: ONE shared Tidal account behind it, so
+        // background downloads go gently (1 token / 10 s, burst 2) and a 429 or
+        // repeated failures back off for long enough to not get the account flagged.
+        configs["tidal_bitchord"] = Config(
+            tokensPerSecond = 1.0 / 10.0,
+            burstCapacity = 2.0,
+            backoff429Ms = 120_000L,
+            circuitBreakAfter = 5,
+            circuitBreakDurationMs = 15 * 60_000L,
+        )
+
+        // Tidal 320 kbps AAC (TidalAacResolver): the same relay and account as
+        // tidal_bitchord, so the same gentle numbers in a bucket of its own.
+        configs["tidal_aac"] = Config(
+            tokensPerSecond = 1.0 / 10.0,
+            burstCapacity = 2.0,
+            backoff429Ms = 120_000L,
+            circuitBreakAfter = 5,
+            circuitBreakDurationMs = 15 * 60_000L,
+        )
+
         // JioSaavn is an opportunistic lossy fallback. A small burst keeps a
         // foreground tap responsive, while the steady rate prevents an album
         // sync from hammering the unofficial web endpoint. Any 429 or repeated

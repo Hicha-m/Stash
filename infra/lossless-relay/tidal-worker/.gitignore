@@ -1,0 +1,4 @@
+.dev.vars
+*.secret
+private-key.pem
+config-input.json

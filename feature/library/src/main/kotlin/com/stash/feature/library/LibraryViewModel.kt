@@ -281,9 +281,24 @@ class LibraryViewModel @Inject constructor(
      * Songs and [LibraryUiState.librarySongCount] the moment Remove download is tapped, not
      * when the file goes.
      */
+    @OptIn(ExperimentalCoroutinesApi::class)
     private val downloadedTracks: Flow<List<Track>> =
-        combine(musicRepository.getAllTracks(), downloadRemoval.hiddenIds) { tracks, hidden ->
-            if (hidden.isEmpty()) tracks else tracks.filterNot { it.id in hidden }
+        combine(
+            // Download mode: exactly the old downloads-only query. Stream-only: everything.
+            streamingPreference.enabled.flatMapLatest { streaming ->
+                if (streaming) musicRepository.getLibraryTracksIncludingOnline()
+                else musicRepository.getAllTracks()
+            },
+            streamingPreference.enabled,
+            downloadRemoval.hiddenIds,
+        ) { tracks, streaming, hidden ->
+            when {
+                hidden.isEmpty() -> tracks
+                // Stream-only: a staged removal keeps its row and just counts as online, so it
+                // only leaves the list under the Downloaded filter (should-fix #1).
+                streaming -> tracks.map { if (it.id in hidden) it.copy(isDownloaded = false) else it }
+                else -> tracks.filterNot { it.id in hidden }
+            }
         }
 
     /**
@@ -344,10 +359,25 @@ class LibraryViewModel @Inject constructor(
         .flowOn(Dispatchers.Default)
 
     /**
+     * [pipelineControls] with the Downloaded / Online filters read as All outside
+     * Stream-only mode. Those chips only exist in Stream-only, so a saved Online
+     * choice would otherwise empty the Songs list in Download mode with no chip to
+     * explain it. The saved choice itself is kept, so it comes back with Stream-only.
+     */
+    private val effectiveControls: Flow<ControlState> = combine(
+        pipelineControls,
+        streamingPreference.enabled,
+    ) { controls, streaming ->
+        val availability = controls.sourceFilter == SourceFilter.DOWNLOADED ||
+            controls.sourceFilter == SourceFilter.ONLINE
+        if (!streaming && availability) controls.copy(sourceFilter = SourceFilter.ALL) else controls
+    }
+
+    /**
      * Combined UI state that reacts to both data changes and user interactions.
      */
     val uiState: StateFlow<LibraryUiState> = combine(
-        pipelineControls,
+        effectiveControls,
         downloadedTracks,
         libraryDataFlow,
         artistCards,
@@ -386,11 +416,13 @@ class LibraryViewModel @Inject constructor(
             // Codec set kept in sync with com.stash.core.ui.components.FlacBadge
             // (and com.stash.data.download.lossless.AudioFormat.LOSSLESS_CODECS).
             // Worth duplicating — short list, short reach across modules.
-            SourceFilter.FLAC -> allTracks.filter { it.fileFormat.lowercase() in LOSSLESS_CODECS }
+            SourceFilter.FLAC -> allTracks.filter { it.isDownloaded && it.fileFormat.lowercase() in LOSSLESS_CODECS }
             // The batch-upgrade worklist: downloaded but still lossy.
             SourceFilter.NON_FLAC -> allTracks.filter {
                 it.isDownloaded && it.fileFormat.lowercase() !in LOSSLESS_CODECS
             }
+            SourceFilter.DOWNLOADED -> allTracks.filter { it.isDownloaded }
+            SourceFilter.ONLINE -> allTracks.filter { !it.isDownloaded }
         }
 
         // -- Apply client-side search filter --
@@ -477,6 +509,8 @@ class LibraryViewModel @Inject constructor(
         libraryState.copy(
             currentlyPlayingTrackId = playerState.currentTrack?.id,
         )
+    }.combine(streamingPreference.enabled) { libraryState, streaming ->
+        libraryState.copy(streamingMode = streaming)
     }.combine(artistImageDao.observeAll()) { libraryState, images ->
         // Overlay real artist photos (ArtistImageBackfillWorker output) keyed
         // by the SAME primary-artist name the Artists tab groups by. Artists
@@ -643,7 +677,15 @@ class LibraryViewModel @Inject constructor(
         viewModelScope.launch {
             // Streaming is always allowed: every track is playable, and a
             // not-downloaded one streams when it is reached.
-            val playable = allTracks
+            // Download mode: a downloaded tap queues only downloaded rows, so offline playback
+            // never walks into online neighbours. Stream-only: every row shown is playable, so
+            // the queue is exactly the list shown, whatever row was tapped.
+            val streaming = streamingPreference.enabled.first()
+            val playable = if (!streaming && track.isDownloaded) {
+                allTracks.filter { it.isDownloaded }
+            } else {
+                allTracks
+            }
             val index = playable.indexOfFirst { it.id == track.id }
             if (index >= 0) {
                 playerRepository.setQueue(playable, index, source = com.stash.core.model.PlaybackSource.Library)
@@ -844,6 +886,14 @@ class LibraryViewModel @Inject constructor(
             if (!playerRepository.shuffleLibrary()) {
                 _userMessages.tryEmit("Nothing downloaded to shuffle yet — download some songs first.")
             }
+        }
+    }
+
+    /** Shuffle exactly what Songs shows (Stream-only mode, where the list includes online rows). */
+    fun shuffleVisible(tracks: List<Track>) {
+        viewModelScope.launch {
+            if (tracks.isEmpty()) return@launch
+            playerRepository.setQueue(tracks.shuffled(), 0, source = com.stash.core.model.PlaybackSource.Library)
         }
     }
 

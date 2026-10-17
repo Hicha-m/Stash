@@ -74,7 +74,8 @@ switch (cmd) {
         const dir = mkdtempSync(join(tmpdir(), "lossless-config-"));
         writeFileSync(join(dir, "lossless.json"), bytes);
         writeFileSync(join(dir, "lossless.json.sig"), sign("sha256", bytes, priv).toString("base64"));
-        console.log(`publishing: ${text}`);
+        const preview = JSON.parse(text);
+        console.log(`publishing: updated_at=${preview.updated_at} relays=${preview.relays.map((r) => r.base).join(",") || "(none)"} tidal_relay_url=${preview.tidal_relay_url || "(unset)"} tidal_relay_token=${preview.tidal_relay_token ? "(present; redacted)" : "(unset)"}`);
         kvPut(KV_JSON, join(dir, "lossless.json"));
         kvPut(KV_SIG, join(dir, "lossless.json.sig"));
         console.log("uploaded. KV propagates within ~60 s; reading the live copy now (re-run `verify` if it is still the old one):");

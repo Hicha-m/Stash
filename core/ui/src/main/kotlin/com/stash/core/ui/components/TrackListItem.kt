@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.DownloadDone  
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -80,6 +81,7 @@ fun TrackListItem(
     isResolving: Boolean = false,
     selectionActive: Boolean = false,
     selected: Boolean = false,
+    showAvailabilityTag: Boolean = false,
 ) {
     val hasMoreButton = !selectionActive && onMoreClick != null
     // Inside a TrackRowFitScope the list shares one width reading and one text measurer; on its own
@@ -92,6 +94,7 @@ fun TrackListItem(
         )
         TrackListItemRow(
             track, onClick, modifier, isPlaying, onMoreClick, onLongPress, isResolving, selectionActive, selected, fit,
+            showAvailabilityTag = showAvailabilityTag,
         )
     } else {
         BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
@@ -100,6 +103,7 @@ fun TrackListItem(
             )
             TrackListItemRow(
                 track, onClick, Modifier, isPlaying, onMoreClick, onLongPress, isResolving, selectionActive, selected, fit,
+                showAvailabilityTag = showAvailabilityTag,
             )
         }
     }
@@ -119,6 +123,7 @@ private fun TrackListItemRow(
     selectionActive: Boolean,
     selected: Boolean,
     fit: TrackRowFit,
+    showAvailabilityTag: Boolean = false,
 ) {
     val extendedColors = StashTheme.extendedColors
     val primaryColor = MaterialTheme.colorScheme.primary
@@ -221,13 +226,20 @@ private fun TrackListItemRow(
                     )
                 }
             }
-            Text(
-                text = track.artist,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = track.artist,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                if (showAvailabilityTag) AvailabilityTag(track.isDownloaded)
+            }
         }
 
         Spacer(modifier = Modifier.width(SmallGap))
@@ -269,6 +281,17 @@ private fun TrackListItemRow(
             }
         }
     }
+}
+
+@Composable
+private fun AvailabilityTag(downloaded: Boolean) {
+    if (!downloaded) return
+    Icon(
+        imageVector = Icons.Default.DownloadDone,
+        contentDescription = "Downloaded",
+        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+        modifier = Modifier.size(14.dp),
+    )
 }
 
 // ── Previews ───────────────────────────────────────────────────────────────

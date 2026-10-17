@@ -38,6 +38,7 @@ import okio.sink
 @Singleton
 class LosslessUrlDownloader @Inject constructor(
     httpClient: OkHttpClient,
+    private val dashDownloader: DashFlacDownloader,
 ) {
     // Whole-file lossless fetches are large (a Hi-Res FLAC runs 70-140 MB). The
     // shared client's 30 s read timeout is an inter-byte stall limit — fine for
@@ -75,6 +76,16 @@ class LosslessUrlDownloader @Inject constructor(
         destination: File,
         onProgress: (bytesRead: Long, totalBytes: Long) -> Unit = { _, _ -> },
     ): Result<File> = withContext(Dispatchers.IO) {
+        // A DASH manifest (Tidal) is not the file: fetch its segments and remux.
+        if (source.isDash) {
+            return@withContext dashDownloader.download(
+                client = fetchClient,
+                mpdUrl = source.downloadUrl,
+                headers = source.downloadHeaders,
+                destination = destination,
+                onProgress = onProgress,
+            )
+        }
         val requestBuilder = Request.Builder().url(source.downloadUrl).get()
         for ((name, value) in source.downloadHeaders) {
             requestBuilder.header(name, value)

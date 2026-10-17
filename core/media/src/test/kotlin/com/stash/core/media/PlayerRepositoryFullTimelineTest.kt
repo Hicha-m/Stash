@@ -240,7 +240,7 @@ class PlayerRepositoryFullTimelineTest {
             codec = "flac",
         )
         coEvery {
-            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true)
+            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true, speculative = true)
         } returns resolved
         val replacement = slot<MediaItem>()
         every { controller.replaceMediaItem(3, capture(replacement)) } returns Unit
@@ -257,6 +257,7 @@ class PlayerRepositoryFullTimelineTest {
                 match { it.id == 3L },
                 allowYouTube = true,
                 allowYtDlp = true,
+                speculative = true,
             )
         }
         verify(exactly = 0) { controller.replaceMediaItem(0, any()) }
@@ -515,7 +516,7 @@ class PlayerRepositoryFullTimelineTest {
 
         assertThat(checkedPaths).containsExactly("/storage/music/local-next.flac")
         coVerify(exactly = 0) {
-            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true)
+            streamResolver.resolve(any(), any(), any(), any())
         }
         verify(exactly = 0) { controller.replaceMediaItem(any(), any()) }
     }

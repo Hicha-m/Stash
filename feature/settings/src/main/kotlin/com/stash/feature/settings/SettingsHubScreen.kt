@@ -157,11 +157,7 @@ fun SettingsHubScreen(
             .padding(bottom = bottomChromePadding()),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text(
-            text = "Settings",
-            style = MaterialTheme.typography.headlineSmall,
-            color = MaterialTheme.colorScheme.onSurface,
-        )
+        // No "Settings" title: the tab bar already says where you are.
         SupportBanner(onDonate = onDonate, onDonateCoDev = onDonateCoDev, onStar = onStar)
         SettingsSearchField(
             value = searchQuery,

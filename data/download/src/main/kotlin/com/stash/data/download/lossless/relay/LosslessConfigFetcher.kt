@@ -40,6 +40,9 @@ import okhttp3.Request
 @Serializable
 data class RelayEntry(val base: String, val priority: Int = 1)
 
+/** The Tidal (BitChord) server delivered by the signed config: an https base and its optional token. */
+data class TidalRelay(val base: String, val token: String?)
+
 @Serializable
 data class LosslessConfig(
     val v: Int = 1,
@@ -52,6 +55,15 @@ data class LosslessConfig(
      * config and is dead on every device within one cold start. Null → unsigned.
      */
     @SerialName("relay_key") val relayKey: String? = null,
+    /**
+     * Base URL of the owner-hosted BitChord Lossless Relay (Tidal rung), https
+     * only; normalised in [parse], so an http or junk value arrives as null. May
+     * carry the server's ACCESS_TOKEN as a path prefix. Null → the Tidal rung is
+     * off unless the user set their own server.
+     */
+    @SerialName("tidal_relay_url") val tidalRelayUrl: String? = null,
+    /** That server's ACCESS_TOKEN, sent as `X-Access-Token`. Optional; rotates like [relayKey]. */
+    @SerialName("tidal_relay_token") val tidalRelayToken: String? = null,
 )
 
 private val Context.losslessRelayConfigDataStore: DataStore<Preferences> by preferencesDataStore(
@@ -90,6 +102,11 @@ class LosslessConfigFetcher @Inject constructor(
     /** The current relay access key from the applied config; null when unsigned. */
     val relayKey: StateFlow<String?> = _relayKey.asStateFlow()
 
+    private val _tidalRelay = MutableStateFlow<TidalRelay?>(null)
+
+    /** The Tidal (BitChord) server from the signed config, or null. See [LosslessConfig.tidalRelayUrl]. */
+    val tidalRelay: StateFlow<TidalRelay?> = _tidalRelay.asStateFlow()
+
     private val _updatedAt = MutableStateFlow(0L)
     /** `updated_at` (unix seconds) of the applied config; 0 until one is loaded. For the diagnostics bundle. */
     val updatedAt: StateFlow<Long> = _updatedAt.asStateFlow()
@@ -117,7 +134,7 @@ class LosslessConfigFetcher @Inject constructor(
      */
     suspend fun loadCached() {
         val cached = readCache() ?: return
-        parse(cached)?.let { _relays.value = it.relays; _relayKey.value = it.relayKey; _updatedAt.value = it.updatedAt }
+        parse(cached)?.let { apply(it) }
     }
 
     /** Fetch + verify + apply. Returns true only when a fresh, valid config was applied. Never throws. */
@@ -140,12 +157,17 @@ class LosslessConfigFetcher @Inject constructor(
             Log.w(TAG, "lossless config older than the cached copy (${fresh.updatedAt} < $cachedUpdatedAt) — rejected")
             return@withContext false
         }
-        _relays.value = fresh.relays
-        _relayKey.value = fresh.relayKey
-        _updatedAt.value = fresh.updatedAt
+        apply(fresh)
         ioCatching("cache write") { context.losslessRelayConfigDataStore.edit { it[jsonKey] = text } }
         Log.i(TAG, "lossless config applied: ${fresh.relays.size} relay(s)")
         true
+    }
+
+    private fun apply(cfg: LosslessConfig) {
+        _relays.value = cfg.relays
+        _relayKey.value = cfg.relayKey
+        _tidalRelay.value = cfg.tidalRelayUrl?.let { TidalRelay(it, cfg.tidalRelayToken?.takeIf { t -> t.isNotBlank() }) }
+        _updatedAt.value = cfg.updatedAt
     }
 
     /** Load the cache, then refresh now and every [REFRESH_INTERVAL_MS] — [RETRY_INTERVAL_MS] after a failure. */
@@ -178,6 +200,7 @@ class LosslessConfigFetcher @Inject constructor(
             relays = cfg.relays
                 .mapNotNull { e -> LosslessSourcePreferences.normaliseEndpoint(e.base)?.let { RelayEntry(it, e.priority) } }
                 .sortedBy { it.priority },
+            tidalRelayUrl = LosslessSourcePreferences.normaliseEndpoint(cfg.tidalRelayUrl),
         )
     }.getOrNull()
 
@@ -214,6 +237,7 @@ class LosslessConfigFetcher @Inject constructor(
     internal suspend fun clearForTest() {
         _relays.value = emptyList()
         _relayKey.value = null
+        _tidalRelay.value = null
         context.losslessRelayConfigDataStore.edit { it.clear() }
     }
 

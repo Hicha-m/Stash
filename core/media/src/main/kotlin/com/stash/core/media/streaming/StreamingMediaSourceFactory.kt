@@ -7,6 +7,9 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSink
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.SimpleCache
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
 import com.stash.core.data.db.dao.TrackDao
@@ -75,6 +78,34 @@ class StreamingMediaSourceFactory @Inject constructor(
                     CacheDataSource.FLAG_BLOCK_ON_CACHE,
             )
         return DefaultMediaSourceFactory(cachedFactory)
+    }
+
+    /**
+     * A [DashMediaSource] for a Tidal MPD from the user's BitChord server
+     * ([TidalStreamResolver], [StreamUrl.isDash]) at [mpdUrl], keeping
+     * [mediaItem]'s id and metadata.
+     *
+     * Plain HTTP underneath — no [RefreshingDataSource] (that re-resolves a single
+     * progressive file at a byte offset; a DASH period re-fetches its own MPD and
+     * segments) and no [streamCache] (its keys are per-URI, and each segment URL
+     * is a one-off Tidal CDN signature). Redirects are followed: Tidal's CDN uses
+     * them, and every URL here came from the MPD the user's own server served.
+     *
+     * Nothing else is needed client-side: the server rewrites the MPD's
+     * `initialization` to its own signed `/dash/td/<id>/init.mp4`, which patches
+     * the fLaC box's zero sample rate that made FragmentedMp4Extractor fail.
+     */
+    fun createDashMediaSource(mediaItem: MediaItem, mpdUrl: String): MediaSource {
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent("Stash/0.9.26")
+            .setConnectTimeoutMs(10_000)
+            .setReadTimeoutMs(30_000)
+            .setAllowCrossProtocolRedirects(false)
+        val item = mediaItem.buildUpon()
+            .setUri(mpdUrl)
+            .setMimeType(MimeTypes.APPLICATION_MPD)
+            .build()
+        return DashMediaSource.Factory(httpFactory).createMediaSource(item)
     }
 
     /**

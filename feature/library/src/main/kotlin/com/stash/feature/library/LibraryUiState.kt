@@ -38,10 +38,13 @@ data class LibraryUiState(
 
     /** Total downloaded songs in the library (unfiltered) — drives the Shuffle hero count. */
     val librarySongCount: Int = 0,
+
+    /** Stream-only mode: Songs shows online rows too, and the Downloaded/Online filter is offered. */
+    val streamingMode: Boolean = false,
 )
 
 /** Tabs available in the library browser. LIKED sits between Songs and Playlists. */
-enum class LibraryTab { PLAYLISTS, TRACKS, LIKED, ARTISTS, ALBUMS }
+enum class LibraryTab { PLAYLISTS, TRACKS, LIKED, ARTISTS, ALBUMS, DEVICE }
 
 /** Source sift for the Liked subcategory: all likes, or one origin. */
 enum class LikedFilter { ALL, STASH, SPOTIFY, YOUTUBE }
@@ -56,8 +59,10 @@ enum class SortOrder { RECENT, ALPHABETICAL, MOST_PLAYED, DURATION }
  * of my tracks". When selected, only lossless-codec files (flac, alac,
  * wav, etc.) survive. [NON_FLAC] is the inverse — downloaded tracks
  * still on a lossy codec, i.e. the batch-upgrade worklist.
+ * [DOWNLOADED] and [ONLINE] split by whether the file is on this phone;
+ * they're offered only in Stream-only mode.
  */
-enum class SourceFilter { ALL, YOUTUBE, SPOTIFY, FLAC, NON_FLAC }
+enum class SourceFilter { ALL, YOUTUBE, SPOTIFY, FLAC, NON_FLAC, DOWNLOADED, ONLINE }
 
 /**
  * @property name           Display name of the artist.

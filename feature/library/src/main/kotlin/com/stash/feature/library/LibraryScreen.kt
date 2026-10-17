@@ -39,6 +39,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.Close
@@ -58,6 +59,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.PlaylistAddCheck
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Search
@@ -106,6 +108,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -134,6 +137,9 @@ import com.stash.core.ui.selection.SelectionState
 import com.stash.core.ui.theme.StashTheme
 import com.stash.core.common.extensions.pluralize
 import com.stash.core.ui.components.bottomChromePadding
+import com.stash.feature.library.allsongs.AllSongsViewModel
+import com.stash.feature.library.allsongs.OnThisDeviceSelectionBar
+import com.stash.feature.library.allsongs.OnThisDeviceTab
 
 /**
  * Library screen entry point. Injects the [LibraryViewModel] via Hilt
@@ -172,6 +178,11 @@ fun LibraryScreen(
     val likedTracks by viewModel.likedTracks.collectAsStateWithLifecycle()
     val likedFilter by viewModel.likedFilter.collectAsStateWithLifecycle()
     val likedSources by viewModel.likedSources.collectAsStateWithLifecycle()
+
+    // "On this device" (the folder scan): its own ViewModel, steered by this screen's search and sort.
+    val deviceViewModel: AllSongsViewModel = hiltViewModel()
+    LaunchedEffect(searchQuery) { deviceViewModel.setQuery(searchQuery) }
+    LaunchedEffect(state.sortOrder) { deviceViewModel.setSortOrder(state.sortOrder) }
 
     // Home's Liked card queued a focus before the tab switch: land on Liked.
     // The tab is ALSO handed to the content pager — on a cold restore the
@@ -245,8 +256,11 @@ fun LibraryScreen(
             state = state,
             searchQuery = searchQuery,
             importState = importState,
-            onShuffleLibrary = viewModel::shuffleLibrary,
+            onShuffleLibrary = {
+                if (state.streamingMode) viewModel.shuffleVisible(state.tracks) else viewModel.shuffleLibrary()
+            },
             onShuffleLiked = viewModel::shuffleLiked,
+            onShuffleDevice = deviceViewModel::shuffle,
             onTabSelected = viewModel::selectTab,
             onSearchQueryChanged = viewModel::setSearchQuery,
             onSortOrderChanged = viewModel::setSortOrder,
@@ -297,6 +311,14 @@ fun LibraryScreen(
             onOpenSync = onNavigateToSync,
             onOpenSearch = onNavigateToSearch,
             onOpenAccounts = onNavigateToAccounts,
+            deviceContent = {
+                OnThisDeviceTab(
+                    viewModel = deviceViewModel,
+                    selection = selection,
+                    alphabetical = state.sortOrder == SortOrder.ALPHABETICAL,
+                    onClearSearch = { viewModel.setSearchQuery("") },
+                )
+            },
         )
 
         // ── Selection chrome — meaningful on the Tracks and Liked tabs. Selection
@@ -313,6 +335,20 @@ fun LibraryScreen(
         // Batch "Remove download" deletes files that can take hours to fetch again (a whole
         // Select all, one mis-tap from the confirmed Delete): confirm it first (shared dialog).
         var confirmRemoveDownloads by remember { mutableStateOf<List<Track>?>(null) }
+        var confirmDownloadIds by remember { mutableStateOf<List<Long>?>(null) }
+        confirmDownloadIds?.let { ids ->
+            AlertDialog(
+                onDismissRequest = { confirmDownloadIds = null },
+                title = { Text("Download ${ids.size} songs?") },
+                text = { Text("This queues ${ids.size} downloads and can use a lot of data and storage.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.downloadSelected(ids); selection.clear(); confirmDownloadIds = null
+                    }) { Text("Download") }
+                },
+                dismissButton = { TextButton(onClick = { confirmDownloadIds = null }) { Text("Cancel") } },
+            )
+        }
         confirmRemoveDownloads?.let { tracks ->
             RemoveDownloadsConfirmDialog(
                 count = tracks.size,
@@ -342,7 +378,10 @@ fun LibraryScreen(
                 }
             } else {
                 SelectionAction("download", "Download", Icons.Default.Download) {
-                    viewModel.downloadSelected(selectedIds); selection.clear()
+                    // Only the rows that still need downloading, and a confirm past 100.
+                    val ids = selectedTracks.filter { !it.isDownloaded }.map { it.id }
+                    if (ids.size > 100) confirmDownloadIds = ids
+                    else { viewModel.downloadSelected(ids); selection.clear() }
                 }
             },
             SelectionAction("delete", "Delete", Icons.Default.Delete) {
@@ -363,6 +402,10 @@ fun LibraryScreen(
                 allIds = remember(activeSelectableTracks) { activeSelectableTracks.map { it.id } },
                 actions = selectionActions,
             )
+        }
+
+        if (state.activeTab == LibraryTab.DEVICE) {
+            OnThisDeviceSelectionBar(selection = selection, viewModel = deviceViewModel)
         }
 
         androidx.compose.material3.SnackbarHost(
@@ -413,7 +456,8 @@ fun LibraryScreen(
                 Column {
                     Text(
                         "${n} song${if (n != 1) "s" else ""} will be removed from your " +
-                            "library and deleted from disk.",
+                            "${n} song${if (n != 1) "s" else ""} will be removed from your library" +
+                            if (batchTracks.any { it.isDownloaded }) " and deleted from disk." else ".",
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
@@ -528,6 +572,7 @@ private fun LibraryContent(
     importState: com.stash.data.download.files.LocalImportState,
     onShuffleLibrary: () -> Unit,
     onShuffleLiked: () -> Unit,
+    onShuffleDevice: () -> Unit,
     onTabSelected: (LibraryTab) -> Unit,
     onSearchQueryChanged: (String) -> Unit,
     onSortOrderChanged: (SortOrder) -> Unit,
@@ -573,6 +618,8 @@ private fun LibraryContent(
     onOpenSync: () -> Unit = {},
     onOpenSearch: () -> Unit = {},
     onOpenAccounts: () -> Unit = {},
+    /** The "On this device" page (the folder scan); see OnThisDeviceTab. */
+    deviceContent: @Composable () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -615,29 +662,74 @@ private fun LibraryContent(
             }
         }
 
-        // Compact header: title + Import (+), search, and sort/filter icons —
-        // replaces the old heading row + the six stacked control bars.
+        // "On this device" opens from the header's disk icon, not a chip: it's a different place
+        // (files in folders you picked), not another view of the library. The disk icon (or Back)
+        // returns to the library page you came from.
+        val deviceTabActive = state.activeTab == LibraryTab.DEVICE
+        var lastLibraryTab by rememberSaveable { mutableStateOf(LibraryTab.TRACKS) }
+        LaunchedEffect(state.activeTab) {
+            if (state.activeTab != LibraryTab.DEVICE) lastLibraryTab = state.activeTab
+        }
+        androidx.activity.compose.BackHandler(enabled = deviceTabActive && !selection.isActive) {
+            onTabSelected(lastLibraryTab)
+        }
+
+        // Compact header: On this device, shuffle, Import (+), search, and sort/filter icons, on the
+        // right. No "Library" title: the tab bar already says where you are.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(start = 20.dp, end = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.End,
         ) {
-            Text(
-                text = "Library",
-                style = MaterialTheme.typography.headlineLarge,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.weight(1f),
-            )
             // Shuffle stays in the always-visible header so it's reachable even
             // once the hero has scrolled away. It shuffles what you're looking
             // at: the liked list on the Liked tab (issue #402 — it used to
             // shuffle the whole library there), the whole library elsewhere.
             val likedTabActive = state.activeTab == LibraryTab.LIKED
-            IconButton(onClick = if (likedTabActive) onShuffleLiked else onShuffleLibrary) {
+            IconButton(
+                onClick = { onTabSelected(if (deviceTabActive) lastLibraryTab else LibraryTab.DEVICE) },
+                modifier = Modifier.semantics { this.selected = deviceTabActive },
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .background(
+                            color = if (deviceTabActive) {
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                            } else {
+                                Color.Transparent
+                            },
+                            shape = CircleShape,
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Filled.Save,
+                        contentDescription = "On this device",
+                        tint = if (deviceTabActive) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            LocalContentColor.current
+                        },
+                    )
+                }
+            }
+            IconButton(
+                onClick = when {
+                    likedTabActive -> onShuffleLiked
+                    deviceTabActive -> onShuffleDevice
+                    else -> onShuffleLibrary
+                },
+            ) {
                 Icon(
                     Icons.Filled.Shuffle,
-                    contentDescription = if (likedTabActive) "Shuffle liked songs" else "Shuffle library",
+                    contentDescription = when {
+                        likedTabActive -> "Shuffle liked songs"
+                        deviceTabActive -> "Shuffle songs on this device"
+                        else -> "Shuffle library"
+                    },
                     tint = MaterialTheme.colorScheme.primary,
                 )
             }
@@ -704,7 +796,8 @@ private fun LibraryContent(
             )
         }
 
-        // -- Category chips (pinned): Songs / Playlists / Artists / Albums --
+        // -- Category chips (pinned): Songs / Playlists / Artists / Albums. None is lit while On
+        // this device (the header's disk icon) is open; a chip tap goes back to the library.
         val chipTabs = listOf(
             "Songs" to LibraryTab.TRACKS,
             "Liked" to LibraryTab.LIKED,
@@ -714,7 +807,7 @@ private fun LibraryContent(
         )
         com.stash.core.ui.components.CrispChipRow(
             chips = chipTabs.map { it.first },
-            selected = chipTabs.first { it.second == state.activeTab }.first,
+            selected = chipTabs.firstOrNull { it.second == state.activeTab }?.first.orEmpty(),
             onSelect = { label -> onTabSelected(chipTabs.first { it.first == label }.second) },
             modifier = Modifier.padding(vertical = 4.dp),
         )
@@ -726,9 +819,12 @@ private fun LibraryContent(
             LibrarySortFilterSheet(
                 sortOrder = state.sortOrder,
                 sourceFilter = state.sourceFilter,
-                showDuration = state.activeTab == LibraryTab.TRACKS,
+                showDuration = state.activeTab == LibraryTab.TRACKS || state.activeTab == LibraryTab.DEVICE,
                 // The source filter narrows Songs only; offered elsewhere it looked broken.
                 showSourceFilter = state.activeTab == LibraryTab.TRACKS,
+                showAvailabilityFilter = state.streamingMode,
+                // Scanned songs have no play counts.
+                showMostPlayed = state.activeTab != LibraryTab.DEVICE,
                 onSortSelected = onSortOrderChanged,
                 onFilterSelected = onSourceFilterChanged,
                 onDismiss = { sortFilterOpen = false },
@@ -737,7 +833,10 @@ private fun LibraryContent(
 
         // -- Content area --
         val anyServiceConnected = state.spotifyConnected || state.youTubeConnected
-        if (state.isLoading) {
+        if (deviceTabActive) {
+            // Outside the pager: swiping is for the library's own pages.
+            Box(modifier = Modifier.fillMaxSize().weight(1f)) { deviceContent() }
+        } else if (state.isLoading) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -867,6 +966,7 @@ private fun LibraryContent(
                         onClearFilters = clearSearch,
                         alphabetical = alphabetical,
                     )
+                    LibraryTab.DEVICE -> Unit // shown above, outside the pager
                 }
             }
         }
@@ -1067,7 +1167,8 @@ private fun LikedTab(
                 Column {
                     Text(
                         "\"${track.title}\" by ${track.artist} will be removed from " +
-                            "your library and deleted from disk.",
+                            if (track.isDownloaded) "your library and deleted from disk."
+                            else "your library.",
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
@@ -1178,7 +1279,7 @@ private fun GlassSearchBar(
 // ── Local import progress strip ─────────────────────────────────────────────
 
 /**
- * Compact banner that appears below the "Library" heading while
+ * Compact banner that appears below the Library header while
  * [LocalImportState] is non-Idle. Shows progress during a batch import,
  * a summary after Done, or an error + dismiss after Error. Hides
  * completely when [state] is [LocalImportState.Idle].
@@ -1790,6 +1891,11 @@ private fun TracksTab(
         return
     }
 
+    // Tag rows Offline/Online only when the list actually mixes both.
+    val mixed = remember(tracks) {
+        tracks.any { it.isDownloaded } && tracks.any { !it.isDownloaded }
+    }
+
     // Track selected for the context-menu bottom sheet (opened via the ⋮ now;
     // long-press enters multi-select instead).
     var selectedTrack by remember { mutableStateOf<Track?>(null) }
@@ -1829,6 +1935,7 @@ private fun TracksTab(
                         onLongPress = { if (!selection.isActive) selection.enter(track.id) },
                         selectionActive = selection.isActive,
                         selected = selection.isSelected(track.id),
+                        showAvailabilityTag = mixed,
                         onMoreClick = { selectedTrack = track },
                     )
                 }
@@ -1907,7 +2014,8 @@ private fun TracksTab(
                 Column {
                     Text(
                         "\"${track.title}\" by ${track.artist} will be removed from " +
-                            "your library and deleted from disk.",
+                            if (track.isDownloaded) "your library and deleted from disk."
+                            else "your library.",
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(

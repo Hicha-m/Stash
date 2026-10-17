@@ -58,7 +58,7 @@ export function bumpQuotaStmt(db, day, key, ip = null) {
  * side compares the OLD key. Atomic under concurrent invocations because D1 runs
  * one statement at a time. Returns the label, or null when nothing is eligible.
  */
-export async function selectAccount(db, nowSec, caps, exclude = null, labels = null) {
+export async function selectAccount(db, nowSec, caps, exclude = null, labels = null, uncappedLabels = null, noCooldownLabels = null) {
     const row = await db.prepare(`
 UPDATE accounts SET
   hour_n = CASE WHEN hour_key = ?2 THEN hour_n + 1 ELSE 1 END, hour_key = ?2,
@@ -66,13 +66,13 @@ UPDATE accounts SET
   last_used_at = ?1
 WHERE label = (
   SELECT label FROM accounts
-  WHERE state = 'live' AND cooling_until <= ?1
-    AND (hour_key != ?2 OR hour_n < ?4)
-    AND (day_key  != ?3 OR day_n  < ?5)
+  WHERE state = 'live' AND (cooling_until <= ?1 OR label IN (SELECT value FROM json_each(?9)))
+    AND (label IN (SELECT value FROM json_each(?8)) OR (hour_key != ?2 OR hour_n < ?4))
+    AND (label IN (SELECT value FROM json_each(?8)) OR (day_key  != ?3 OR day_n  < ?5))
     AND label IS NOT ?6
     AND (?7 IS NULL OR label IN (SELECT value FROM json_each(?7)))
   ORDER BY CASE WHEN ?6 IS NULL THEN last_used_at ELSE -last_used_at END ASC, label ASC LIMIT 1)
-RETURNING label`).bind(nowSec, hourKey(nowSec), dayKey(nowSec), caps.hourly, caps.daily, exclude, labels && JSON.stringify(labels)).first();
+RETURNING label`).bind(nowSec, hourKey(nowSec), dayKey(nowSec), caps.hourly, caps.daily, exclude, labels && JSON.stringify(labels), uncappedLabels?.length ? JSON.stringify(uncappedLabels) : null, noCooldownLabels?.length ? JSON.stringify(noCooldownLabels) : null).first();
     return row ? row.label : null;
 }
 

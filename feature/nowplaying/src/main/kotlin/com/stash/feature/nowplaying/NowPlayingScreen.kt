@@ -108,6 +108,7 @@ import coil3.compose.AsyncImagePainter
 import coil3.toBitmap
 import com.stash.core.model.RepeatMode
 import com.stash.core.model.isFlac
+import com.stash.core.model.isScannedSong
 import com.stash.core.ui.components.SaveToPlaylistSheet
 import com.stash.core.ui.components.SheetOptionRow
 import com.stash.core.ui.theme.LocalIsAmoledTheme
@@ -332,6 +333,8 @@ fun NowPlayingScreen(
     val liveLyricsEnabled by viewModel.liveLyricsBarEnabled.collectAsStateWithLifecycle()
     val lyricsSyncOffsetMs by viewModel.lyricsSyncOffsetMs.collectAsStateWithLifecycle()
     val lyricsOutputOffset by viewModel.lyricsOutputOffset.collectAsStateWithLifecycle()
+    val appleLyricsEnabled by viewModel.appleLyricsEnabled.collectAsStateWithLifecycle()
+    val upgradingLyricsTrackId by viewModel.upgradingLyricsTrackId.collectAsStateWithLifecycle()
     val reading = lyricsMode && track != null
     androidx.activity.compose.BackHandler(enabled = reading) { viewModel.onDismissLyrics() }
 
@@ -349,13 +352,15 @@ fun NowPlayingScreen(
     // Cast shows (pinned or as a ⋮ row) exactly where its button did: a phone with Play
     // Services, outside a Listen Together room (the two exclude each other, cast spec §3).
     val castSupported = castConnection != com.stash.core.media.cast.CastConnection.Unavailable
-    val actionCtx = remember(room != null, casting, postToCommunity != null, isDownloaded, castSupported) {
+    val isScannedSong = track?.isScannedSong == true
+    val actionCtx = remember(room != null, casting, postToCommunity != null, isDownloaded, castSupported, isScannedSong) {
         ActionContext(
             inRoom = room != null,
             casting = casting,
             communityAvailable = postToCommunity != null,
             isDownloaded = isDownloaded,
             castSupported = castSupported,
+            isScannedSong = isScannedSong,
         )
     }
     val castConnectingTo = (castConnection as? com.stash.core.media.cast.CastConnection.Connecting)?.deviceName
@@ -983,7 +988,13 @@ fun NowPlayingScreen(
                             val headerInk = npInk()
                             val headerAccent = npAccent(uiState.vibrantColor)
                             val headerLiked = uiState.currentTrack?.stashLikedAt != null
-                            val lyricsMenuItems = lyricsMenuItemsFor(lyricsState, lyricsSyncOffsetMs, canSaveToFile = track?.isDownloaded == true, outputKnown = lyricsOutputOffset != null)
+                            val lyricsMenuItems = lyricsMenuItemsFor(
+                                    lyricsState,
+                                    lyricsSyncOffsetMs,
+                                    canSaveToFile = track?.isDownloaded == true,
+                                    outputKnown = lyricsOutputOffset != null,
+                                    canGetWordSynced = uiState.currentTrackStored == true && appleLyricsEnabled,
+                                )
                             val savingLyrics = exportingLyricsTrackId != null
                             val rise = with(LocalDensity.current) { RiseDistance.roundToPx() }
                             val headerTextEnter = remember(this@AnimatedContent, rise) {
@@ -1026,12 +1037,15 @@ fun NowPlayingScreen(
                                     buttonSize = 48.dp,
                                     iconSize = 22.dp,
                                 )
-                                com.stash.core.ui.components.LikeButton(
-                                    isLiked = headerLiked,
-                                    onTap = { viewModel.onLikeTap() },
-                                    unlikedTint = headerInk.copy(alpha = 0.7f),
-                                    size = 26.dp,
-                                )
+                                // An All Songs file can't be liked (no library row): no heart.
+                                if (uiState.currentTrack?.isScannedSong != true) {
+                                    com.stash.core.ui.components.LikeButton(
+                                        isLiked = headerLiked,
+                                        onTap = { viewModel.onLikeTap() },
+                                        unlikedTint = headerInk.copy(alpha = 0.7f),
+                                        size = 26.dp,
+                                    )
+                                }
                                 LyricsMenuButton(
                                     items = lyricsMenuItems,
                                     liveEnabled = liveLyricsEnabled,
@@ -1042,6 +1056,8 @@ fun NowPlayingScreen(
                                     onOutputOffsetChange = { viewModel.setLyricsOutputOffsetMs(it) },
                                     savingToFile = savingLyrics,
                                     onSaveToFile = { viewModel.exportLyricsForCurrentTrack() },
+                                    gettingWordSynced = upgradingLyricsTrackId != null,           // new
+                                    onGetWordSynced = { viewModel.getWordSyncedLyricsForCurrentTrack() }, // new
                                     ink = headerInk,
                                 )
                             }
@@ -1354,8 +1370,8 @@ private fun TrackInfoBlock(
 
         // Like heart — floated to the trailing edge and vertically centred
         // against the title/artist block. The track's other actions live in
-        // the top row (pinned) or the ⋮ menu.
-        if (track != null) {
+        // the top row (pinned) or the ⋮ menu. None for an All Songs file (no library row).
+        if (track != null && !track.isScannedSong) {
             com.stash.core.ui.components.LikeButton(
                 isLiked = isLiked,
                 onTap = onLikeTap,
