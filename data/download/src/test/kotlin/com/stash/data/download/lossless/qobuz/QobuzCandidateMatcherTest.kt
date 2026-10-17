@@ -263,6 +263,36 @@ class QobuzCandidateMatcherTest {
         assertThat(yt(325, 326, version = "Live")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
     }
 
+    private fun byArtist(queryArtist: String, candArtist: String, candTitle: String = "Song", candVersion: String? = null, querySec: Long = 200, candSec: Int = 200) =
+        QobuzCandidateMatcher.confidence(
+            query = TrackQuery(artist = queryArtist, title = "Song", durationMs = querySec * 1000),
+            candTitle = candTitle, candArtist = candArtist, candIsrc = null, candDurationSec = candSec,
+            candStreamable = true, candVersion = candVersion,
+        )
+
+    @Test fun `an all-bracket artist name still matches itself`() {
+        assertThat(byArtist("[bsd.u]", "[bsd.u]")).isEqualTo(1.0f)
+    }
+
+    @Test fun `a short lead artist credited alone on the catalog matches the full credit`() {
+        assertThat(byArtist("Sia, Spencer Brown", "Sia")).isEqualTo(1.0f)
+        assertThat(byArtist("Air, Beth Hirsch", "Air")).isEqualTo(1.0f)
+        // Not a lead: a short name elsewhere in the credit still earns nothing extra.
+        assertThat(byArtist("Beth Hirsch, Air", "Air")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+    }
+
+    @Test fun `dotted and dashed names compare joined up`() {
+        assertThat(byArtist("Run–D.M.C., Jason Nevins", "Run-DMC & Jason Nevins")).isEqualTo(1.0f)
+    }
+
+    @Test fun `a named single or radio edit only passes when the length confirms it`() {
+        // Gladys Knight: the library's album cut is 4:39, the catalog's Single Version 3:55.
+        assertThat(byArtist("A", "A", candVersion = "Single Version", querySec = 279, candSec = 235)).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(byArtist("A", "A", candTitle = "Song (Radio Edit)", querySec = 279, candSec = 230)).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(byArtist("A", "A", candVersion = "Single Version", querySec = 235, candSec = 235)).isEqualTo(1.0f)
+        assertThat(byArtist("A", "A", candVersion = "Album Version", querySec = 279, candSec = 280)).isEqualTo(1.0f)
+    }
+
     @Test fun `accents fold on both sides, including decomposed catalog text`() {
         val decomposed = "Molécules" // e + combining acute, as some catalogs store it
         assertThat(score("Molécules", decomposed)).isEqualTo(1.0f)

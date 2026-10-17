@@ -1,6 +1,6 @@
 {
  "version": 1,
- "policy": "Labelled 2026-10 by claude-opus-5-5 (effort high). match = same song, artist and performance (remasters, same-recording mixes, radio/clean edits, compilations count); wrong_version = live/remix/acoustic/instrumental/sped-up/re-recorded/extended etc. the library song is not; wrong_song = other song, cover, or unrelated artist. Queries: owner's library (Spotify + YouTube Music rows, raw title/artist as the app sends them). Candidates: Deezer public search top 5 for 'artist title' (title_short as title, title_version as version), a stand-in for Qobuz/Tidal results.",
+ "policy": "Labelled 2026-10 by claude-opus-5-5 (effort high) under the app's version rules. match = same song, artist and performance (remasters, same-recording mixes, clean/explicit, compilations count); wrong_version = live/remix/acoustic/instrumental/sped-up/re-recorded etc. the library song is not, or an edit of clearly different length (owner: the cut you know or nothing), except that a YouTube row's length alone never counts (often the video's); wrong_song = other song, cover, or unrelated artist. Queries: owner's library (Spotify + YouTube Music rows, raw title/artist). Candidates: Deezer public search top 5 for 'artist title' (title_short as title, title_version as version).",
  "items": [
   {
    "qid": "q5175",

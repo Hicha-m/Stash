@@ -69,10 +69,7 @@ object QobuzCandidateMatcher {
         // minimum smaller-set size to avoid spurious 1-word matches
         // (e.g. an artist named "Love" matching every track with
         // "Love" in the artist string).
-        val artistSim = artistSimilarity(
-            normalize(query.artist),
-            normalize(candArtist),
-        )
+        val artistSim = queryArtistSimilarity(query.artist, candArtist)
 
         // Duration similarity. Skip the penalty when query duration is
         // unknown (Stash sometimes lacks duration for stub tracks).
@@ -113,8 +110,15 @@ object QobuzCandidateMatcher {
         // another album the same length proves nothing: a live take often runs like the studio cut.
         val durationConfirms = query.durationReliable && (query.durationMs ?: 0L) > 0 && candDurationSec > 0 &&
             durationFactor == 1.0f
+        // A named edit ("Single Version", "Radio Edit", "Short Version") the query doesn't name is a
+        // different cut of the same recording: the owner's rule is the cut the user knows or nothing,
+        // so it only passes when the length confirms it (an edit of the user's own length).
+        val candEditText = BRACKETED.findAll(candTitle).joinToString(" ") { it.value } + " " +
+            VersionWords.DASH_SUFFIX.find(candTitle)?.value.orEmpty() + " " + candVersion.orEmpty()
+        val namedEdit = EDIT_CUT.containsMatchIn(candEditText) && !EDIT_CUT.containsMatchIn(query.title)
         val versionFactor = when {
-            extraVersion.isEmpty() && missingVersion.isEmpty() -> 1.0f
+            extraVersion.isEmpty() && missingVersion.isEmpty() && !namedEdit -> 1.0f
+            extraVersion.isEmpty() && missingVersion.isEmpty() -> if (durationConfirms) 1.0f else VERSION_PENALTY
             durationConfirms && sameAlbum(query.album, candAlbum) -> VERSION_TIEBREAK
             else -> VERSION_PENALTY
         }
@@ -184,6 +188,45 @@ object QobuzCandidateMatcher {
     }
 
     private const val SAME_ALBUM_MIN = 0.6f
+
+    /** A cut of a recording: single/radio/short/edit versions. Not "Album Version" (the cut most libraries hold). */
+    private val EDIT_CUT = Regex(
+        "\\b(single (version|edit)|radio (version|edit|mix)|short (version|edit)|edit(ed)? version|\\bedit\\b|7\" version|45 version)",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * [artistSimilarity] on raw credits, with three gaps closed (each found by the labelled library set):
+     *  - a name that is all brackets ("[bsd.u]") normalised to nothing and matched nobody: its
+     *    bracket contents are used instead;
+     *  - the catalog credits only the lead artist ("Sia" for "Sia, Spencer Brown"), and a lead of
+     *    three letters or fewer never counted as a distinctive overlap: the lead artist named in
+     *    full on one side is now full credit;
+     *  - "Run–D.M.C." vs "Run-DMC", "U-Ziq" vs "µ-Ziq": dots and dashes inside a name are also
+     *    compared joined up ("rundmc"), and the better score wins.
+     */
+    private fun queryArtistSimilarity(queryArtist: String, candArtist: String): Float {
+        val q = artistWords(queryArtist)
+        val c = artistWords(candArtist)
+        if (q.isEmpty() || c.isEmpty()) return 0f
+        val plain = artistSimilarity(q, c)
+        if (plain >= 1f) return plain
+        val lead = if (leadArtist(queryArtist) == c || leadArtist(candArtist) == q) 1f else 0f
+        val joined = artistSimilarity(artistWords(INNER_JOIN.replace(queryArtist, "")), artistWords(INNER_JOIN.replace(candArtist, "")))
+        return maxOf(plain, lead, joined)
+    }
+
+    private fun artistWords(s: String): String =
+        normalize(s).ifEmpty { normalize(s.replace(Regex("[\\[\\]()]"), " ")) }
+
+    /** The first credited artist: "Sia, Spencer Brown" and "Sia & Chaka Khan" lead with "sia". */
+    private fun leadArtist(s: String): String =
+        artistWords(s.split(LEAD_SPLIT).first())
+
+    private val LEAD_SPLIT = Regex(",|&|\\s+(?:x|and|feat\\.?|ft\\.?|featuring|with)\\s+", RegexOption.IGNORE_CASE)
+
+    /** A dot or dash between two letters/digits: "D.M.C.", "Run-DMC", "U-Ziq". */
+    private val INNER_JOIN = Regex("(?<=[\\p{L}\\p{N}])[.\\-‐–](?=[\\p{L}\\p{N}])")
 
     private fun tokens(s: String): Set<String> = s.split(" ").filter { it.isNotEmpty() }.toSet()
 

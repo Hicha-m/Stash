@@ -42,7 +42,7 @@ object YouTubeSongTitle {
     /** Words that make a bracket, bar or dash part a version of the song rather than more title. */
     private val VERSION = Regex(
         "\\b(live|remix|mix|acoustic|unplugged|session|sessions|demo|instrumental|cover|edit|version|remaster(ed)?|mono|" +
-            "stereo|sped|slowed|reverb|piano|orchestral|a ?cappella|karaoke|extended|radio|club|dub|rework|bootleg|vip)\\b",
+            "stereo|sped|slowed|reverb|piano|orchestral|a ?cappella|karaoke|extended|radio|club|dub|rework|bootleg|vip|bonus)\\b",
         RegexOption.IGNORE_CASE,
     )
     private val CREDIT = Regex("^(feat|ft|with|prod|arr)\\b", RegexOption.IGNORE_CASE)

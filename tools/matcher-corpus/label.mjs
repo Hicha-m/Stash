@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const KEY_FILE = join(homedir(), ".stash", "anthropic_api_key.txt");
-const MODEL = "claude-opus-5-5";
+const MODEL = process.env.LABEL_MODEL || "claude-opus-5-5"; // LABEL_MODEL=claude-fable-5-1 for the re-check
 
 const SYSTEM = `You label test data for a music player's song matcher.
 
@@ -143,6 +143,15 @@ if (mode === "trial") {
   const batch = await client().messages.batches.create({ requests });
   writeFileSync(idFile, batch.id);
   console.log(`batch ${batch.id}: ${requests.length} requests, status ${batch.processing_status}`);
+} else if (mode === "batch-ids") {
+  // Re-label only the songs in <ids.json> (e.g. with LABEL_MODEL=claude-fable-5-1): node label.mjs batch-ids q.json c.json ids.json batch-id.txt
+  const [qPath, cPath, idsPath, idFile] = args;
+  const cands = load(cPath);
+  const ids = new Set(load(idsPath));
+  const requests = load(qPath).filter((q) => ids.has(q.qid) && cands[q.qid]?.length).map((q) => ({ custom_id: q.qid, params: params(q, cands[q.qid]) }));
+  const batch = await client().messages.batches.create({ requests });
+  writeFileSync(idFile, batch.id);
+  console.log(`batch ${batch.id} (${MODEL}): ${requests.length} requests, status ${batch.processing_status}`);
 } else if (mode === "collect") {
   const [idFile, qPath, cPath, out] = args;
   const c = client();
