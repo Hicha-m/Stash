@@ -1210,7 +1210,7 @@ class NowPlayingViewModel @Inject constructor(
         // An All Songs file isn't in the library: there is no row to delete or block, and its
         // words must never pick a library song of the same name to delete instead.
         if (track.isScannedSong) {
-            _userMessages.tryEmit("Songs from All Songs can't be deleted or blocked here.")
+            _userMessages.tryEmit("Songs from your folders can't be deleted or blocked here.")
             return
         }
         // A stream with no library row (transient id): both deletes were no-ops that still

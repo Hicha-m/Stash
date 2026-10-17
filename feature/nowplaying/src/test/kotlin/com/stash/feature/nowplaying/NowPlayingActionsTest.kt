@@ -260,7 +260,7 @@ class NowPlayingActionsTest {
         val shown = topRowActions(pins, ctx).leading + topRowActions(pins, ctx).trailing + menuActions(pins, ctx)
         for (hidden in SCANNED_HIDDEN) {
             assertTrue("$hidden must not show", hidden !in shown)
-            assertEquals("Not for songs from All Songs", hiddenReason(hidden, ctx))
+            assertEquals("Not for songs from your folders", hiddenReason(hidden, ctx))
         }
         // What still works on a file: its lyrics, the queue, a radio from it, its speed.
         assertTrue(NowPlayingAction.LYRICS in shown)

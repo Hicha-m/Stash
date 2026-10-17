@@ -164,7 +164,7 @@ internal fun editableActions(pins: Set<NowPlayingAction>, ctx: ActionContext): L
 internal fun hiddenReason(action: NowPlayingAction, ctx: ActionContext): String? = when {
     isActionAvailable(action, ctx) -> null
     ctx.inRoom && action != NowPlayingAction.POST_TO_COMMUNITY -> "Hidden while listening together"
-    ctx.isScannedSong && action in SCANNED_HIDDEN -> "Not for songs from All Songs"
+    ctx.isScannedSong && action in SCANNED_HIDDEN -> "Not for songs from your folders"
     action == NowPlayingAction.CAST -> "Cast isn't available on this phone"
     ctx.casting && action == NowPlayingAction.PLAYBACK_SPEED -> "Hidden while casting"
     else -> "Not available right now"
