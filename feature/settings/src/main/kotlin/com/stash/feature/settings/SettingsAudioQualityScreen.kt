@@ -189,6 +189,8 @@ fun SettingsAudioQualityScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
+                        // Unlimited for Ko-fi supporters: the claim, or the relays' "supporter" status.
+                        SupporterSection()
 
                         // Direct Qobuz — direct www.qobuz.com Hi-Res FLAC, the
                         // primary lossless source. The badge shows when no
