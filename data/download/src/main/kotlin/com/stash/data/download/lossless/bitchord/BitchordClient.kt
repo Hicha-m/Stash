@@ -60,6 +60,11 @@ internal data class BitchordStreamResponse(
     val bitDepth: Int = 0,
     val sampleRate: Int = 0,
     val bitrate: Int = 0,
+    /**
+     * Progressive answers only: when the Tidal URL itself expires, epoch SECONDS. Null when
+     * the relay doesn't say (older relays, DASH, whose MPD URL carries a signed `exp` instead).
+     */
+    val expiresAt: Long? = null,
 )
 
 /** A non-2xx body from the relay: `{error:"<code>"}`. */
@@ -392,7 +397,7 @@ class BitchordClient @Inject constructor(
             sampleRateHz = s.sampleRate,
             bitrateKbps = s.bitrate,
             coverArtUrl = match.artwork,
-            expiresAtMs = expiryFor(url),
+            expiresAtMs = expiryFor(url, s.expiresAt),
             confidence = match.confidence,
             trackId = match.tidalId,
             codec = if (aac) "aac" else "flac",
@@ -404,12 +409,17 @@ class BitchordClient @Inject constructor(
      * capped at [MAX_TTL_MS] either way. The cap matters for DASH: the MPD names
      * Tidal CDN segment URLs whose own signatures outlive neither the MPD's nor an
      * hour, and an unsigned (open-mode) server gives no `exp` at all.
+     *
+     * [expiresAtSec] is the body's `expiresAt` (a progressive Tidal CDN URL, which has no
+     * `exp` of ours): it lowers the result to [EXPIRY_MARGIN_MS] before Tidal's own expiry,
+     * so a cached URL is refreshed before it 403s mid-track.
      */
-    private fun expiryFor(url: HttpUrl): Long {
+    private fun expiryFor(url: HttpUrl, expiresAtSec: Long? = null): Long {
         val now = nowMs()
-        val cap = now + MAX_TTL_MS
-        val exp = url.queryParameter("exp")?.toDoubleOrNull()?.toLong()?.times(1000L) ?: return cap
-        return minOf(exp, cap)
+        val signed = url.queryParameter("exp")?.toDoubleOrNull()?.toLong()?.times(1000L)
+        val cap = minOf(now + MAX_TTL_MS, signed ?: Long.MAX_VALUE)
+        val upstream = expiresAtSec?.takeIf { it > 0 }?.let { it * 1000L - EXPIRY_MARGIN_MS } ?: return cap
+        return minOf(cap, upstream)
     }
 
     private fun confidence(query: TrackQuery, t: BitchordTrack): Float =
@@ -481,6 +491,8 @@ class BitchordClient @Inject constructor(
         const val MAX_BODY_BYTES = 1L * 1024 * 1024
         /** Below upstream's 1 h signature so the cache's margin never serves a dead URL. */
         const val MAX_TTL_MS = 50 * 60_000L
+        /** How long before a progressive answer's `expiresAt` the URL is treated as dead. */
+        const val EXPIRY_MARGIN_MS = 60_000L
         val LOSSLESS_TIERS = setOf("LOSSLESS", "HI_RES_LOSSLESS")
 
         /** A confident match is trusted this long before `/search` runs again. */

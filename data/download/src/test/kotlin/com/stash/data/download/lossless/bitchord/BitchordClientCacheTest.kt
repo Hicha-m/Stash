@@ -247,6 +247,30 @@ class BitchordClientCacheTest {
         assertThat(streams.get()).isEqualTo(2)
     }
 
+    @Test fun `a progressive expiresAt lowers the stream expiry to a minute before it`() = runBlocking {
+        val tenMin = now / 1000 + 600
+        streamReply = { ok("""{"url":"https://cdn.example/a.flac","codec":"flac","manifest":"none","expiresAt":$tenMin}""") }
+        val soon = client.lookup(query) as TidalLookup.Found
+        assertThat(soon.stream.expiresAtMs).isEqualTo(tenMin * 1000 - BitchordClient.EXPIRY_MARGIN_MS)
+
+        // Later than the cap: the cap still wins.
+        val days = now / 1000 + 86_400
+        streamReply = { ok("""{"url":"https://cdn.example/a.flac","codec":"flac","manifest":"none","expiresAt":$days}""") }
+        val late = client.lookup(query) as TidalLookup.Found
+        assertThat(late.stream.expiresAtMs).isEqualTo(now + BitchordClient.MAX_TTL_MS)
+    }
+
+    @Test fun `no expiresAt keeps the signed exp or the cap`() = runBlocking {
+        val plain = client.lookup(query) as TidalLookup.Found
+        assertThat(plain.stream.expiresAtMs).isEqualTo(now + BitchordClient.MAX_TTL_MS)
+
+        val exp = now / 1000 + 300
+        streamReply = { ok("""{"url":"https://relay.example/dash/td/1.mpd?exp=$exp&sig=x","codec":"flac","manifest":"dash"}""") }
+        val dash = client.lookup(query) as TidalLookup.Found
+        assertThat(dash.stream.isDash).isTrue()
+        assertThat(dash.stream.expiresAtMs).isEqualTo(exp * 1000)
+    }
+
     @Test fun `concurrent identical lookups share one request`() = runBlocking {
         val gate = CountDownLatch(1)
         searchReply = { gate.await(5, TimeUnit.SECONDS); ok(SEARCH_HIT) }
