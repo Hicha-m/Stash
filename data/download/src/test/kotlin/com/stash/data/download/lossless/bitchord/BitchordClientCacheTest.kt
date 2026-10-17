@@ -6,6 +6,7 @@ import com.stash.core.data.db.entity.TidalMatchEntity
 import com.stash.data.download.lossless.LosslessSourcePreferences
 import com.stash.data.download.lossless.TrackQuery
 import com.stash.data.download.lossless.relay.LosslessConfigFetcher
+import com.stash.data.download.lossless.relay.RelaySigner
 import com.stash.data.download.lossless.relay.TidalRelay
 import io.mockk.coEvery
 import io.mockk.every
@@ -73,7 +74,7 @@ class BitchordClientCacheTest {
         val config: LosslessConfigFetcher = mockk {
             every { tidalRelay } returns MutableStateFlow<TidalRelay?>(null)
         }
-        client = BitchordClient(OkHttpClient(), prefs, config, dao)
+        client = BitchordClient(OkHttpClient(), prefs, config, dao, RelaySigner(config))
         client.nowMs = { now }
     }
 
