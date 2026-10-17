@@ -236,6 +236,31 @@ test("refusalNamesTrack: catalog miss and Track/Sample/Format codes name the tra
     }
 });
 
+test("a transient upstream failure costs the caller's network one unit per failed Qobuz call; a refusal before any call costs nothing", async () => {
+    const e = env({ IP_SALT: "salt-1" });
+    const ip = "2001:db8:aa:bb00::1";
+    assert.equal((await handle(mintReq(42, 27, { ip }), e, qobuz([500, ""], [500, ""]), NOW)).status, 503);
+    const net = () => e.DB.raw.prepare("SELECT key, n FROM quota WHERE key LIKE 'n:%' OR key LIKE 'w:%' ORDER BY key").all().map((r) => r.n);
+    assert.deepEqual(net(), [2, 2]); // two failed calls: the /56's n: and the /48's w:
+    assert.equal(e.DB.raw.prepare("SELECT COUNT(*) AS c FROM quota WHERE key = 'global' OR key LIKE 'i:%'").get().c, 0);
+    // Both accounts now cool: the next request is refused before any Qobuz call and costs nothing.
+    assert.equal((await handle(mintReq(43, 27, { ip }), e, qobuz(), NOW + 10)).status, 503);
+    assert.deepEqual(net(), [2, 2]);
+    // A transient then a success: one unit for the failure, one for the answer.
+    const s = env({ IP_SALT: "salt-1" });
+    assert.equal((await handle(mintReq(44, 27), s, qobuz([500, ""], [200, GOOD]), NOW)).status, 200);
+    assert.equal(s.DB.raw.prepare("SELECT n FROM quota WHERE key LIKE 'n:%'").get().n, 2);
+});
+
+test("a network that keeps triggering transient failures meets its daily cap: 429, and it can no longer cool the pool", async () => {
+    const e = env({ IP_SALT: "salt-1", NETWORK_DAILY_CAP: "3" });
+    const q = qobuz(...Array(10).fill([500, ""]));
+    const statuses = [];
+    for (let i = 0; i < 3; i++) statuses.push((await handle(mintReq(42 + i, 27, { install: `cooler-id-${i}`, ts: NOW + i * 400 }), e, q, NOW + i * 400)).status);
+    assert.deepEqual(statuses, [503, 503, 429]); // 2 + 2 units ≥ 3
+    assert.equal(q.calls.length, 4);
+});
+
 test("every account failing transiently → 503 with Retry-After after at most two attempts; both cool; the next request is a 503 with no Qobuz call", async () => {
     const e = env(); const q = qobuz([500, ""], [500, ""], [200, GOOD]);
     const r = await handle(mintReq(42, 27), e, q, NOW);

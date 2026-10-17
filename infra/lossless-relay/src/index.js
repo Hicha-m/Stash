@@ -23,7 +23,7 @@ import { verifyMint } from "./auth.js";
 import { mintFromQobuz } from "./qobuz.js";
 import {
     getCached, putCachedStmt, readQuota, readQuotas, bumpQuotaStmt,
-    selectAccount, ensureAccounts, coolAccount, coolAccountStmt, killAccount, prune, dayKey,
+    selectAccount, ensureAccounts, coolAccountStmt, killAccount, prune, dayKey,
 } from "./db.js";
 
 /** The lossless formats the client asks for (LosslessQualityTier → 6 / 7 / 27). Data Saver's 5 (MP3 320) is answered 404 below. */
@@ -177,7 +177,9 @@ async function mint(request, url, env, fetchImpl, nowSec) {
             return r.kind === "ok" ? ok(r.url, r.formatId, r.bitDepth, r.sampleRateHz, "MISS") : json({ error: "not_available" }, 404);
         }
         if (r.kind === "dead") await killAccount(env.DB, label, r.reason);
-        else await coolAccount(env.DB, label, nowSec + TRANSIENT_COOL_S);
+        // A transient reached Qobuz and cools an account, so it costs the caller's network one unit
+        // (2026-10-17 audit: free, a network could keep the pool cooling at no cost to itself).
+        else await env.DB.batch([coolAccountStmt(env.DB, label, nowSec + TRANSIENT_COOL_S), ...networkStmts(env.DB, day, keys)]);
     }
     if (refusedBy) {
         // The one refusal we got stands: answer it as before (404, quota spent) rather than 503.
