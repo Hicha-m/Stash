@@ -20,6 +20,7 @@ export default {
       env.DB.prepare("DELETE FROM tidal_hires_cache WHERE checked_at <= ?").bind(now() - HIRES_TTL),
       env.DB.prepare("DELETE FROM tidal_response_cache WHERE expires_at <= ?").bind(now()),
       env.DB.prepare("DELETE FROM tidal_upstream_429_events WHERE occurred_at < ?").bind(now() - 30 * 86400),
+      env.DB.prepare("DELETE FROM tidal_device_auth WHERE expires_at <= ?").bind(now()),
     ]);
   },
   async fetch(request, env) {

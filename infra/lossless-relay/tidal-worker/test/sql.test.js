@@ -175,6 +175,16 @@ test("real SQL: an expired token whose refresh is rejected as invalid retires th
   assert.equal(r.calls.filter((u) => !isAuth(u)).length, 0);
 });
 
+test("real SQL: the hourly job prunes expired device grants and keeps pending ones", async () => {
+  const db = database();
+  const put = db.prepare("INSERT INTO tidal_device_auth(device_code,user_code,expires_at) VALUES(?,?,?)");
+  put.run("old", "OLD", now() - 1);
+  put.run("edge", "EDGE", now());
+  put.run("live", "LIVE", now() + 300);
+  await worker.scheduled({}, { DB: d1(db) });
+  assert.deepEqual(db.prepare("SELECT device_code FROM tidal_device_auth").all().map((r) => r.device_code), ["live"]);
+});
+
 test("migration 0008 drops cached not_available answers and keeps everything else", () => {
   const db = database({
     before(d) {
