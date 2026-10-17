@@ -134,8 +134,8 @@ test("real SQL: a 401 that survives a successful refresh is an escalating strike
   assert.equal(db.prepare("SELECT COUNT(*) n FROM tidal_upstream_429_events").get().n, 0, "429 events are for real 429s only");
 });
 
-test("real SQL: a refresh rejected with invalid_grant/invalid_client retires the seat and the next serves", async () => {
-  for (const error of ["invalid_grant", "invalid_client"]) {
+test("real SQL: a refresh rejected with invalid_grant retires the seat and the next serves", async () => {
+  for (const error of ["invalid_grant"]) {
     const db = database();
     addSeat(db, "a");
     addSeat(db, "b", { last_used_at: 10 });
@@ -151,9 +151,11 @@ test("real SQL: a refresh rejected with invalid_grant/invalid_client retires the
   }
 });
 
-test("real SQL: a refresh failing any other way (5xx, network, other 4xx error) cools 300 s and never kills", async () => {
+test("real SQL: a refresh failing any other way (5xx, network, other 4xx error, invalid_client) cools 300 s and never kills", async () => {
   for (const auth of [() => new Response("", { status: 503 }), () => { throw new TypeError("network down"); },
-    () => new Response(JSON.stringify({ error: "temporarily_unavailable" }), { status: 400 })]) {
+    () => new Response(JSON.stringify({ error: "temporarily_unavailable" }), { status: 400 }),
+    // invalid_client is the shared client credentials, not this seat: never a reason to retire seats.
+    () => new Response(JSON.stringify({ error: "invalid_client" }), { status: 401 })]) {
     const db = database();
     addSeat(db, "a");
     const r = relay(db, (url) => (isAuth(url) ? auth() : new Response("{}", { status: 401 })));

@@ -790,9 +790,12 @@ async function refreshAccount(account, env) {
   const r = await fetch(`${AUTH}/token`, { method: "POST", headers: oauthHeaders(), body: form }).catch(() => null);
   if (!r?.ok) {
     await env.DB.prepare("UPDATE tidal_accounts SET refresh_lock_until=0 WHERE id=? AND generation=?").bind(claimed.id, claimed.generation).run();
-    // Only Tidal's own OAuth verdict retires a seat; 5xx/network failures are cooled by the caller.
+    // Only Tidal's verdict on THIS seat's grant retires it; 5xx/network failures are cooled by the caller.
+    // invalid_client is about the shared client credentials, the same for every seat: retiring on it would
+    // take the whole pool down one seat at a time, so it only cools (and logs) like a transient failure.
     const error = r && (r.status === 400 || r.status === 401) ? (await r.json().catch(() => ({}))).error : null;
-    if (["invalid_grant", "invalid_client"].includes(error)) await killAccount(env, claimed.id, "refresh_invalid");
+    if (error === "invalid_grant") await killAccount(env, claimed.id, "refresh_invalid");
+    else if (error === "invalid_client") console.error("tidal refresh: invalid_client (shared client credentials?)");
     return null;
   }
   const d = await r.json();
