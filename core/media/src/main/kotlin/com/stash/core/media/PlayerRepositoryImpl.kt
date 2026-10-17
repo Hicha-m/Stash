@@ -2604,8 +2604,12 @@ class PlayerRepositoryImpl @Inject constructor(
             // prepare() call is a no-op when the player is already READY and
             // rescues the IDLE case automatically.
             // Only when it should be playing: a paused, unprepared restore (after Listen Together) is IDLE on purpose.
+            // And only when no error is pending: an item that fails to open (a local file deleted outside the
+            // app) lands here IDLE with playerError set, just before onPlayerError. Preparing it again loads
+            // it a second time; that second failure arrives after onPlayerError has skipped ahead and is
+            // blamed on the next song, which then gets skipped too (or the queue stops if it was the last).
             if (controller.playbackState == Player.STATE_IDLE && controller.currentMediaItem != null &&
-                controller.playWhenReady
+                controller.playWhenReady && controller.playerError == null
             ) {
                 Log.w(TAG, "onMediaItemTransition landed in STATE_IDLE — defensive prepare()")
                 controller.prepare()
