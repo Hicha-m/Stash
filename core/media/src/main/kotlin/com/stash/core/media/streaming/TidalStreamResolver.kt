@@ -47,7 +47,7 @@ class TidalStreamResolver @Inject constructor(
         album = album.takeIf { it.isNotBlank() },
         isrc = isrc?.takeIf { it.isNotBlank() },
         durationMs = durationMs,
-    ).forLibrarySource(source)
+    ).forLibrarySource(source, musicVideoType)
 
     suspend fun resolve(track: TrackEntity): StreamUrl? {
         if (!client.isConfigured()) return null

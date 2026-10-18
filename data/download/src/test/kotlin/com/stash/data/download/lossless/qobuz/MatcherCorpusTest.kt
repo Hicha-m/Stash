@@ -15,8 +15,9 @@ import java.util.zip.GZIPInputStream
  * catalog search results for it, and a verdict per result (match / wrong_version / wrong_song /
  * unsure) labelled by Claude under the app's version rules (see the corpus's `policy` field).
  *
- * The matcher picks like the sources do: the highest-scoring candidate at or above
- * [QobuzCandidateMatcher.MIN_CONFIDENCE]. Per song the outcome is one of:
+ * The matcher picks like the sources do ([QobuzCandidateMatcher.pickBest]): the highest-scoring
+ * candidate at or above [QobuzCandidateMatcher.MIN_CONFIDENCE], a tie going to the closest length.
+ * Per song the outcome is one of:
  *  - correct: it picked a "match";
  *  - wrong accept: it picked a wrong version or a wrong song (the user gets the wrong audio);
  *  - miss: it picked nothing (or nothing it should) although a "match" was listed;
@@ -65,7 +66,11 @@ class MatcherCorpusTest {
         return Json { ignoreUnknownKeys = true }.decodeFromString(text)
     }
 
-    /** The query the app builds for this library row (forLibrarySource: YouTube rows parsed, length unreliable). */
+    /**
+     * The query the app builds for this library row (forLibrarySource: YouTube rows parsed; length
+     * unreliable unless the row has an album, which marks an official audio upload; the corpus
+     * carries no stored video class).
+     */
     private fun query(q: Query, source: String) = TrackQuery(
         artist = q.artist,
         title = q.title,
@@ -87,11 +92,7 @@ class MatcherCorpusTest {
 
     private fun outcome(item: Item): Pair<Outcome, Candidate?> {
         val q = query(item.query, item.source)
-        val best = item.candidates
-            .map { it to score(q, it) }
-            .filter { it.second >= QobuzCandidateMatcher.MIN_CONFIDENCE }
-            .maxByOrNull { it.second }
-            ?.first
+        val best = QobuzCandidateMatcher.pickBest(q, item.candidates.map { it to score(q, it) }) { it.durationSec }?.first
         val hasMatch = item.candidates.any { it.verdict == "match" }
         return when {
             best == null && hasMatch -> Outcome.MISS to null
@@ -141,9 +142,13 @@ class MatcherCorpusTest {
         const val V1_MAX_WRONG = 10
         const val V1_MAX_MISSES = 18
 
-        /** Ratchet for corpus v2 (3,682 songs, Deezer + Apple candidates, Fable-checked labels). */
-        const val V2_MAX_WRONG = 54
-        const val V2_MAX_MISSES = 108
+        /**
+         * Ratchet for corpus v2 (3,682 songs, Deezer + Apple candidates, Fable-checked labels).
+         * 2026-10-17: 54 / 108 -> 41 / 105 (YouTube rows keep every version they name; an official
+         * audio row keeps the strict length rule; equal scores go to the closest reliable length).
+         */
+        const val V2_MAX_WRONG = 41
+        const val V2_MAX_MISSES = 105
         const val REPORT_LIMIT = 400
     }
 }

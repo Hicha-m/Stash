@@ -134,6 +134,48 @@ object QobuzCandidateMatcher {
         return base * versionFactor
     }
 
+    /**
+     * The candidate a source takes from [scored] (each candidate with its [confidence]): the highest
+     * score at or above [MIN_CONFIDENCE]. Equal scores go to the candidate whose length is closest to
+     * the query's, then to the first listed: two cuts within 5% of the song both score 1.0, and the
+     * first listed was whichever the catalog put first. A candidate of unknown length loses a tie to
+     * one of known length.
+     *
+     * Only a reliable length breaks ties ([TrackQuery.durationReliable]). A music video's length is
+     * the video's, and on the labelled set the cut nearest to it was more often an alternate take
+     * ("Let Her Cry (1991 Version)", "Dock of the Bay (Take 2)": 6 more wrong picks in v1) than the
+     * master the catalog lists first. Without one, the first listed wins.
+     *
+     * One helper for every pick site (squid/qbdlx Qobuz, the Tidal relay, kennyy), so they agree.
+     *
+     * @param durationSec a candidate's length in seconds, 0 or less when unknown.
+     */
+    fun <T> pickBest(query: TrackQuery, scored: List<Pair<T, Float>>, durationSec: (T) -> Int): Pair<T, Float>? {
+        val querySec = query.durationMs?.takeIf { it > 0 && query.durationReliable }?.let { it / 1000.0 }
+        var best: Pair<T, Float>? = null
+        var bestGap = Double.MAX_VALUE
+        for (entry in scored) {
+            if (entry.second < MIN_CONFIDENCE) continue
+            val gap = when {
+                querySec == null -> 0.0
+                durationSec(entry.first) <= 0 -> Double.MAX_VALUE
+                else -> abs(durationSec(entry.first) - querySec)
+            }
+            val current = best
+            val better = current == null ||
+                entry.second > current.second + SCORE_TIE ||
+                (abs(entry.second - current.second) <= SCORE_TIE && gap < bestGap)
+            if (better) {
+                best = entry
+                bestGap = gap
+            }
+        }
+        return best
+    }
+
+    /** Scores this close are a tie: they come from the same factors, so only float rounding separates them. */
+    private const val SCORE_TIE = 1e-4f
+
     /** Largest length gap a [TrackQuery.durationReliable]=false query tolerates before the 0.3 factor. */
     private const val VIDEO_DRIFT_OK = 0.40
 

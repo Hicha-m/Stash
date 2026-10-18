@@ -569,7 +569,7 @@ class DownloadManager @Inject constructor(
             durationMs = track.durationMs.takeIf { it > 0 },
             explicit = track.explicit,
             trackId = track.id,
-        ).forLibrarySource(track.source)
+        ).forLibrarySource(track.source, track.musicVideoType)
 
         val match = try {
             // The Download quality picker sets the JioSaavn variant too.
@@ -594,7 +594,7 @@ class DownloadManager @Inject constructor(
             durationMs = track.durationMs.takeIf { it > 0 },
             explicit = track.explicit,
             trackId = track.id,
-        ).forLibrarySource(track.source)
+        ).forLibrarySource(track.source, track.musicVideoType)
         val match = try {
             tidalAacResolver.resolve(query)
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -710,7 +710,7 @@ class DownloadManager @Inject constructor(
             explicit = track.explicit,
             spotifyUri = track.spotifyUri,
             trackId = track.id,
-        ).forLibrarySource(track.source)
+        ).forLibrarySource(track.source, track.musicVideoType)
 
         // Bounded failover loop: the duration backstop can reject a degraded
         // source's preview-stub and record it degraded, after which the

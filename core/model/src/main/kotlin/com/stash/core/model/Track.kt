@@ -116,4 +116,10 @@ data class Track(
      * fetches the picked video.
      */
     val matchPickedAt: Long? = null,
+    /**
+     * YouTube Music's classification of this row's video ("ATV" official audio, "OMV", "UGC"...),
+     * when known. Mirrors `tracks.music_video_type`. The lossless lookups read it to tell an
+     * official audio upload (whose length is the song's) from a music video.
+     */
+    val musicVideoType: String? = null,
 )

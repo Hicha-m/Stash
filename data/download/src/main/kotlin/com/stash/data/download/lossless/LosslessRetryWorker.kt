@@ -100,7 +100,7 @@ class LosslessRetryWorker @AssistedInject constructor(
                         isrc = track.isrc,
                         durationMs = track.durationMs.takeIf { it > 0 },
                         spotifyUri = track.spotifyUri,
-                    ).forLibrarySource(track.source),
+                    ).forLibrarySource(track.source, track.musicVideoType),
                 ) }
             }.getOrNull()
             if (match != null) {
