@@ -302,6 +302,12 @@ class QobuzCandidateMatcherTest {
         assertThat(QobuzCandidateMatcher.normalize("Rodríguez")).isEqualTo("rodriguez")
     }
 
+    @Test fun `curly and straight apostrophes both join the word`() {
+        // Catalogs write "Don’t", libraries "Don't": both are "dont", never "don t".
+        assertThat(QobuzCandidateMatcher.normalize("Don’t Stop")).isEqualTo("dont stop")
+        assertThat(QobuzCandidateMatcher.normalize("Don't Stop")).isEqualTo("dont stop")
+    }
+
     @Test fun `an ISRC match ignores the version`() {
         val s = QobuzCandidateMatcher.confidence(
             query = TrackQuery(artist = "KISS", title = "Deuce", isrc = "USPR37500001"),

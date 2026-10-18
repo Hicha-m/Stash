@@ -318,7 +318,7 @@ object QobuzCandidateMatcher {
     private val PAREN_GROUP = Regex("\\([^)]*\\)")
     private val SQUARE_GROUP = Regex("\\[[^]]*\\]")
     private val FEAT_TAIL = Regex("(?i)\\b(feat\\.?|ft\\.?|featuring)\\b.*")
-    private val APOSTROPHES = Regex("[''`]")
+    private val APOSTROPHES = Regex("['’`]")
     private val NON_WORD = Regex("[^\\p{L}\\p{N}\\p{S}\\s]")
     private val WHITESPACE = Regex("\\s+")
     private val BRACKET_CHARS = Regex("[\\[\\]()]")
