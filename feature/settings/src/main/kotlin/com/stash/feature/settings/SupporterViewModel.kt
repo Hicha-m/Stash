@@ -39,6 +39,8 @@ data class SupporterClaimUi(
     val busy: Boolean = false,
     /** A plain error or status line, or null. */
     val message: String? = null,
+    /** [message] is an error (shown in the error colour) rather than a status. */
+    val messageIsError: Boolean = true,
     /** The relays confirmed unlimited: the sheet closes and the row flips. */
     val done: Boolean = false,
 ) {
@@ -72,12 +74,18 @@ class SupporterViewModel @Inject constructor(
     /** Asks the tip jar to email a code to [email]. */
     fun sendCode(email: String) = launchStep { supporter.claimStart(email).let { r -> _claim.value.after(r, email.trim()) } }
 
+    /** The code step's "Send a new code": the same address again. */
+    fun resendCode() = sendCode(_claim.value.email)
+
     /** Checks [code]; a right one is then confirmed with the relays. */
     fun unlock(code: String) {
         val email = _claim.value.email
         launchStep {
             when (val r = supporter.claimVerify(email, code)) {
                 ClaimResult.Unlocked -> {
+                    // A supporter is never spent: lift it here, so the lossless rungs ask the
+                    // relays again even when this refresh fails offline.
+                    quota.liftSpent()
                     refresher.refreshNow()
                     _claim.value.unlocked(confirmed = quota.current()?.unlimited == true)
                 }
@@ -120,15 +128,23 @@ internal fun supporterRow(allowance: LosslessAllowance?, relayConfigured: Boolea
 
 /** The sheet after [r] for [email]: the next step, or the same step with a plain message. */
 internal fun SupporterClaimUi.after(r: ClaimResult, email: String): SupporterClaimUi = when (r) {
-    ClaimResult.CodeSent -> SupporterClaimUi(step = SupporterClaimUi.Step.Code, email = email)
+    // A second code to the same address (the code step's "Send a new code") says it went.
+    ClaimResult.CodeSent ->
+        if (step == SupporterClaimUi.Step.Code) {
+            SupporterClaimUi(step = step, email = email, message = "A new code is on its way.", messageIsError = false)
+        } else {
+            SupporterClaimUi(step = SupporterClaimUi.Step.Code, email = email)
+        }
     ClaimResult.Unlocked -> unlocked(confirmed = true)
-    ClaimResult.BadEmail -> copy(message = "That doesn't look like an email address. Check it and try again.")
-    ClaimResult.BadCode -> copy(message = "That code isn't right. Check the email and try again.")
-    ClaimResult.StartOver -> SupporterClaimUi(email = email, message = "That code can't be used any more. Ask for a new one.")
-    is ClaimResult.RateLimited -> copy(message = rateLimitedMessage(r.retryAfterSec))
-    ClaimResult.NotConfigured -> copy(message = "Unlocking isn't available right now. Please try again later.")
-    ClaimResult.Unreachable -> copy(message = "Couldn't reach Stash. Check your connection and try again.")
+    ClaimResult.BadEmail -> failed("That doesn't look like an email address. Check it and try again.")
+    // Wrong, expired, or used up: the tip jar no longer says which. "Send a new code" sits below.
+    ClaimResult.BadCode -> failed("That code didn't work. Check it, or send a new one.")
+    is ClaimResult.RateLimited -> failed(rateLimitedMessage(r.retryAfterSec))
+    ClaimResult.NotConfigured -> failed("Unlocking isn't available right now. Please try again later.")
+    ClaimResult.Unreachable -> failed("Couldn't reach Stash. Check your connection and try again.")
 }
+
+private fun SupporterClaimUi.failed(text: String) = copy(message = text, messageIsError = true)
 
 /**
  * A right code: [confirmed] when the relays now report unlimited (the sheet closes); otherwise
@@ -136,13 +152,13 @@ internal fun SupporterClaimUi.after(r: ClaimResult, email: String): SupporterCla
  */
 internal fun SupporterClaimUi.unlocked(confirmed: Boolean): SupporterClaimUi =
     if (confirmed) copy(done = true, message = null)
-    else copy(message = "Code accepted. Unlimited lossless shows here once Stash confirms it.")
+    else copy(message = "Code accepted. Unlimited lossless shows here once Stash confirms it.", messageIsError = false)
 
+/** `429` is the tip jar's rate limiter (code requests and code tries alike). */
 private fun rateLimitedMessage(retryAfterSec: Long?): String {
     val minutes = retryAfterSec?.let { (it + 59) / 60 }
     return when {
-        minutes == null -> "Too many codes asked for. Please try again in a little while."
-        minutes <= 1 -> "Too many codes asked for. Please try again in a minute."
-        else -> "Too many codes asked for. Please try again in $minutes minutes."
+        minutes != null && minutes > 1 -> "Too many tries. Wait $minutes minutes."
+        else -> "Too many tries. Wait a minute."
     }
 }

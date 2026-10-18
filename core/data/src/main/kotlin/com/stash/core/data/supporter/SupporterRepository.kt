@@ -50,13 +50,14 @@ sealed interface ClaimResult {
     /** The email was refused, here or by the tip jar. */
     data object BadEmail : ClaimResult
 
-    /** The code was wrong; the same code request can be tried again. */
+    /**
+     * `401 bad_code`: the code did not work. The tip jar does not say why (a wrong code, an
+     * expired one, no code asked for, or too many tries, which also deletes the claim), so the
+     * sheet offers both: check it, or send a new one.
+     */
     data object BadCode : ClaimResult
 
-    /** Too many wrong codes, or the code expired: ask for a new one. */
-    data object StartOver : ClaimResult
-
-    /** Too many code requests; [retryAfterSec] from `Retry-After`, when sent. */
+    /** `429`: the tip jar's rate limiter; [retryAfterSec] from `Retry-After`, when sent. */
     data class RateLimited(val retryAfterSec: Long?) : ClaimResult
 
     /** The tip jar has no claim set up (`503 not_configured`, or no tip-jar URL in this build). */
@@ -83,8 +84,8 @@ private val Context.supporterDataStore: DataStore<Preferences> by preferencesDat
  * simply reads as the free allowance.
  *
  * Only the owner's relays ever see [token] (`X-Stash-Entitlement`); it carries no personal data.
- * Kept in its own DataStore (no Room migration). Not device-locked by design, so a settings
- * backup carries it to a new phone.
+ * Kept in its own DataStore ([DATASTORE_FILE], no Room migration). Settings backups leave it
+ * out (a backup file travels further than the phone; a new phone claims again by email).
  */
 @Singleton
 class SupporterRepository(
@@ -194,9 +195,8 @@ class SupporterRepository(
                 val error = (body?.get("error") as? JsonPrimitive)?.content
                 when {
                     r.code == 400 -> ClaimResult.BadEmail
-                    r.code == 401 -> ClaimResult.BadCode
-                    r.code == 410 -> ClaimResult.StartOver
-                    r.code == 429 && error == "too_many_tries" -> ClaimResult.StartOver
+                    // Every refused code is 401 bad_code. 410 is the tip jar before that change.
+                    r.code == 401 || r.code == 410 -> ClaimResult.BadCode
                     r.code == 429 -> ClaimResult.RateLimited(r.header("Retry-After")?.trim()?.toLongOrNull()?.takeIf { it > 0 })
                     r.code == 503 && error == "not_configured" -> ClaimResult.NotConfigured
                     else -> {
@@ -242,6 +242,9 @@ class SupporterRepository(
         const val CODE_LENGTH = 6
 
         private val KEY_TOKEN = stringPreferencesKey("token")
+
+        /** The token's DataStore file under `files/datastore/`, which settings backups skip. */
+        const val DATASTORE_FILE = "supporter.preferences_pb"
         private val JSON_MEDIA = "application/json".toMediaType()
 
         /** Header-safe and bounded (base64url / JWT-style segments). */

@@ -13,6 +13,7 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,6 +34,7 @@ class SupporterViewModelTest {
     private val quota: LosslessQuota = mockk {
         every { state } returns allowance
         every { current() } answers { allowance.value }
+        every { liftSpent() } returns Unit
     }
     private val supporter: SupporterRepository = mockk(relaxUnitFun = true) {
         every { this@mockk.token } returns this@SupporterViewModelTest.token
@@ -61,17 +63,39 @@ class SupporterViewModelTest {
         assertThat(email.after(ClaimResult.CodeSent, "fan@example.com"))
             .isEqualTo(SupporterClaimUi(step = SupporterClaimUi.Step.Code, email = "fan@example.com"))
         assertThat(email.after(ClaimResult.BadEmail, "x").message).contains("email address")
-        assertThat(email.after(ClaimResult.RateLimited(120), "x").message).contains("2 minutes")
-        assertThat(email.after(ClaimResult.RateLimited(null), "x").message).contains("a little while")
+        assertThat(email.after(ClaimResult.RateLimited(120), "x").message).isEqualTo("Too many tries. Wait 2 minutes.")
+        assertThat(email.after(ClaimResult.RateLimited(null), "x").message).isEqualTo("Too many tries. Wait a minute.")
+        assertThat(email.after(ClaimResult.RateLimited(30), "x").message).isEqualTo("Too many tries. Wait a minute.")
         assertThat(email.after(ClaimResult.NotConfigured, "x").message).contains("isn't available")
         assertThat(email.after(ClaimResult.Unreachable, "x").message).contains("connection")
 
         val code = SupporterClaimUi(step = SupporterClaimUi.Step.Code, email = "fan@example.com")
-        assertThat(code.after(ClaimResult.BadCode, "fan@example.com").step).isEqualTo(SupporterClaimUi.Step.Code)
-        val over = code.after(ClaimResult.StartOver, "fan@example.com")
-        assertThat(over.step).isEqualTo(SupporterClaimUi.Step.Email)
-        assertThat(over.email).isEqualTo("fan@example.com")
-        assertThat(over.message).contains("new one")
+        // Wrong, expired or used up all read the same, on the code step with "Send a new code".
+        val bad = code.after(ClaimResult.BadCode, "fan@example.com")
+        assertThat(bad.step).isEqualTo(SupporterClaimUi.Step.Code)
+        assertThat(bad.email).isEqualTo("fan@example.com")
+        assertThat(bad.message).isEqualTo("That code didn't work. Check it, or send a new one.")
+        assertThat(bad.messageIsError).isTrue()
+
+        val resent = bad.after(ClaimResult.CodeSent, "fan@example.com")
+        assertThat(resent.step).isEqualTo(SupporterClaimUi.Step.Code)
+        assertThat(resent.message).isEqualTo("A new code is on its way.")
+        assertThat(resent.messageIsError).isFalse()
+    }
+
+    @Test fun `send a new code asks again for the same address`() = runTest {
+        coEvery { supporter.claimStart(any()) } returns ClaimResult.CodeSent
+        coEvery { supporter.claimVerify(any(), any()) } returns ClaimResult.BadCode
+        val vm = vm()
+        vm.sendCode("fan@example.com")
+        vm.unlock("111111")
+        assertThat(vm.claim.value.message).contains("send a new one")
+
+        vm.resendCode()
+
+        coVerify(exactly = 2) { supporter.claimStart("fan@example.com") }
+        assertThat(vm.claim.value.step).isEqualTo(SupporterClaimUi.Step.Code)
+        assertThat(vm.claim.value.message).isEqualTo("A new code is on its way.")
     }
 
     @Test fun `a right code asks the relays and closes once they report unlimited`() = runTest {
@@ -103,6 +127,30 @@ class SupporterViewModelTest {
 
         assertThat(vm.claim.value.done).isFalse()
         assertThat(vm.claim.value.message).contains("Code accepted")
+        assertThat(vm.claim.value.messageIsError).isFalse()
+    }
+
+    @Test fun `a right code lifts the spent day even when the relays can't be reached`() = runTest {
+        coEvery { supporter.claimStart(any()) } returns ClaimResult.CodeSent
+        coEvery { supporter.claimVerify(any(), any()) } returns ClaimResult.Unlocked
+        coEvery { refresher.refreshNow() } returns false // offline
+        val vm = vm()
+
+        vm.sendCode("fan@example.com")
+        vm.unlock("123456")
+
+        verify(exactly = 1) { quota.liftSpent() }
+    }
+
+    @Test fun `a wrong code lifts nothing`() = runTest {
+        coEvery { supporter.claimStart(any()) } returns ClaimResult.CodeSent
+        coEvery { supporter.claimVerify(any(), any()) } returns ClaimResult.BadCode
+        val vm = vm()
+
+        vm.sendCode("fan@example.com")
+        vm.unlock("123456")
+
+        verify(exactly = 0) { quota.liftSpent() }
     }
 
     @Test fun `removing the code clears it and asks the relays again`() = runTest {

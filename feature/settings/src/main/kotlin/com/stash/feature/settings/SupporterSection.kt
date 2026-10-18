@@ -106,6 +106,7 @@ internal fun SupporterSection(viewModel: SupporterViewModel = hiltViewModel()) {
             ui = claim,
             hasToken = (row as SupporterRow.Offer).hasToken,
             onSendCode = viewModel::sendCode,
+            onResendCode = viewModel::resendCode,
             onUnlock = viewModel::unlock,
             onStartOver = viewModel::startOver,
             onRemoveCode = viewModel::removeCode,
@@ -128,6 +129,7 @@ private fun SupporterClaimSheet(
     ui: SupporterClaimUi,
     hasToken: Boolean,
     onSendCode: (String) -> Unit,
+    onResendCode: () -> Unit,
     onUnlock: (String) -> Unit,
     onStartOver: () -> Unit,
     onRemoveCode: () -> Unit,
@@ -196,6 +198,15 @@ private fun SupporterClaimSheet(
                         enabled = !ui.busy && code.length == SupporterRepository.CODE_LENGTH,
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Unlock") }
+                    // A code that didn't work (wrong, expired or used up) is replaced from here.
+                    TextButton(
+                        onClick = {
+                            code = ""
+                            onResendCode()
+                        },
+                        enabled = !ui.busy,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Send a new code") }
                     TextButton(onClick = onStartOver, enabled = !ui.busy, modifier = Modifier.fillMaxWidth()) {
                         Text("Use a different email")
                     }
@@ -222,7 +233,12 @@ private fun SupporterClaimSheet(
 private fun Footer(ui: SupporterClaimUi) {
     ui.message?.let {
         Spacer(Modifier.padding(top = 8.dp))
-        Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+        Text(
+            it,
+            style = MaterialTheme.typography.bodyMedium,
+            // "Code accepted…" and "A new code is on its way." are not errors.
+            color = if (ui.messageIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
     if (ui.busy) {
         Spacer(Modifier.padding(top = 8.dp))

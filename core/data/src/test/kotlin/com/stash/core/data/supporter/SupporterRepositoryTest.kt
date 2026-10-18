@@ -85,15 +85,19 @@ class SupporterRepositoryTest {
         assertThat(req.body.readUtf8()).isEqualTo("""{"email":"fan@example.com","code":"123456"}""")
     }
 
-    @Test fun `verify sorts wrong, used-up, expired and unconfigured answers and stores nothing`() = runBlocking {
+    @Test fun `verify sorts refused, rate-limited and unconfigured answers and stores nothing`() = runBlocking {
+        // Wrong, expired, never asked for and too many tries all answer 401 bad_code now.
         server.enqueue(json(401, """{"error":"bad_code"}"""))
+        server.enqueue(json(410, """{"error":"expired"}""")) // a tip jar from before that change
+        server.enqueue(json(429, """{"error":"rate_limited"}""").setHeader("Retry-After", "60"))
         server.enqueue(json(429, """{"error":"too_many_tries"}"""))
-        server.enqueue(json(410, """{"error":"expired"}"""))
         server.enqueue(json(503, """{"error":"not_configured"}"""))
 
         assertThat(repo.claimVerify("a@b.co", "111111")).isEqualTo(ClaimResult.BadCode)
-        assertThat(repo.claimVerify("a@b.co", "111111")).isEqualTo(ClaimResult.StartOver)
-        assertThat(repo.claimVerify("a@b.co", "111111")).isEqualTo(ClaimResult.StartOver)
+        assertThat(repo.claimVerify("a@b.co", "111111")).isEqualTo(ClaimResult.BadCode)
+        // 429 is only ever the rate limiter, whatever its body says.
+        assertThat(repo.claimVerify("a@b.co", "111111")).isEqualTo(ClaimResult.RateLimited(60))
+        assertThat(repo.claimVerify("a@b.co", "111111")).isEqualTo(ClaimResult.RateLimited(null))
         assertThat(repo.claimVerify("a@b.co", "111111")).isEqualTo(ClaimResult.NotConfigured)
         assertThat(repo.tokenNow()).isNull()
     }
