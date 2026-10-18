@@ -47,8 +47,9 @@ interface MusicRepository {
      * The songs on an album card: [album] (ignoring case) whose credits include [artist].
      *
      * Like [getTracksByArtist], it follows the Download switch: every song in Stream only, the
-     * downloaded ones in Download, re-applied live when the switch flips. The album page and the
-     * card's Play and Add to queue all read this.
+     * downloaded ones in Download, re-applied live when the switch flips, and in Stream only the
+     * sort sheet's "In your library" filter as [getAllAlbums] does. The album page and the card's
+     * Play and Add to queue all read this.
      */
     fun getTracksByAlbum(album: String, artist: String): Flow<List<Track>>
 

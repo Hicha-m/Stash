@@ -55,7 +55,7 @@ class ArtistImageDaoTest {
     @Test fun `download - includes downloaded artists`() = runTest {
         insertDownloaded(id = 1L, artist = "Drake")
 
-        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = false))
+        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = false, libraryOnly = false))
     }
 
     @Test fun `download - excludes artists with nothing downloaded, as the tab does`() = runTest {
@@ -66,7 +66,7 @@ class ArtistImageDaoTest {
         val playlistId = playlistDao.insert(activePlaylist())
         playlistDao.insertCrossRef(crossRef(playlistId, unchecked, position = 0))
 
-        assertTrue(artistImageDao.distinctArtistNames(includeNotDownloaded = false).isEmpty())
+        assertTrue(artistImageDao.distinctArtistNames(includeNotDownloaded = false, libraryOnly = false).isEmpty())
     }
 
     // ── Stream only (includeNotDownloaded = true) ───────────────────────
@@ -79,7 +79,7 @@ class ArtistImageDaoTest {
 
         assertEquals(
             setOf("Drake", "Future", "Travis", "Aarne"),
-            artistImageDao.distinctArtistNames(includeNotDownloaded = true).toSet(),
+            artistImageDao.distinctArtistNames(includeNotDownloaded = true, libraryOnly = false).toSet(),
         )
     }
 
@@ -91,10 +91,26 @@ class ArtistImageDaoTest {
         for (includeNotDownloaded in listOf(false, true)) {
             assertEquals(
                 "includeNotDownloaded=$includeNotDownloaded",
-                trackDao.getAllArtists(includeNotDownloaded).first().map { it.artist }.toSet(),
-                artistImageDao.distinctArtistNames(includeNotDownloaded).toSet(),
+                trackDao.getAllArtists(includeNotDownloaded, libraryOnly = false).first().map { it.artist }.toSet(),
+                artistImageDao.distinctArtistNames(includeNotDownloaded, libraryOnly = false).toSet(),
             )
         }
+    }
+
+    @Test fun `stream only, in your library - only the artists the narrowed tab lists`() = runTest {
+        insertDownloaded(id = 1L, artist = "Drake")
+        val synced = insertUnchecked(id = 2L, artist = "Aarne")
+        insertUnchecked(id = 3L, artist = "Future") // in no playlist
+        val mixOnly = insertUnchecked(id = 4L, artist = "Travis")
+        playlistDao.insertCrossRef(crossRef(playlistDao.insert(activePlaylist()), synced, position = 0))
+        playlistDao.insertCrossRef(
+            crossRef(playlistDao.insert(activePlaylist().copy(type = PlaylistType.DAILY_MIX)), mixOnly, position = 0),
+        )
+
+        val names = artistImageDao.distinctArtistNames(includeNotDownloaded = true, libraryOnly = true).toSet()
+
+        assertEquals(setOf("Drake", "Aarne"), names)
+        assertEquals(trackDao.getAllArtists(includeNotDownloaded = true, libraryOnly = true).first().map { it.artist }.toSet(), names)
     }
 
     // ── Both ────────────────────────────────────────────────────────────
@@ -104,16 +120,16 @@ class ArtistImageDaoTest {
         insertDownloaded(id = 2L, artist = "Drake")
         insertUnchecked(id = 3L, artist = "Drake")
 
-        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = false))
-        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = true))
+        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = false, libraryOnly = false))
+        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = true, libraryOnly = false))
     }
 
     @Test fun `excludes empty artist credits`() = runTest {
         insertDownloaded(id = 1L, artist = "")
         insertUnchecked(id = 2L, artist = "")
 
-        assertTrue("blank credit must not be resolved", artistImageDao.distinctArtistNames(false).isEmpty())
-        assertTrue("blank credit must not be resolved", artistImageDao.distinctArtistNames(true).isEmpty())
+        assertTrue("blank credit must not be resolved", artistImageDao.distinctArtistNames(false, false).isEmpty())
+        assertTrue("blank credit must not be resolved", artistImageDao.distinctArtistNames(true, false).isEmpty())
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────

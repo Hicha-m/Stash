@@ -67,7 +67,7 @@ class TrackDaoStreamableTest {
         insertStreamableOnly(id = 2L, album = "Album A", artist = "Drake")
         insertUnchecked(id = 3L, album = "Album B", artist = "Drake")
 
-        val albums = dao.getAllAlbums(includeNotDownloaded = false).first()
+        val albums = dao.getAllAlbums(includeNotDownloaded = false, libraryOnly = false).first()
 
         assertEquals(listOf("Album A" to 1), albums.map { it.album to it.trackCount })
     }
@@ -79,7 +79,7 @@ class TrackDaoStreamableTest {
         insertUnchecked(id = 3L, album = "Album A", artist = "Drake")
         insertUnavailable(id = 4L, album = "Album C", artist = "Drake")
 
-        val albums = dao.getAllAlbums(includeNotDownloaded = true).first()
+        val albums = dao.getAllAlbums(includeNotDownloaded = true, libraryOnly = false).first()
 
         assertEquals(
             setOf("Album A" to 3, "Album C" to 1),
@@ -95,11 +95,26 @@ class TrackDaoStreamableTest {
 
         // Download counts Drake's two, so the card is Drake's and his page lists them. Naming it
         // after Future (most songs overall) opened a page that listed nothing.
-        val download = dao.getAllAlbums(includeNotDownloaded = false).first().single()
+        val download = dao.getAllAlbums(includeNotDownloaded = false, libraryOnly = false).first().single()
         assertEquals("Drake" to 2, download.artist to download.trackCount)
 
-        val streamOnly = dao.getAllAlbums(includeNotDownloaded = true).first().single()
+        val streamOnly = dao.getAllAlbums(includeNotDownloaded = true, libraryOnly = false).first().single()
         assertEquals("Future" to 5, streamOnly.artist to streamOnly.trackCount)
+    }
+
+    @Test fun `getAllAlbums in your library names an untagged album after the act its library songs credit`() = runTest {
+        // Drake: two songs, one downloaded and one in a synced playlist. Future: three songs in
+        // the app but not in the library. The display-artist pick reads the narrowed rows too.
+        insertDownloaded(id = 1L, album = "Shared", artist = "Drake")
+        val synced = insertUnchecked(id = 2L, album = "Shared", artist = "Drake")
+        (3L..5L).forEach { insertUnchecked(id = it, album = "Shared", artist = "Future") }
+        playlistDao.insertCrossRef(crossRef(playlistDao.insert(customPlaylist()), synced, position = 0))
+
+        val everything = dao.getAllAlbums(includeNotDownloaded = true, libraryOnly = false).first().single()
+        assertEquals("Future" to 5, everything.artist to everything.trackCount)
+
+        val inLibrary = dao.getAllAlbums(includeNotDownloaded = true, libraryOnly = true).first().single()
+        assertEquals("Drake" to 2, inLibrary.artist to inLibrary.trackCount)
     }
 
     // ── getAllArtists ───────────────────────────────────────────────────
@@ -109,7 +124,7 @@ class TrackDaoStreamableTest {
         insertStreamableOnly(id = 2L, album = "Album B", artist = "Drake")
         insertUnchecked(id = 3L, album = "Album B", artist = "Future")
 
-        val artists = dao.getAllArtists(includeNotDownloaded = false).first()
+        val artists = dao.getAllArtists(includeNotDownloaded = false, libraryOnly = false).first()
 
         assertEquals(
             listOf(Triple("Drake", 1, 1)),
@@ -123,7 +138,7 @@ class TrackDaoStreamableTest {
         insertUnchecked(id = 3L, album = "Album B", artist = "Drake")
         insertUnavailable(id = 4L, album = "Album C", artist = "Travis")
 
-        val artists = dao.getAllArtists(includeNotDownloaded = true).first()
+        val artists = dao.getAllArtists(includeNotDownloaded = true, libraryOnly = false).first()
 
         assertEquals(
             setOf(Triple("Drake", 3, 1), Triple("Travis", 1, 0)),
@@ -138,7 +153,7 @@ class TrackDaoStreamableTest {
         insertTrack(id = 2L, artist = "Someone Else", albumArtist = "Drake", downloaded = false, durationMs = 200)
         insertTrack(id = 3L, artist = "Someone Else", albumArtist = "", downloaded = true, durationMs = 300)
 
-        val pairs = dao.getAllArtists(includeNotDownloaded = true).first()
+        val pairs = dao.getAllArtists(includeNotDownloaded = true, libraryOnly = false).first()
             .map { listOf(it.artist, it.albumArtist, it.trackCount, it.downloadedCount, it.totalDurationMs) }
             .toSet()
 
@@ -162,7 +177,7 @@ class TrackDaoStreamableTest {
         )
         insertDownloaded(id = 2L, album = "B", artist = "Drake") // no art, visited last
 
-        val drake = dao.getAllArtists(includeNotDownloaded = false).first().single()
+        val drake = dao.getAllArtists(includeNotDownloaded = false, libraryOnly = false).first().single()
 
         assertEquals("https://art/1.jpg", drake.artUrl)
     }
@@ -175,10 +190,10 @@ class TrackDaoStreamableTest {
         insertTrack(id = 3L, artist = "Someone Else", albumArtist = "Drake", downloaded = false)
         insertDownloaded(id = 4L, album = "C", artist = "Travis")
 
-        assertEquals(listOf(1L), dao.getByArtist("Drake", includeNotDownloaded = false).first().map { it.id })
+        assertEquals(listOf(1L), dao.getByArtist("Drake", includeNotDownloaded = false, libraryOnly = false).first().map { it.id })
         assertEquals(
             setOf(1L, 2L, 3L),
-            dao.getByArtist("Drake", includeNotDownloaded = true).first().map { it.id }.toSet(),
+            dao.getByArtist("Drake", includeNotDownloaded = true, libraryOnly = false).first().map { it.id }.toSet(),
         )
     }
 
@@ -188,17 +203,17 @@ class TrackDaoStreamableTest {
         insertStreamableOnly(id = 3L, album = "Her Loss", artist = "21 Savage")
         insertDownloaded(id = 4L, album = "Scorpion", artist = "Drake")
 
-        assertEquals(listOf(1L), dao.getByAlbum("her loss", includeNotDownloaded = false).first().map { it.id })
+        assertEquals(listOf(1L), dao.getByAlbum("her loss", includeNotDownloaded = false, libraryOnly = false).first().map { it.id })
         assertEquals(
             setOf(1L, 2L, 3L),
-            dao.getByAlbum("her loss", includeNotDownloaded = true).first().map { it.id }.toSet(),
+            dao.getByAlbum("her loss", includeNotDownloaded = true, libraryOnly = false).first().map { it.id }.toSet(),
         )
     }
 
     @Test fun `getByAlbum never matches untagged songs`() = runTest {
         insertDownloaded(id = 1L, album = "", artist = "Drake")
 
-        assertTrue(dao.getByAlbum("", includeNotDownloaded = true).first().isEmpty())
+        assertTrue(dao.getByAlbum("", includeNotDownloaded = true, libraryOnly = false).first().isEmpty())
     }
 
     // ── getByPlaylist ───────────────────────────────────────────────────

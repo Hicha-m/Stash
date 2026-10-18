@@ -35,6 +35,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
@@ -67,6 +68,7 @@ class MusicRepositoryImpl @Inject constructor(
     private val stashMixRecipeDao: com.stash.core.data.db.dao.StashMixRecipeDao,
     private val downloadNetworkPreference: com.stash.core.data.prefs.DownloadNetworkPreference,
     private val streamingPreference: com.stash.core.data.prefs.StreamingPreference,
+    private val libraryScopePreference: com.stash.core.data.prefs.LibraryScopePreference,
     private val localFileOps: com.stash.core.data.files.LocalFileOps,
     private val syncPreferencesManager: com.stash.core.data.sync.SyncPreferencesManager,
     private val singleTrackDownloadEnqueuer: com.stash.core.data.sync.SingleTrackDownloadEnqueuer,
@@ -302,8 +304,8 @@ class MusicRepositoryImpl @Inject constructor(
         trackDao.getLibraryWithOnlineByDateAdded().map { rows -> rows.map { it.toDomain() } }
 
     override fun getTracksByArtist(artist: String): Flow<List<Track>> =
-        libraryScope { includeNotDownloaded ->
-            trackDao.getByArtist(artist, includeNotDownloaded)
+        libraryScope { includeNotDownloaded, libraryOnly ->
+            trackDao.getByArtist(artist, includeNotDownloaded, libraryOnly)
         }
             .map { entities ->
                 entities
@@ -315,8 +317,8 @@ class MusicRepositoryImpl @Inject constructor(
             .flowOn(Dispatchers.Default)
 
     override fun getTracksByAlbum(album: String, artist: String): Flow<List<Track>> =
-        libraryScope { includeNotDownloaded ->
-            trackDao.getByAlbum(album, includeNotDownloaded)
+        libraryScope { includeNotDownloaded, libraryOnly ->
+            trackDao.getByAlbum(album, includeNotDownloaded, libraryOnly)
         }
             .map { entities ->
                 entities
@@ -338,12 +340,19 @@ class MusicRepositoryImpl @Inject constructor(
      * left a Stream only listener with an artist card counting 3 songs whose page listed 40. The
      * Songs tab has its own feed, and a playlist is not a Library view: it shows every song in
      * every mode (see [getTracksByPlaylist]).
+     *
+     * In Stream only, the sort sheet's "In your library" ([com.stash.core.data.prefs.LibraryScopePreference.inLibraryOnly])
+     * narrows all of them to the songs the Songs tab lists: [query] gets `libraryOnly`, false in
+     * Download whatever was saved. Every Library artist and album read goes through here, so a
+     * card's count and the page it opens always agree.
      */
     @OptIn(ExperimentalCoroutinesApi::class)
-    private fun <T> libraryScope(query: (includeNotDownloaded: Boolean) -> Flow<T>): Flow<T> =
-        streamingPreference.enabled
+    private fun <T> libraryScope(query: (includeNotDownloaded: Boolean, libraryOnly: Boolean) -> Flow<T>): Flow<T> =
+        combine(streamingPreference.enabled, libraryScopePreference.inLibraryOnly) { streamOnly, inLibraryOnly ->
+            streamOnly to (streamOnly && inLibraryOnly)
+        }
             .distinctUntilChanged()
-            .flatMapLatest { streamOnly -> query(streamOnly) }
+            .flatMapLatest { (streamOnly, libraryOnly) -> query(streamOnly, libraryOnly) }
 
     // A playlist shows ALL of its tracks, streamable and downloaded, in every
     // mode — streaming is always allowed, and tapping a streamable track
@@ -359,16 +368,17 @@ class MusicRepositoryImpl @Inject constructor(
 
     /**
      * Credit pairs for the Library Artists tab, in the Download switch's scope (see
-     * [libraryScope]): every song in Stream only, downloaded songs in Download.
+     * [libraryScope]): every song in Stream only (or the songs in your library, under that
+     * filter), downloaded songs in Download.
      * `ArtistImageDao.distinctArtistNames` takes the same scope, so photos are resolved for
      * exactly the artists the tab lists; change the two together.
      */
     override fun getAllArtists(): Flow<List<ArtistSummary>> =
-        libraryScope { includeNotDownloaded -> trackDao.getAllArtists(includeNotDownloaded) }
+        libraryScope { includeNotDownloaded, libraryOnly -> trackDao.getAllArtists(includeNotDownloaded, libraryOnly) }
 
     /** Albums for the Library Albums tab, in the same scope as [getAllArtists]. */
     override fun getAllAlbums(): Flow<List<AlbumSummary>> =
-        libraryScope { includeNotDownloaded -> trackDao.getAllAlbums(includeNotDownloaded) }
+        libraryScope { includeNotDownloaded, libraryOnly -> trackDao.getAllAlbums(includeNotDownloaded, libraryOnly) }
 
     override fun getRecentlyAdded(limit: Int): Flow<List<Track>> =
         trackDao.getRecentlyAdded(limit).map { entities -> entities.map { it.toDomain() } }

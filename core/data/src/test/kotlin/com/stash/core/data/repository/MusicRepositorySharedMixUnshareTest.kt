@@ -51,6 +51,7 @@ class MusicRepositorySharedMixUnshareTest {
         stashMixRecipeDao = mockk(relaxed = true),
         downloadNetworkPreference = mockk(relaxed = true),
         streamingPreference = mockk(relaxed = true),
+        libraryScopePreference = mockk(relaxed = true),
         localFileOps = mockk(relaxed = true),
         syncPreferencesManager = mockk(relaxed = true),
         singleTrackDownloadEnqueuer = mockk(relaxed = true),
