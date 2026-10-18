@@ -371,11 +371,18 @@ class BitchordClient @Inject constructor(
      * `now − (MISS_TTL_MS − SHORT_MISS_TTL_MS)` — and [cachedMiss]'s one 14-day check expires it
      * 6 h from now. No schema migration, and [TidalMatchDao.deleteOlderThan] (30-day prune) is
      * unaffected: the backdated stamp is still well inside it.
+     *
+     * A stamp only ever moves later: an AAC lookup's short miss also stamps lossless, and must
+     * not cut a definitive lossless miss already cached (14 days) down to 6 h.
      */
     private suspend fun stampMiss(match: TidalMatchEntity, allowAac: Boolean, definitive: Boolean = true) {
         val now = nowMs()
         val at = if (definitive) now else now - (MISS_TTL_MS - SHORT_MISS_TTL_MS)
-        writeCache(if (allowAac) match.copy(aacMissAt = at, losslessMissAt = at) else match.copy(losslessMissAt = at))
+        val lossless = maxOf(match.losslessMissAt ?: at, at)
+        writeCache(
+            if (allowAac) match.copy(aacMissAt = maxOf(match.aacMissAt ?: at, at), losslessMissAt = lossless)
+            else match.copy(losslessMissAt = lossless),
+        )
     }
 
     private fun cachedMiss(c: TidalMatchEntity?, allowAac: Boolean, now: Long): Boolean {
