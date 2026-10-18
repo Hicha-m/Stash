@@ -31,6 +31,13 @@ import org.robolectric.annotation.Config
  *
  * The predicate `(is_downloaded = 1 OR (:includeStreamable AND is_streamable = 1))`
  * handles all four states correctly.
+ *
+ * EXCEPT the Library Artists and Albums queries (getAllArtists, getAllAlbums,
+ * getByArtist, getByAlbum): they take `includeNotDownloaded`, the Download
+ * switch's Library rule — `is_downloaded = 1 OR :includeNotDownloaded`, so
+ * Download lists downloaded rows and Stream only lists EVERY row. Nothing in
+ * the app sets `is_streamable`, so their old `is_streamable = 1` arm admitted
+ * nothing and a Stream only artist card counted 3 songs while its page listed 40.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [33])
@@ -55,69 +62,109 @@ class TrackDaoStreamableTest {
 
     // ── getAllAlbums ────────────────────────────────────────────────────
 
-    @Test fun `getAllAlbums excludes streamable by default`() = runTest {
+    @Test fun `getAllAlbums in Download lists and counts downloaded songs only`() = runTest {
         insertDownloaded(id = 1L, album = "Album A", artist = "Drake")
-        insertStreamableOnly(id = 2L, album = "Album B", artist = "Drake")
+        insertStreamableOnly(id = 2L, album = "Album A", artist = "Drake")
+        insertUnchecked(id = 3L, album = "Album B", artist = "Drake")
 
-        val albums = dao.getAllAlbums(includeStreamable = false).first()
+        val albums = dao.getAllAlbums(includeNotDownloaded = false, libraryOnly = false).first()
 
-        assertEquals(listOf("Album A"), albums.map { it.album })
+        assertEquals(listOf("Album A" to 1), albums.map { it.album to it.trackCount })
     }
 
-    @Test fun `getAllAlbums includes streamable when flagged`() = runTest {
+    @Test fun `getAllAlbums in Stream only lists and counts every song`() = runTest {
         insertDownloaded(id = 1L, album = "Album A", artist = "Drake")
-        insertStreamableOnly(id = 2L, album = "Album B", artist = "Drake")
+        insertStreamableOnly(id = 2L, album = "Album A", artist = "Drake")
+        // Never-probed and probed-unavailable rows are songs too: nothing sets is_streamable.
+        insertUnchecked(id = 3L, album = "Album A", artist = "Drake")
+        insertUnavailable(id = 4L, album = "Album C", artist = "Drake")
 
-        val albums = dao.getAllAlbums(includeStreamable = true).first()
+        val albums = dao.getAllAlbums(includeNotDownloaded = true, libraryOnly = false).first()
 
-        assertEquals(setOf("Album A", "Album B"), albums.map { it.album }.toSet())
+        assertEquals(
+            setOf("Album A" to 3, "Album C" to 1),
+            albums.map { it.album to it.trackCount }.toSet(),
+        )
     }
 
-    @Test fun `getAllAlbums excludes unavailable even when streamable true`() = runTest {
-        insertDownloaded(id = 1L, album = "Album A", artist = "Drake")
-        insertUnavailable(id = 2L, album = "Album C", artist = "Drake")
+    @Test fun `getAllAlbums names an untagged album after the act its counted songs credit`() = runTest {
+        // Two downloaded songs by Drake, three not-downloaded by Future, no album artist tag.
+        insertDownloaded(id = 1L, album = "Shared", artist = "Drake")
+        insertDownloaded(id = 2L, album = "Shared", artist = "Drake")
+        (3L..5L).forEach { insertUnchecked(id = it, album = "Shared", artist = "Future") }
 
-        val albums = dao.getAllAlbums(includeStreamable = true).first()
+        // Download counts Drake's two, so the card is Drake's and his page lists them. Naming it
+        // after Future (most songs overall) opened a page that listed nothing.
+        val download = dao.getAllAlbums(includeNotDownloaded = false, libraryOnly = false).first().single()
+        assertEquals("Drake" to 2, download.artist to download.trackCount)
 
-        assertFalse("Album C unavailable must not appear", albums.any { it.album == "Album C" })
+        val streamOnly = dao.getAllAlbums(includeNotDownloaded = true, libraryOnly = false).first().single()
+        assertEquals("Future" to 5, streamOnly.artist to streamOnly.trackCount)
     }
 
-    @Test fun `getAllAlbums excludes unchecked even when streamable true`() = runTest {
-        insertDownloaded(id = 1L, album = "Album A", artist = "Drake")
-        insertUnchecked(id = 2L, album = "Album D", artist = "Drake")
+    @Test fun `getAllAlbums in your library names an untagged album after the act its library songs credit`() = runTest {
+        // Drake: two songs, one downloaded and one in a synced playlist. Future: three songs in
+        // the app but not in the library. The display-artist pick reads the narrowed rows too.
+        insertDownloaded(id = 1L, album = "Shared", artist = "Drake")
+        val synced = insertUnchecked(id = 2L, album = "Shared", artist = "Drake")
+        (3L..5L).forEach { insertUnchecked(id = it, album = "Shared", artist = "Future") }
+        playlistDao.insertCrossRef(crossRef(playlistDao.insert(customPlaylist()), synced, position = 0))
 
-        val albums = dao.getAllAlbums(includeStreamable = true).first()
+        val everything = dao.getAllAlbums(includeNotDownloaded = true, libraryOnly = false).first().single()
+        assertEquals("Future" to 5, everything.artist to everything.trackCount)
 
-        assertFalse("Album D unchecked must not appear", albums.any { it.album == "Album D" })
+        val inLibrary = dao.getAllAlbums(includeNotDownloaded = true, libraryOnly = true).first().single()
+        assertEquals("Drake" to 2, inLibrary.artist to inLibrary.trackCount)
     }
 
     // ── getAllArtists ───────────────────────────────────────────────────
 
-    @Test fun `getAllArtists excludes streamable by default`() = runTest {
+    @Test fun `getAllArtists in Download counts downloaded songs only`() = runTest {
         insertDownloaded(id = 1L, album = "Album A", artist = "Drake")
-        insertStreamableOnly(id = 2L, album = "Album B", artist = "Future")
+        insertStreamableOnly(id = 2L, album = "Album B", artist = "Drake")
+        insertUnchecked(id = 3L, album = "Album B", artist = "Future")
 
-        val artists = dao.getAllArtists(includeStreamable = false).first()
+        val artists = dao.getAllArtists(includeNotDownloaded = false, libraryOnly = false).first()
 
-        assertEquals(listOf("Drake"), artists.map { it.artist })
+        assertEquals(
+            listOf(Triple("Drake", 1, 1)),
+            artists.map { Triple(it.artist, it.trackCount, it.downloadedCount) },
+        )
     }
 
-    @Test fun `getAllArtists includes streamable when flagged`() = runTest {
+    @Test fun `getAllArtists in Stream only counts every song, and how many are downloaded`() = runTest {
         insertDownloaded(id = 1L, album = "Album A", artist = "Drake")
-        insertStreamableOnly(id = 2L, album = "Album B", artist = "Future")
+        insertStreamableOnly(id = 2L, album = "Album B", artist = "Drake")
+        insertUnchecked(id = 3L, album = "Album B", artist = "Drake")
+        insertUnavailable(id = 4L, album = "Album C", artist = "Travis")
 
-        val artists = dao.getAllArtists(includeStreamable = true).first()
+        val artists = dao.getAllArtists(includeNotDownloaded = true, libraryOnly = false).first()
 
-        assertEquals(setOf("Drake", "Future"), artists.map { it.artist }.toSet())
+        assertEquals(
+            setOf(Triple("Drake", 3, 1), Triple("Travis", 1, 0)),
+            artists.map { Triple(it.artist, it.trackCount, it.downloadedCount) }.toSet(),
+        )
     }
 
-    @Test fun `getAllArtists excludes unavailable even when streamable true`() = runTest {
-        insertDownloaded(id = 1L, album = "Album A", artist = "Drake")
-        insertUnavailable(id = 2L, album = "Album C", artist = "Travis")
+    @Test fun `getAllArtists keeps each album-artist credit apart`() = runTest {
+        // The artist page also takes songs whose ALBUM artist credits the act, so the card
+        // needs the pair, not the artist column alone.
+        insertTrack(id = 1L, artist = "Drake", albumArtist = "", downloaded = true, durationMs = 100)
+        insertTrack(id = 2L, artist = "Someone Else", albumArtist = "Drake", downloaded = false, durationMs = 200)
+        insertTrack(id = 3L, artist = "Someone Else", albumArtist = "", downloaded = true, durationMs = 300)
 
-        val artists = dao.getAllArtists(includeStreamable = true).first()
+        val pairs = dao.getAllArtists(includeNotDownloaded = true, libraryOnly = false).first()
+            .map { listOf(it.artist, it.albumArtist, it.trackCount, it.downloadedCount, it.totalDurationMs) }
+            .toSet()
 
-        assertFalse("Travis unavailable must not appear", artists.any { it.artist == "Travis" })
+        assertEquals(
+            setOf(
+                listOf("Drake", "", 1, 1, 100L),
+                listOf("Someone Else", "Drake", 1, 0, 200L),
+                listOf("Someone Else", "", 1, 1, 300L),
+            ),
+            pairs,
+        )
     }
 
     @Test fun `getAllArtists art is a stable non-null pick, not whichever row came last`() = runTest {
@@ -130,9 +177,43 @@ class TrackDaoStreamableTest {
         )
         insertDownloaded(id = 2L, album = "B", artist = "Drake") // no art, visited last
 
-        val drake = dao.getAllArtists(includeStreamable = false).first().single()
+        val drake = dao.getAllArtists(includeNotDownloaded = false, libraryOnly = false).first().single()
 
         assertEquals("https://art/1.jpg", drake.artUrl)
+    }
+
+    // ── getByArtist / getByAlbum (the artist and album pages) ──────────
+
+    @Test fun `getByArtist follows the Download switch`() = runTest {
+        insertDownloaded(id = 1L, album = "A", artist = "Drake")
+        insertUnchecked(id = 2L, album = "B", artist = "Drake, Future")
+        insertTrack(id = 3L, artist = "Someone Else", albumArtist = "Drake", downloaded = false)
+        insertDownloaded(id = 4L, album = "C", artist = "Travis")
+
+        assertEquals(listOf(1L), dao.getByArtist("Drake", includeNotDownloaded = false, libraryOnly = false).first().map { it.id })
+        assertEquals(
+            setOf(1L, 2L, 3L),
+            dao.getByArtist("Drake", includeNotDownloaded = true, libraryOnly = false).first().map { it.id }.toSet(),
+        )
+    }
+
+    @Test fun `getByAlbum follows the Download switch and ignores case`() = runTest {
+        insertDownloaded(id = 1L, album = "Her Loss", artist = "Drake")
+        insertUnchecked(id = 2L, album = "HER LOSS", artist = "Drake, 21 Savage")
+        insertStreamableOnly(id = 3L, album = "Her Loss", artist = "21 Savage")
+        insertDownloaded(id = 4L, album = "Scorpion", artist = "Drake")
+
+        assertEquals(listOf(1L), dao.getByAlbum("her loss", includeNotDownloaded = false, libraryOnly = false).first().map { it.id })
+        assertEquals(
+            setOf(1L, 2L, 3L),
+            dao.getByAlbum("her loss", includeNotDownloaded = true, libraryOnly = false).first().map { it.id }.toSet(),
+        )
+    }
+
+    @Test fun `getByAlbum never matches untagged songs`() = runTest {
+        insertDownloaded(id = 1L, album = "", artist = "Drake")
+
+        assertTrue(dao.getByAlbum("", includeNotDownloaded = true, libraryOnly = false).first().isEmpty())
     }
 
     // ── getByPlaylist ───────────────────────────────────────────────────
@@ -196,7 +277,7 @@ class TrackDaoStreamableTest {
 
     /**
      * getByPlaylist deliberately does NOT filter on `is_streamable` the way
-     * getAllAlbums/getAllArtists/search/getTotalCount do. Those are library-wide
+     * search/getTotalCount do. Those are library-wide
      * aggregates, where an unplayable row is noise. A playlist is different:
      * **membership is the source of truth**, and availability is decided at play
      * time.
@@ -378,6 +459,30 @@ class TrackDaoStreamableTest {
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
+
+    private suspend fun insertTrack(
+        id: Long,
+        artist: String,
+        albumArtist: String,
+        downloaded: Boolean,
+        album: String = "Album $id",
+        durationMs: Long = 0L,
+    ): Long {
+        dao.insert(
+            TrackEntity(
+                id = id,
+                title = "Title $id",
+                artist = artist,
+                albumArtist = albumArtist,
+                album = album,
+                durationMs = durationMs,
+                canonicalTitle = "title $id",
+                canonicalArtist = artist.lowercase(),
+                isDownloaded = downloaded,
+            )
+        )
+        return id
+    }
 
     private suspend fun insertDownloaded(
         id: Long,
