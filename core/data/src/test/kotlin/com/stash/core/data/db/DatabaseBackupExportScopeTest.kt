@@ -13,6 +13,7 @@ import com.stash.core.model.PlaylistType
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -20,7 +21,10 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
+import java.io.FileOutputStream
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 /**
  * Export used to be all-or-nothing: the whole database plus every settings
@@ -178,6 +182,61 @@ class DatabaseBackupExportScopeTest {
             theme.delete()
             key.delete()
             leftover.delete()
+        }
+    }
+
+    @Test fun `settings leave out the supporter token but keep the install id and the day's lossless count`() = runTest {
+        val supporter = context.preferencesDataStoreFile("supporter")
+        val leftover = File(supporter.path + ".tmp")
+        val config = context.preferencesDataStoreFile("lossless_relay_config")
+        val quota = context.preferencesDataStoreFile("lossless_quota")
+        supporter.parentFile?.mkdirs()
+        for (f in listOf(supporter, leftover, config, quota)) f.writeText(f.name)
+        try {
+            manager.exportDatabase(Uri.fromFile(out), BackupExportScope.SETTINGS_ONLY).getOrThrow()
+
+            ZipFile(out).use { zip ->
+                val names = zip.entries().toList().map { it.name }
+                assertTrue("the supporter token must not", "datastore/supporter.preferences_pb" !in names)
+                assertTrue("nor its leftover copy", "datastore/supporter.preferences_pb.tmp" !in names)
+                assertTrue("the install id rides along", "datastore/lossless_relay_config.preferences_pb" in names)
+                assertTrue("so does the day's count", "datastore/lossless_quota.preferences_pb" in names)
+            }
+        } finally {
+            for (f in listOf(supporter, leftover, config, quota)) f.delete()
+        }
+    }
+
+    @Test fun `a settings restore ignores a supporter token in an older archive`() = runTest {
+        val zipFile = File(context.cacheDir, "old-settings-${System.nanoTime()}.zip")
+        ZipOutputStream(FileOutputStream(zipFile)).use { zip ->
+            zip.putNextEntry(ZipEntry("manifest.json"))
+            zip.write("""{"dbSchemaVersion":1,"exportTimestamp":1,"scope":"SETTINGS_ONLY"}""".toByteArray())
+            zip.closeEntry()
+            for (name in listOf("theme_preferences.preferences_pb", "supporter.preferences_pb", "supporter.preferences_pb.tmp")) {
+                zip.putNextEntry(ZipEntry("datastore/$name"))
+                zip.write(name.toByteArray())
+                zip.closeEntry()
+            }
+        }
+        val theme = context.preferencesDataStoreFile("theme_preferences")
+        val supporter = context.preferencesDataStoreFile("supporter")
+        val leftover = File(supporter.path + ".tmp")
+        theme.parentFile?.mkdirs()
+        theme.delete()
+        supporter.delete()
+        try {
+            val result = manager.importDatabase(Uri.fromFile(zipFile), BackupImportScope.SETTINGS_REPLACE)
+
+            assertTrue("restore failed: ${result.exceptionOrNull()}", result.isSuccess)
+            assertEquals("theme_preferences.preferences_pb", theme.readText())
+            assertFalse("the archive's supporter token is not installed", supporter.exists())
+            assertFalse("nor its leftover copy", leftover.exists())
+        } finally {
+            theme.delete()
+            supporter.delete()
+            leftover.delete()
+            zipFile.delete()
         }
     }
 

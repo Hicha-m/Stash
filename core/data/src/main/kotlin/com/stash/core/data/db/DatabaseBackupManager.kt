@@ -12,6 +12,7 @@ import com.stash.core.data.db.entity.PlaylistTrackCrossRef
 import com.stash.core.data.db.entity.TrackEntity
 import com.stash.core.data.library.CanonicalRecompute
 import com.stash.core.data.library.SameSongRule
+import com.stash.core.data.supporter.SupporterRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -44,6 +45,16 @@ private val SQLITE_MAGIC: ByteArray = "SQLite format 3".toByteArray(Charsets.US_
  * leftover `.tmp` copy of it stays out too: a new phone is a new Community identity.
  */
 private const val COMMUNITY_KEY_FILE = "community_preference.preferences_pb"
+
+/**
+ * The DataStore files a backup never carries and a restore never writes, matched by prefix like
+ * the Community key: that key, and the Ko-fi supporter token ([SupporterRepository]), which a
+ * backup file must not hand to whoever holds it (a new phone claims again by email). The install
+ * id and the day's lossless count do ride along.
+ */
+private val NEVER_BACKED_UP = listOf(COMMUNITY_KEY_FILE, SupporterRepository.DATASTORE_FILE)
+
+private fun neverBackedUp(fileName: String): Boolean = NEVER_BACKED_UP.any { fileName.startsWith(it) }
 
 /**
  * What the user chose to restore from a backup ZIP (issue #235). The classic
@@ -111,8 +122,9 @@ enum class BackupImportScope(
  *   Those hold the encrypted tokens, which cannot survive a reinstall anyway
  *   (their keyset is sealed by an Android Keystore key that uninstalling
  *   destroys), so a settings-bearing archive restores preferences, not logins.
- *   The Community identity key is left out, and skipped when an older archive
- *   has it, so a restore never changes a phone's Community identity.
+ *   The Community identity key and the Ko-fi supporter token are left out, and
+ *   skipped when an older archive has them, so a restore never changes a phone's
+ *   Community identity and a backup file never carries a supporter's unlock.
  * @property likesOnly         True when the database is pruned to the liked
  *   tracks and the playlists that hold them before it is written.
  */
@@ -252,9 +264,10 @@ class DatabaseBackupManager @Inject constructor(
                         if (stagedDb != null) addToZip(zipOut, stagedDb, "stash.db")
 
                         // 4. Add all DataStore files (settings, tokens, etc.) but the Community key
+                        //    and the supporter token
                         if (scope.includesSettings && datastoreDir.exists()) {
                             datastoreDir.listFiles()?.forEach { file ->
-                                if (file.isFile && !file.name.startsWith(COMMUNITY_KEY_FILE)) {
+                                if (file.isFile && !neverBackedUp(file.name)) {
                                     addToZip(zipOut, file, "datastore/${file.name}")
                                 }
                             }
@@ -592,8 +605,8 @@ class DatabaseBackupManager @Inject constructor(
                                 }
 
                                 val finalFile = resolved.toFile()
-                                if (finalFile.name.startsWith(COMMUNITY_KEY_FILE)) {
-                                    null // an archive from before the key was left out: this phone keeps its own
+                                if (neverBackedUp(finalFile.name)) {
+                                    null // an archive from before these were left out: this phone keeps its own
                                 } else {
                                     val tmp = File(finalFile.path + ".import-tmp")
                                     stagedDatastore.add(tmp to finalFile)
