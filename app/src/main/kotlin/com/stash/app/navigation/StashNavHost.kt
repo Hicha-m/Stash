@@ -27,6 +27,8 @@ import com.stash.feature.community.CommunityScreen
 import com.stash.feature.community.CommunitySection
 import com.stash.feature.community.rememberCommunityPosting
 import com.stash.feature.home.HomeScreen
+import com.stash.feature.listening.YourListeningSection
+import com.stash.feature.listening.history.HistoryScreen
 import com.stash.feature.home.MixBrowseScreen
 import com.stash.feature.home.MixRail
 import com.stash.feature.home.PlaylistBrowseScreen
@@ -178,6 +180,9 @@ private fun StashNavGraph(
                         onSeeAll = { navController.navigate(CommunityRoute()) },
                         onPost = posting.pick,
                     )
+                },
+                yourListeningSection = {
+                    YourListeningSection(onOpenHistory = { navController.navigate(ListeningHistoryRoute()) })
                 },
             )
         }
@@ -495,6 +500,10 @@ private fun StashNavGraph(
                 onBack = { if (onTop()) navController.popBackStack() },
                 onOpenPlaylist = { id -> if (onTop()) navController.navigate(PlaylistDetailRoute(id)) },
             )
+        }
+
+        composable<ListeningHistoryRoute> {
+            HistoryScreen(onBack = { navController.popBackStack() })
         }
 
         composable<ListenJoinRoute> {
