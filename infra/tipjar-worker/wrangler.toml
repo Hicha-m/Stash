@@ -47,3 +47,28 @@ service = "stash-mailer"
 # per 1,000 supporters, and a write only when the list changed.
 [triggers]
 crons = ["17 4 * * *"]
+
+# The supporter claim (src/claim.js): a burst limit on POST /claim/email/start (key "start:<hashed IP>") and
+# /verify ("verify:<hashed IP>" and "v:<email hash>"); "IP" is the IPv4 address or the IPv6 /64. The binding
+# only counts over 10 or 60 seconds; the hourly limits (5 starts per IP, 3 per email) are KV counters in
+# ACCESS_KV (claimrl:*). Namespace 1004: 1001-1003 and 2010-2021 are taken on this account.
+[[ratelimits]]
+name = "CLAIM_RL"
+namespace_id = "1004"
+simple = { limit = 10, period = 60 }
+
+# The supporter claim's pending claims and its no-donation email cap (src/claim-store.js): a D1 database of its
+# own, so the try limit and single use are atomic (KV can't do that). Schema: migrations/0001_claims.sql.
+# Created 2026-10-17 (wrangler d1 create stash-claims; migrations applied with
+#   npx wrangler d1 migrations apply stash-claims --remote).
+[[d1_databases]]
+binding = "CLAIMS_DB"
+database_name = "stash-claims"
+database_id = "f0b932fb-c48c-4bc1-8489-b8bd67601740"
+migrations_dir = "migrations"
+
+# Secret: ENTITLEMENT_PRIVATE_KEY (the supporter claim, src/entitlement.js): standard base64 of the PKCS#8 DER
+# Ed25519 private key that signs supporter tokens. NOT committed. Without it /claim/email/start and /verify
+# answer 503. The matching public key is in README.md ("Supporter claim"). The claim also needs CLAIMS_DB,
+# EMAIL_PEPPER (it also keys the stored code hashes), MAILER and MAILER_TOKEN (above), and stash-mailer's
+# POST /supporter-claim route.

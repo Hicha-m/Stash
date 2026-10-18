@@ -106,6 +106,7 @@ class DownloadManagerPickedTrackTest {
         losslessHealthGate = losslessHealthGate,
         // Every fetched file counts as audio here; DownloadManagerJunkBodyTest checks the gate.
         localFileOps = mockk<com.stash.core.data.files.LocalFileOps> { every { acceptDownloadOrDelete(any()) } returns true },
+        losslessQuota = com.stash.data.download.lossless.quota.LosslessQuota.inMemory(),
     ).apply {
         // BuildConfig.DEBUG is true under unit tests; use release behavior.
         forceYoutubeFallbackOnDebugBuilds = false

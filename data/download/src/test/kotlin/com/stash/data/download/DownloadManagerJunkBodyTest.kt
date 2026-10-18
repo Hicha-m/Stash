@@ -102,6 +102,7 @@ class DownloadManagerJunkBodyTest {
         audioDurationExtractor = mockk(relaxed = true),
         losslessHealthGate = mockk(relaxed = true),
         localFileOps = localFileOps,
+        losslessQuota = com.stash.data.download.lossless.quota.LosslessQuota.inMemory(),
     )
 
     /** A downloaded song whose audio the user picked: straight to the YouTube rung. */

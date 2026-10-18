@@ -15,6 +15,10 @@ import com.stash.data.download.jiosaavn.JioSaavnResolver
 import com.stash.data.download.lossless.LosslessSourcePreferences
 import com.stash.data.download.lossless.LosslessSourceRegistry
 import com.stash.data.download.lossless.LosslessUrlDownloader
+import com.stash.data.download.lossless.SourceResult
+import com.stash.data.download.lossless.AudioFormat
+import com.stash.data.download.lossless.quota.LosslessQuota
+import com.stash.data.download.lossless.tidal.TidalAacResolver
 import com.stash.data.download.matching.AlbumMatchExecutor
 import com.stash.data.download.matching.HybridSearchExecutor
 import com.stash.data.download.matching.MatchScorer
@@ -79,6 +83,9 @@ class DownloadManagerDeferTest {
         mockk(relaxed = true)
     private val losslessHealthGate: com.stash.data.download.lossless.LosslessSourceHealthGate =
         mockk(relaxed = true)
+    private val tidalAacResolver: TidalAacResolver = mockk { coEvery { resolve(any()) } returns null }
+    private val now = 1_792_238_400_000L
+    private val losslessQuota = LosslessQuota.inMemory { now }
 
     private fun newSubject(): DownloadManager = DownloadManager(
         downloadExecutor = downloadExecutor,
@@ -97,7 +104,7 @@ class DownloadManagerDeferTest {
         losslessUrlDownloader = losslessUrlDownloader,
         losslessPrefs = losslessPrefs,
         jioSaavnResolver = jioSaavnResolver,
-        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any()) } returns null },
+        tidalAacResolver = tidalAacResolver,
         trackFinalizer = trackFinalizer,
         loudnessMeasurer = loudnessMeasurer,
         metadataEmbedder = metadataEmbedder,
@@ -107,6 +114,7 @@ class DownloadManagerDeferTest {
         losslessHealthGate = losslessHealthGate,
         // Every fetched file counts as audio here; DownloadManagerJunkBodyTest checks the gate.
         localFileOps = mockk<com.stash.core.data.files.LocalFileOps> { every { acceptDownloadOrDelete(any()) } returns true },
+        losslessQuota = losslessQuota,
     ).apply {
         // Under testDebugUnitTest, BuildConfig.DEBUG is unconditionally true,
         // which would otherwise make the strict-FLAC Deferred branch under
@@ -259,6 +267,69 @@ class DownloadManagerDeferTest {
         coVerify(exactly = 0) { losslessRegistry.resolve(any()) }
         coVerify(exactly = 0) { playlistDao.isTrackInStashMix(any()) }
         assertTrue("expected the YouTube rung's Unmatched, got $result", result is TrackDownloadResult.Unmatched)
+    }
+
+    // -- The daily lossless allowance -------------------------------------------------
+
+    /** Today's allowance used up, as the relays reported it. */
+    private fun allowanceSpent() = losslessQuota.onHeaders("500/500", "${now / 1000 + 3600}")
+
+    private fun tidalAacHasIt() {
+        coEvery { tidalAacResolver.resolve(any()) } returns SourceResult(
+            sourceId = TidalAacResolver.SOURCE_ID,
+            downloadUrl = "https://cdn.example/a.mp4",
+            format = AudioFormat(codec = "aac", bitrateKbps = 320),
+            confidence = 0.99f,
+        )
+    }
+
+    @Test
+    fun `spent allowance + fallback off waits for the reset and saves no Tidal AAC, switch on or not`() = runTest {
+        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
+        coEvery { losslessRegistry.resolve(any()) } returns null // the relay rungs skip while spent
+        coEvery { playlistDao.isTrackInStashMix(any()) } returns false
+        tidalAacHasIt() // "Tidal AAC when no FLAC" on, and Tidal has the song
+        allowanceSpent()
+
+        val result = newSubject().downloadTrack(track = stubTrack(), preResolvedUrl = null)
+
+        assertTrue("expected Deferred, got $result", result is TrackDownloadResult.Deferred)
+        coVerify(exactly = 0) { tidalAacResolver.resolve(any()) }
+        coVerify(exactly = 0) { losslessUrlDownloader.download(any(), any(), any()) }
+    }
+
+    @Test
+    fun `spent allowance + fallback on keeps going lossy`() = runTest {
+        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns true
+        coEvery { losslessRegistry.resolve(any()) } returns null
+        coEvery { playlistDao.isTrackInStashMix(any()) } returns false
+        coEvery { albumMatchExecutor.findTrackInAlbum(any(), any(), any(), any()) } returns null
+        coEvery { searchExecutor.search(any(), any()) } returns emptyList()
+        coEvery { searchExecutor.searchYtDlpDirect(any(), any()) } returns emptyList()
+        allowanceSpent()
+
+        val result = newSubject().downloadTrack(track = stubTrack(), preResolvedUrl = null)
+
+        // The lossy rungs ran: Tidal AAC first, then JioSaavn, then YouTube (whose empty search is Unmatched).
+        assertTrue("expected the YouTube rung's Unmatched, got $result", result is TrackDownloadResult.Unmatched)
+        coVerify(exactly = 1) { tidalAacResolver.resolve(any()) }
+    }
+
+    @Test
+    fun `allowance not spent + fallback off still tries Tidal AAC as before`() = runTest {
+        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
+        coEvery { losslessRegistry.resolve(any()) } returns null
+        coEvery { playlistDao.isTrackInStashMix(any()) } returns false
+        losslessQuota.onHeaders("499/500", "${now / 1000 + 3600}")
+
+        val result = newSubject().downloadTrack(track = stubTrack(), preResolvedUrl = null)
+
+        coVerify(exactly = 1) { tidalAacResolver.resolve(any()) }
+        // The resolver had nothing, so the strict-FLAC download waits as before.
+        assertTrue("expected Deferred, got $result", result is TrackDownloadResult.Deferred)
     }
 
     /** What the relay client does on a "paced" answer: note it on the caller's label, return no URL. */

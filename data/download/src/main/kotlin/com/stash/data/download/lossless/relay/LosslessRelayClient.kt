@@ -1,12 +1,10 @@
 package com.stash.data.download.lossless.relay
 
 import android.util.Log
+import com.stash.data.download.lossless.quota.LosslessQuota
 import java.io.IOException
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.AbstractCoroutineContextElement
@@ -41,6 +39,12 @@ sealed interface RelayMint {
      * first. Not a sick relay — no cooldown. [retryAfterSec] is when the pace line catches up.
      */
     data class Paced(val retryAfterSec: Long) : RelayMint
+    /**
+     * 429 `daily_lossless_cap`: this install's lossless allowance for the day is used up
+     * ([LosslessQuota] now says so). The count is shared by every relay, so no other base is
+     * asked, and the base is not cooled: nothing is wrong with it.
+     */
+    object Spent : RelayMint
 }
 
 /**
@@ -111,7 +115,8 @@ internal data class RelayFileResponse(
 @Singleton
 class LosslessRelayClient @Inject constructor(
     sharedClient: OkHttpClient,
-    private val config: LosslessConfigFetcher,
+    private val signer: RelaySigner,
+    private val quota: LosslessQuota,
 ) {
     /**
      * Derived client so the relay's short timeouts don't leak onto the shared
@@ -181,19 +186,35 @@ class LosslessRelayClient @Inject constructor(
             .addQueryParameter("track_id", trackId.toString())
             .addQueryParameter("format_id", formatId.toString())
             .build()
-        val req = Request.Builder().url(url)
-            .header("X-Stash-Version", PROTOCOL_VERSION)
-            .header("Accept", "application/json")
-            .also { if (download != null) it.header("X-Stash-Purpose", "download") }
-            .also { signIfKeyed(it, trackId, formatId) }
-            .get().build()
-        // The body read stays INSIDE the try: a relay that returns 200 headers and then
-        // stalls throws out of string(), and that must cool this base — not escape into
-        // the caller's breaker (QbdlxQobuzSource.callLimited trips qbdlx wholesale).
-        try {
-            httpClient.newCall(req).execute().use { r ->
+        /**
+         * One signed (when keyed) request and its outcome. Null only when [mayRetrySkew] and the
+         * relay refused the signature on its clock: the caller re-signs with the learned offset
+         * (the request is rebuilt because the signature covers the timestamp).
+         */
+        suspend fun attempt(mayRetrySkew: Boolean): RelayMint? {
+            val b = Request.Builder().url(url)
+                .header("X-Stash-Version", PROTOCOL_VERSION)
+                .header("Accept", "application/json")
+                .also { if (download != null) it.header("X-Stash-Purpose", "download") }
+            val signed = signer.sign(b, "$trackId:$formatId", clock())
+            // A supporter's token goes to the signed config's relays only, never a user's own endpoint.
+            val owner = signer.isOwnerRelay(base)
+            if (owner) signer.entitle(b)
+            val req = b.get().build()
+            return httpClient.newCall(req).execute().use { r ->
                 val body = r.body?.string().orEmpty()
+                // Every owner relay answer may carry the day's lossless count; the cap answer also
+                // has it in its body. A user's own endpoint keeps no shared count: its headers, a
+                // cap-shaped body and its clock are not the owner relays' and change nothing here.
+                if (owner) quota.onResponse(r)
+                val capped = owner && r.code == 429 && quota.onCapBody(body)
                 when (r.code) {
+                    // A signed mint refused with the relay's time attached: our clock is off.
+                    // Adopt the offset and ask once more; a second 401 cools like any other.
+                    401 if signed && owner && mayRetrySkew && signer.adoptServerTime(r, clock()) -> {
+                        note(base, startedAt, "401 clock offset ${signer.clockOffsetSec}s; re-signing")
+                        null
+                    }
                     200 -> {
                         val file = runCatching { json.decodeFromString<RelayFileResponse>(body) }.getOrNull()
                         // https only: a relay handing back a plaintext CDN URL is either
@@ -215,6 +236,12 @@ class LosslessRelayClient @Inject constructor(
                     404 -> {
                         note(base, startedAt, "404 not available")
                         RelayMint.NoMatch
+                    }
+                    429 if capped -> {
+                        // A stream or a download alike: not "no lossless version" for this track.
+                        download?.searchIncomplete = true
+                        note(base, startedAt, "429 daily lossless cap")
+                        RelayMint.Spent
                     }
                     // Only a labelled download is ever paced; any other 429 is a limit and cools below.
                     429 if download != null && body.contains("\"paced\"") -> {
@@ -238,6 +265,13 @@ class LosslessRelayClient @Inject constructor(
                     }
                 }
             }
+        }
+        // The body read stays INSIDE the try: a relay that returns 200 headers and then
+        // stalls throws out of string(), and that must cool this base — not escape into
+        // the caller's breaker (QbdlxQobuzSource.callLimited trips qbdlx wholesale).
+        try {
+            // attempt(false) never answers null; the fallback only satisfies the type.
+            attempt(mayRetrySkew = true) ?: attempt(mayRetrySkew = false) ?: RelayMint.Unavailable
         } catch (e: IOException) {
             // Also covers a body that dies mid-read (callTimeout firing during string()) — that IS a sick relay.
             Log.w(TAG, "relay ${host(base)} unreachable (${e.javaClass.simpleName}) — cooling ${UNAVAILABLE_COOLDOWN_MS / 1000}s")
@@ -270,33 +304,13 @@ class LosslessRelayClient @Inject constructor(
         }
     }
 
-    /**
-     * Relay access control (spec §5.4). When the signed config carries a
-     * `relay_key`, the mint is signed: `X-Stash-Auth` = hex HMAC-SHA256 over
-     * `"<install_id>:<track_id>:<format_id>:<unix_ts>"`, with `X-Stash-Install` and
-     * `X-Stash-Ts` alongside. The install id sits INSIDE the MAC so a captured
-     * header cannot be replayed under another install's allowance; the timestamp
-     * lets the relay reject anything outside its ±5 min window.
-     *
-     * No key → no headers. A user-run custom endpoint built to the public contract
-     * needs none, and a relay that wants auth answers an unsigned mint with a
-     * non-2xx that [mint] already cools for 5 min.
-     *
-     * A DataStore failure fetching the install id falls back to a transient id
-     * rather than throwing: this runs BEFORE the HTTP try, and an exception here
-     * would escape into QbdlxQobuzSource's breaker and trip qbdlx wholesale.
-     *
-     * ponytail: the ±5 min window assumes an NTP-synced clock; add Date-header
-     * skew correction if relay 401s show up in the field.
+    /*
+     * Relay access control (spec §5.4) lives in [RelaySigner], shared with the Tidal client:
+     * a mint signs `"<install_id>:<track_id>:<format_id>:<unix_ts>"` when the signed config
+     * carries a `relay_key`, and a 401 carrying `X-Stash-Server-Time` teaches it the device's
+     * clock offset. No key → no headers; a relay that wants auth answers an unsigned mint
+     * with a non-2xx that [mint] already cools for 5 min.
      */
-    private suspend fun signIfKeyed(b: Request.Builder, trackId: Long, formatId: Int) {
-        val key = config.relayKey.value ?: return
-        val install = runCatching { config.installId() }.getOrElse { UUID.randomUUID().toString() }
-        val ts = clock() / 1000
-        val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key.toByteArray(), "HmacSHA256")) }
-        val sig = mac.doFinal("$install:$trackId:$formatId:$ts".toByteArray()).joinToString("") { "%02x".format(it) }
-        b.header("X-Stash-Install", install).header("X-Stash-Ts", ts.toString()).header("X-Stash-Auth", sig)
-    }
 
     private fun cool(base: String, ms: Long) {
         cooledUntil[base] = clock() + ms

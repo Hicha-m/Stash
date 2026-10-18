@@ -79,6 +79,7 @@ class DownloadManagerVideoLengthTest {
         audioDurationExtractor = mockk<com.stash.core.data.audio.AudioDurationExtractor>(relaxed = true),
         losslessHealthGate = mockk<com.stash.data.download.lossless.LosslessSourceHealthGate>(relaxed = true),
         localFileOps = mockk<com.stash.core.data.files.LocalFileOps> { every { acceptDownloadOrDelete(any()) } returns true },
+        losslessQuota = com.stash.data.download.lossless.quota.LosslessQuota.inMemory(),
     )
 
     private fun youTubeRow(album: String = "", musicVideoType: String? = null) = Track(
