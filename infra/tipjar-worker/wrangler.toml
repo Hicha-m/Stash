@@ -59,14 +59,12 @@ simple = { limit = 10, period = 60 }
 
 # The supporter claim's pending claims and its no-donation email cap (src/claim-store.js): a D1 database of its
 # own, so the try limit and single use are atomic (KV can't do that). Schema: migrations/0001_claims.sql.
-# TODO(owner), before the first deploy with this binding (README.md, "Supporter claim", deploy steps):
-#   npx wrangler d1 create stash-claims            -> paste the database_id it prints below
-#   npx wrangler d1 migrations apply stash-claims --remote
-# A deploy fails until the placeholder is replaced, on purpose.
+# Created 2026-10-17 (wrangler d1 create stash-claims; migrations applied with
+#   npx wrangler d1 migrations apply stash-claims --remote).
 [[d1_databases]]
 binding = "CLAIMS_DB"
 database_name = "stash-claims"
-database_id = "TO_BE_CREATED"
+database_id = "f0b932fb-c48c-4bc1-8489-b8bd67601740"
 migrations_dir = "migrations"
 
 # Secret: ENTITLEMENT_PRIVATE_KEY (the supporter claim, src/entitlement.js): standard base64 of the PKCS#8 DER
