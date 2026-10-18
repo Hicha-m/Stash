@@ -154,6 +154,61 @@ test("over the cap, ?aac=1 plays Tidal's AAC (asked as HIGH, no hires lookup), u
   assert.equal((await fresh.json()).codec, "flac");
 });
 
+test("over the cap, a warm ?aac=1 AAC answer is served from the cache: no Tidal call, uncounted, with the headers", async () => {
+  const r = relay(() => aacInfo(), { env: { FREE_LOSSLESS_DAILY: "2" } }); // a CD-only track: Tidal answers HIGH
+  const warm = await r.call("/stream/td:1?aac=1", signed("td:1", { install: "install-0002" }));
+  assert.equal((await warm.json()).codec, "aac");
+  assert.equal(r.calls.length, 1);
+  r.setUsed(2);
+  const res = await r.call("/stream/td:1?aac=1", signed("td:1"));
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).codec, "aac");
+  assert.equal(r.calls.length, 1, "answered from the warm aac=1 entry");
+  assert.equal(r.db.prepare("SELECT COUNT(*) AS n FROM tidal_response_cache WHERE cache_key LIKE '%aac=cap%'").get().n, 0, "no cold cap entry");
+  assert.equal(res.headers.get("X-Stash-Lossless"), "2/2");
+  assert.equal(r.used(), 2);
+});
+
+test("over the cap, a warm ?aac=1 not_available is served from the cache; a warm FLAC entry is not, Tidal is asked for HIGH", async () => {
+  const r = relay((url) => {
+    if (url.includes("/tracks/7/")) return new Response(JSON.stringify({ subStatus: 4005 }), { status: 401 });
+    return url.includes("audioquality=HIGH") ? aacInfo() : flac();
+  }, { seats: 8, env: { FREE_LOSSLESS_DAILY: "1" } });
+  const other = { install: "install-0002" };
+  assert.equal((await r.call("/stream/td:7?aac=1", signed("td:7", other))).status, 404);
+  assert.equal((await (await r.call("/stream/td:8?aac=1", signed("td:8", other))).json()).codec, "flac");
+  assert.equal(r.calls.length, 2);
+  r.setUsed(1);
+  const miss = await r.call("/stream/td:7?aac=1", signed("td:7"));
+  assert.equal(miss.status, 404);
+  assert.deepEqual(await miss.json(), { error: "not_available" });
+  assert.equal(miss.headers.get("X-Stash-Lossless"), "1/1");
+  assert.equal(r.calls.length, 2, "the warm not_available, no Tidal call");
+  const aac = await r.call("/stream/td:8?aac=1", signed("td:8"));
+  assert.equal((await aac.json()).codec, "aac", "never the warm FLAC past the cap");
+  assert.equal(r.calls.length, 3);
+  assert.match(r.calls[2], /audioquality=HIGH/);
+  assert.equal(r.used(), 1);
+});
+
+test("over the cap, a HIGH answer that is not progressive AAC is a 404 with the counter headers, cached for hours not days", async () => {
+  const r = relay(() => dash(), { env: { FREE_LOSSLESS_DAILY: "1" } });
+  r.setUsed(1);
+  const res = await r.call("/stream/td:1?aac=1", signed("td:1"));
+  assert.equal(res.status, 404);
+  assert.deepEqual(await res.json(), { error: "lossless_unavailable" });
+  assert.equal(res.headers.get("X-Stash-Lossless"), "1/1");
+  assert.equal(res.headers.get("X-Stash-Lossless-Reset"), String(nextResetSec(now())));
+  const row = r.db.prepare("SELECT expires_at FROM tidal_response_cache WHERE cache_key LIKE '%:1:aac=cap:%'").get();
+  assert.ok(row, "cached under the cap key");
+  assert.ok(row.expires_at <= now() + 6 * 3600 + 1, "hours, not five days");
+  const again = await r.call("/stream/td:1?aac=1", signed("td:1"));
+  assert.equal(again.status, 404);
+  assert.equal(again.headers.get("X-Stash-Lossless"), "1/1", "the cached 404 carries the headers too");
+  assert.equal(r.calls.length, 1);
+  assert.equal(r.used(), 1);
+});
+
 test("legacy: a request with no install headers streams uncounted, as before", async () => {
   const r = relay(tidal());
   const res = await r.call("/stream/td:1");

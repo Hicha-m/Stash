@@ -249,7 +249,15 @@ function searchError() { return json({ error: "upstream_error" }, 502); }
 async function stream(trackId, request, env, quota = {}, aac = aacMode(new URL(request.url))) {
   const url = new URL(request.url);
   const web = url.searchParams.get("web") === "1" ? "web" : "app";
-  const key = `stream:${env.TIDAL_COUNTRY_CODE || "US"}:${trackId}:aac=${aac}:web=${web}`;
+  const keyFor = (mode) => `stream:${env.TIDAL_COUNTRY_CODE || "US"}:${trackId}:aac=${mode}:web=${web}`;
+  const key = keyFor(aac);
+  if (aac === "cap") {
+    // Past the daily cap, ?aac=1's own warm entry is the answer when it is already Tidal's AAC (a CD-only track)
+    // or a track-level miss: no Tidal call for an answer the relay already holds. A warm FLAC entry is not
+    // servable here, so only then is the cap's own entry (or Tidal, asked for HIGH) consulted.
+    const warm = await cachedJson(env, keyFor("1"));
+    if (warm && await capServable(warm)) return { response: warm, upstream: false };
+  }
   const cached = await cachedJson(env, key);
   if (cached) return { response: cached, upstream: false };
   if (quota.globalFull) return { response: globalCapped(), upstream: false };
@@ -259,7 +267,9 @@ async function stream(trackId, request, env, quota = {}, aac = aacMode(new URL(r
   let body;
   try { body = await response.clone().json(); } catch { return { response, upstream: true }; }
   if (response.status === 404 && body.error === "lossless_unavailable") {
-    await cacheJson(env, key, response, RESPONSE_CACHE_TTL);
+    // In cap mode this only means Tidal's HIGH answer was not a progressive AAC file: no lasting verdict on the
+    // track, so it is kept hours, not days.
+    await cacheJson(env, key, response, aac === "cap" ? NOT_AVAILABLE_TTL : RESPONSE_CACHE_TTL);
   } else if (response.status === 404 && body.error === "not_available") {
     await cacheJson(env, key, response, NOT_AVAILABLE_TTL);
   } else if (response.status === 200) {
@@ -268,6 +278,12 @@ async function stream(trackId, request, env, quota = {}, aac = aacMode(new URL(r
     if (ttl > 0) await cacheJson(env, key, response, ttl);
   }
   return { response, upstream: true };
+}
+
+/** A cached ?aac=1 answer that is right past the cap too: Tidal's AAC, or a track-level not_available. */
+async function capServable(cached) {
+  const body = await cached.clone().json().catch(() => ({}));
+  return (cached.status === 200 && body.codec === "aac") || (cached.status === 404 && body.error === "not_available");
 }
 
 /**
@@ -791,11 +807,14 @@ function installUnauthorized() { return json({ error: "unauthorized" }, 401, { "
 /**
  * After a /stream answer: a 200 with codec "flac" (progressive, DASH or edge, a relay cache hit included) costs
  * one unit and carries the counter headers. AAC, 404s and errors are free. `fallback` (?aac=1 past the cap):
- * the AAC answer carries the headers, uncounted, so the app sees it is spent.
+ * the AAC answer and a 404 (no AAC either, or not on Tidal) carry the headers, uncounted, so the app sees the
+ * day is spent and does not file the 404 as a lasting lossless miss.
  */
 async function meterLossless(response, standing, fallback) {
-  if (response.status !== 200) return;
-  if (!fallback) {
+  if (fallback) {
+    if (response.status !== 200 && response.status !== 404) return;
+  } else {
+    if (response.status !== 200) return;
     const body = await response.clone().json().catch(() => ({}));
     if (body.codec !== "flac") return;
     await spendLossless(standing);

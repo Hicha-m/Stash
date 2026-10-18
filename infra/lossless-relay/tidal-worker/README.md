@@ -50,10 +50,13 @@ in `infra/lossless-quota/`, copied for the tests to `test/fixtures/quota_*.sql`:
   searches, `/quota`, `/dash`.
 - **At the limit:** `429 {"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":<epoch s>}` with
   `Retry-After` = seconds to `resetsAt` (the next UTC midnight); no seat is taken. **Except `?aac=1`**: past the limit
-  it is answered with Tidal's AAC (asked for `HIGH`, like `?aac=only`, without the hires lookup; cache key
-  `aac=cap`), uncounted, with the counter headers, so streaming keeps playing lossy until the reset. `?aac=only` is
-  never capped or counted.
-- **Headers** on every counted answer, the over-cap AAC answer, the 429 and `/quota`: `X-Stash-Lossless:
+  it is answered with Tidal's AAC, uncounted, with the counter headers, so streaming keeps playing lossy until the
+  reset. The relay first serves `?aac=1`'s own cached answer when that is already AAC (a CD-only track) or a
+  `not_available` miss, with no Tidal call; otherwise its own cache key `aac=cap`, then Tidal asked for `HIGH` (like
+  `?aac=only`, without the hires lookup). If Tidal's `HIGH` answer is not a progressive AAC file the answer is `404
+  lossless_unavailable` with the counter headers, cached under `aac=cap` for 6 h (not 5 days). `?aac=only` is never
+  capped or counted.
+- **Headers** on every counted answer, the over-cap `?aac=1` answers (AAC and 404), the 429 and `/quota`: `X-Stash-Lossless:
   <used>/<limit>` (`used` after this answer; `<used>/unlimited` for a supporter) and `X-Stash-Lossless-Reset: <epoch
   s>`. JSON answers set no CORS headers, so there is no `Access-Control-Expose-Headers` to extend
   (`LOSSLESS_HEADER_NAMES` in `src/quota.js` is ready if that changes).
