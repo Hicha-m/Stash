@@ -171,13 +171,54 @@ test("REQUIRE_INSTALL=1 refuses a request with no install headers; a signed one 
   assert.equal(r.calls.length, 1);
 });
 
-test("bad or forged install headers are a 401 with X-Stash-Server-Time, always; RELAY_KEY_PREV still verifies", async () => {
-  const r = relay(tidal(), { env: { RELAY_KEY: "new-key", RELAY_KEY_PREV: KEY } });
-  const forged = [
-    signed("td:1", { key: "bogus" }), signed("td:2"), signed("td:1", { ts: now() - 301 }), signed("td:1", { ts: now() + 301 }),
-    { "X-Stash-Install": INSTALL }, { ...signed("td:1"), "X-Stash-Install": "someone-else-1" }, signed("quota"),
-  ];
-  for (const h of forged) {
+/** Install headers that fail verification for /stream/td:1 for a reason other than a skewed clock. */
+const FORGED = () => [
+  signed("td:1", { key: "bogus" }), signed("td:2"), { "X-Stash-Install": INSTALL }, { ...signed("td:1"), "X-Stash-Install": "someone-else-1" },
+  signed("quota"), { ...signed("td:1"), "X-Stash-Auth": "zz" }, signed("td:1", { key: "bogus", ts: now() - 3600 }),
+];
+const SKEWED = () => [signed("td:1", { ts: now() - 301 }), signed("td:1", { ts: now() + 301 })];
+
+/** Runs `fn` with console.warn captured; returns the warnings. */
+async function warnings(fn) {
+  const original = console.warn;
+  const seen = [];
+  console.warn = (...args) => seen.push(args.join(" "));
+  try { await fn(); } finally { console.warn = original; }
+  return seen;
+}
+
+test("REQUIRE_INSTALL=0: a failing install signature (bad key, wrong track, partial, malformed) is served uncounted and logged, redacted", async () => {
+  const r = relay(tidal(), { seats: 8 });
+  for (const h of FORGED()) {
+    const logged = await warnings(async () => {
+      const res = await r.call("/stream/td:1", h);
+      assert.equal(res.status, 200, JSON.stringify(h));
+      assert.equal(res.headers.get("X-Stash-Lossless"), null, JSON.stringify(h));
+      assert.equal(res.headers.get("X-Stash-Server-Time"), null, JSON.stringify(h));
+    });
+    const line = logged.find((l) => l.startsWith("install_signature_failed"));
+    assert.ok(line, JSON.stringify(h));
+    assert.match(line, /"reason":"(malformed|bad_signature)"/);
+    assert.ok(!line.includes(INSTALL) && !line.includes("someone-else-1"), "never the full install id");
+    if (h["X-Stash-Auth"]) assert.ok(!line.includes(h["X-Stash-Auth"]), "never the signature");
+  }
+  assert.equal(r.qdb.prepare("SELECT COUNT(*) AS n FROM usage").get().n, 0, "nothing counted");
+});
+
+test("REQUIRE_INSTALL=0: a genuine signature with ts outside ±300 s stays a 401 with X-Stash-Server-Time (the clock self-corrects)", async () => {
+  const r = relay(tidal());
+  for (const h of SKEWED()) {
+    const res = await r.call("/stream/td:1", h);
+    assert.equal(res.status, 401, JSON.stringify(h));
+    assert.deepEqual(await res.json(), { error: "unauthorized" });
+    assert.ok(Math.abs(Number(res.headers.get("X-Stash-Server-Time")) - now()) <= 1);
+  }
+  assert.equal(r.calls.length, 0);
+});
+
+test("REQUIRE_INSTALL=1: every failing install signature is a 401 with X-Stash-Server-Time; RELAY_KEY_PREV still verifies", async () => {
+  const r = relay(tidal(), { env: { REQUIRE_INSTALL: "1", RELAY_KEY: "new-key", RELAY_KEY_PREV: KEY } });
+  for (const h of [...FORGED(), ...SKEWED()]) {
     const res = await r.call("/stream/td:1", h);
     assert.equal(res.status, 401, JSON.stringify(h));
     assert.deepEqual(await res.json(), { error: "unauthorized" });

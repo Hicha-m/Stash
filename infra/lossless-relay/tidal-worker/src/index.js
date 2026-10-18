@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { verifySigned } from "./auth.js";
+import { verifySigned, MAX_SKEW_S } from "./auth.js";
 import { readStanding, spendLossless, losslessHeaders, capAnswer, quotaBody, pruneUsage } from "./quota.js";
 
 const API = "https://api.tidal.com/v1";
@@ -748,7 +748,11 @@ async function admitStream(request, env) {
  * relay's key (secrets RELAY_KEY / RELAY_KEY_PREV, same values) over "<install>:<middle>:<ts>".
  * @returns {{subject: string}|{denial: Response}|{none: "legacy"|"no_key"}} legacy = no install headers at all
  * (served uncounted, as before, unless REQUIRE_INSTALL=1); no_key = RELAY_KEY unset, so headers can't be
- * checked and the counter is off. A bad or forged signature is always a 401 with X-Stash-Server-Time.
+ * checked and the counter is off.
+ * A signature that fails: with REQUIRE_INSTALL=1 always a 401 with X-Stash-Server-Time. Otherwise only a skewed
+ * clock is a 401 (a genuine signature whose ts is outside ±MAX_SKEW_S, so the app corrects itself from
+ * X-Stash-Server-Time); any other failure (bad HMAC, wrong key, malformed headers) is logged and served as legacy,
+ * uncounted, so an app with a stale key or a bug keeps playing while the counter is still optional.
  */
 function installOf(request, env, middle) {
   const h = (name) => request.headers.get(name) || "";
@@ -761,8 +765,23 @@ function installOf(request, env, middle) {
     if (!warnedNoRelayKey) { warnedNoRelayKey = true; console.warn("RELAY_KEY not set: install headers ignored, daily lossless counter OFF"); }
     return { none: "no_key" };
   }
-  if (!verifySigned({ install, ts, auth }, middle, now(), [env.RELAY_KEY, env.RELAY_KEY_PREV])) return { denial: installUnauthorized() };
-  return { subject: `i:${install}` };
+  const headers = { install, ts, auth };
+  const keys = [env.RELAY_KEY, env.RELAY_KEY_PREV];
+  const t = now();
+  if (verifySigned(headers, middle, t, keys)) return { subject: `i:${install}` };
+  if (requireInstall) return { denial: installUnauthorized() };
+  // Skewed clock: the signature verifies at its own ts. Checked by verifying at ts, so a forged or junk
+  // signature with an old ts is never told the server time (it is served as legacy below instead).
+  const skewed = /^\d{1,12}$/.test(ts) && Math.abs(t - Number(ts)) > MAX_SKEW_S && verifySigned(headers, middle, Number(ts), keys);
+  if (skewed) return { denial: installUnauthorized() };
+  // Redacted: the reason and the install id's last 4 characters only; never the signature or the full id.
+  console.warn(`install_signature_failed ${JSON.stringify({ route: middle === "quota" ? "quota" : "stream", install: install.slice(-4), reason: badShape(install, ts, auth) ? "malformed" : "bad_signature" })}`);
+  return { none: "legacy" };
+}
+
+/** True when the install headers are missing or not shaped like the app's (partial, junk), as opposed to a bad HMAC. */
+function badShape(install, ts, auth) {
+  return !/^[A-Za-z0-9-]{8,64}$/.test(install) || !/^\d{1,12}$/.test(ts) || !/^[0-9a-f]{64}$/.test(auth);
 }
 let warnedNoRelayKey = false;
 

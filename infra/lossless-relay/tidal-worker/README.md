@@ -36,9 +36,13 @@ in `infra/lossless-quota/`, copied for the tests to `test/fixtures/quota_*.sql`:
   exactly as the Qobuz relay's mint signature. Messages: `/stream/td:<id>` and `/stream/<id>` sign
   `<install>:td:<id>:<ts>`; `/quota` signs `<install>:quota:<ts>`. `ts` must be within ±300 s. Verified with the
   `RELAY_KEY` secret and, during a rotation, `RELAY_KEY_PREV`: the **same values as the Qobuz relay's**.
-- **401s.** A bad, partial or forged signature, or a skewed `ts`, is `401 {"error":"unauthorized"}` with
-  `X-Stash-Server-Time: <epoch s>` (the access-token 401 never carries that header). A request with **no** install
-  headers is served as before, uncounted, unless `REQUIRE_INSTALL="1"` (default `"0"`), which makes it a 401 too.
+- **401s.** A genuine signature whose `ts` is outside ±300 s (a skewed device clock) is `401 {"error":"unauthorized"}`
+  with `X-Stash-Server-Time: <epoch s>`, so the app can correct its clock and retry (the access-token 401 never
+  carries that header). While `REQUIRE_INSTALL` is not `"1"` (default `"0"`), any other failing signature (bad HMAC,
+  wrong or stale key, partial or malformed headers) is served like a request with **no** install headers: as before,
+  uncounted, and logged as `install_signature_failed` (reason and the install id's last 4 characters only). With
+  `REQUIRE_INSTALL="1"` every failing signature, and a request with no install headers, is the 401. `/quota` cannot
+  be served uncounted, so there any failing signature is the 401.
   Without the `RELAY_KEY` secret the install headers are ignored and the counter is off (a warning per isolate);
   with `REQUIRE_INSTALL="1"` and no key, `/stream` is a 500 `server_misconfigured`.
 - **Counts (one unit):** a `200` `/stream` answer with `codec: "flac"`: progressive, DASH or `?web=1` edge, a relay
