@@ -11,15 +11,23 @@
  * Endpoints:
  *   GET /v1/qobuz/file?track_id=&format_id=   signed (X-Stash-Install/-Ts/-Auth), X-Stash-Version: 1,
  *                                             optional X-Stash-Purpose: stream | download
+ *   GET /v1/quota                             signed (X-Stash-Install/-Ts/-Auth over "<install>:quota:<ts>"):
+ *                                             today's daily lossless count, not counted itself
  *   GET /v1/status                            reachability probe for the Settings "Test" button
  *
- * State: D1 (accounts' rotation state, the shared mint cache, daily quotas).
+ * State: D1 (accounts' rotation state, the shared mint cache, daily quotas), plus QUOTA_DB: the daily
+ * lossless counter shared with the Tidal relay (src/quota.js). A lossless mint answered (a cache HIT
+ * included) costs the install one unit, written after the answer (ctx.waitUntil); at FREE_LOSSLESS_DAILY it is
+ * answered 429 daily_lossless_cap, checked before the cache and the pool are touched.
+ * A valid supporter token (optional header X-Stash-Entitlement, on mints and /v1/quota) lifts that limit and
+ * INSTALL_DAILY_CAP, up to SUPPORTER_DAILY_CAP a day per token; the network, /48 and global caps still apply.
  * Secrets: RELAY_KEY, RELAY_KEY_PREV (optional), QOBUZ_ACCOUNTS, QOBUZ_ACCOUNTS_EXTRA and
  *          QOBUZ_ACCOUNTS_RECOVERED, QOBUZ_ACCOUNTS_RECOVERED_2 and QOBUZ_ACCOUNTS_RECOVERED_3 (optional additive arrays).
  *          Deploy: see README.md.
  */
 import { createHmac } from "node:crypto";
-import { verifyMint } from "./auth.js";
+import { verifyMint, verifyQuota } from "./auth.js";
+import { readStanding, spendLossless, losslessHeaders, capAnswer, quotaBody, pruneUsage, hooks } from "./quota.js";
 import { mintFromQobuz } from "./qobuz.js";
 import {
     getCached, putCachedStmt, readQuota, readQuotas, bumpQuotaStmt,
@@ -51,8 +59,16 @@ export function refusalNamesTrack(reason) {
 const ensured = new WeakMap();
 
 export default {
-    fetch: (request, env) => handle(request, env, globalThis.fetch, Math.floor(Date.now() / 1000)),
-    scheduled: (event, env) => prune(env.DB, Math.floor(Date.now() / 1000)),
+    fetch: (request, env, ctx) => handle(request, env, globalThis.fetch, Math.floor(Date.now() / 1000), ctx),
+    // The two prunes touch different databases and run independently: one failing never skips the other.
+    // A failure is still rethrown once both have run, so the cron run shows as failed in the dashboard.
+    scheduled: async (event, env) => {
+        const nowSec = Math.floor(Date.now() / 1000);
+        const results = await Promise.allSettled([prune(env.DB, nowSec), pruneUsage(env, nowSec)]);
+        const failed = results.filter((r) => r.status === "rejected").map((r) => r.reason);
+        for (const e of failed) console.error(`scheduled prune failed: ${e?.message || e}`);
+        if (failed.length) throw failed[0];
+    },
 };
 
 /**
@@ -60,21 +76,24 @@ export default {
  * Any throw (a D1 error mid-request) is answered 503 busy: the base cools 60 s and the device tries
  * the next one. Uncaught, it became Cloudflare's bare 500 page, which the client reads as "broken"
  * and cools for 5 minutes.
+ * `ctx`: the Worker's ExecutionContext. Its waitUntil carries the daily lossless counter's bump past the
+ * answer (spendAfter); tests pass one and await what it collected.
  */
-export async function handle(request, env, fetchImpl, nowSec) {
+export async function handle(request, env, fetchImpl, nowSec, ctx) {
     const url = new URL(request.url);
     if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
     if (url.pathname === "/v1/status") return json({ ok: true }, 200);
-    if (url.pathname !== "/v1/qobuz/file") return json({ error: "not_found" }, 404);
+    if (url.pathname !== "/v1/qobuz/file" && url.pathname !== "/v1/quota") return json({ error: "not_found" }, 404);
     try {
-        return await mint(request, url, env, fetchImpl, nowSec);
+        if (url.pathname === "/v1/quota") return await quota(request, env, nowSec);
+        return await mint(request, url, env, fetchImpl, nowSec, ctx);
     } catch (e) {
         console.error(e); // visible in `wrangler tail`
         return json({ error: "busy" }, 503, { "Retry-After": "60" });
     }
 }
 
-async function mint(request, url, env, fetchImpl, nowSec) {
+async function mint(request, url, env, fetchImpl, nowSec, ctx) {
     const h = (name) => request.headers.get(name) || "";
     if (h("X-Stash-Version") !== "1") return json({ error: "bad_version" }, 400);
     const trackRaw = url.searchParams.get("track_id") || "";
@@ -103,8 +122,17 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         if (!success) return json({ error: "rate_limited" }, 429, { "Retry-After": "60" });
     }
 
+    // The daily lossless counter, shared with the Tidal relay. Checked before any answer, before the
+    // cache and the pool are touched: a cache HIT is still a lossless stream for the user, so it counts
+    // too. Off (null) without QUOTA_DB. Only the check waits; the bump runs after the answer (spendAfter).
+    const standing = await standingOf(request, env, "i:" + install, nowSec);
+    if (standing?.over) {
+        const cap = capAnswer(standing, nowSec);
+        return json(cap.body, cap.status, cap.headers);
+    }
+
     const cached = await getCached(env.DB, trackId, formatId, nowSec);
-    if (cached) return ok(cached.url, cached.got_format_id, cached.bit_depth, cached.sample_rate, "HIT");
+    if (cached) return ok(cached.url, cached.got_format_id, cached.bit_depth, cached.sample_rate, "HIT", await spendAfter(standing, ctx));
 
     const day = dayKey(nowSec);
     const caps = vars(env);
@@ -129,7 +157,9 @@ async function mint(request, url, env, fetchImpl, nowSec) {
     // rotates it meets the network cap instead. An IPv6 caller also meets its /48's aggregate cap
     // (network48Of): one free tunnel-broker /48 holds 256 /56s, each with its own network cap.
     // Every counter, and the free-404 tallies (spendStmts), come back in one read. No IP_SALT, no
-    // network tag: the network caps are off.
+    // network tag: the network caps are off. A supporter (a valid token under its own daily ceiling, see
+    // quota.js) skips only the install cap, which would otherwise stop "unlimited" at INSTALL_DAILY_CAP; the
+    // network, /48 and global caps still apply to supporters (owner's decision, 2026-10-17).
     const tag = ipTag(env, network);
     const tag48 = ipTag(env, network48Of(h("CF-Connecting-IP")));
     const keys = {
@@ -137,7 +167,7 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         network48: tag48 && "w:" + tag48, free404w: tag48 && "wf:" + tag48,
     };
     const used = await readQuotas(env.DB, day, Object.values(keys).filter(Boolean));
-    if (used[keys.install] >= caps.install || (tag && used[keys.network] >= caps.network) || (tag48 && used[keys.network48] >= caps.network48)) {
+    if ((!standing?.supporter && used[keys.install] >= caps.install) || (tag && used[keys.network] >= caps.network) || (tag48 && used[keys.network48] >= caps.network48)) {
         return json({ error: "rate_limited" }, 429, { "Retry-After": "3600" });
     }
 
@@ -177,7 +207,8 @@ async function mint(request, url, env, fetchImpl, nowSec) {
             }
             if (r.kind === "ok" && r.etsp) writes.push(putCachedStmt(env.DB, trackId, formatId, r)); // no etsp → serve once, never cache
             await env.DB.batch(writes);
-            return r.kind === "ok" ? ok(r.url, r.formatId, r.bitDepth, r.sampleRateHz, "MISS") : json({ error: "not_available" }, 404);
+            if (r.kind !== "ok") return json({ error: "not_available" }, 404); // a 404 never counts as lossless
+            return ok(r.url, r.formatId, r.bitDepth, r.sampleRateHz, "MISS", await spendAfter(standing, ctx));
         }
         if (r.kind === "dead") await killAccount(env.DB, label, r.reason);
         // A transient reached Qobuz and cools an account, so it costs the caller's network one unit
@@ -200,6 +231,89 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         return json({ error: "not_available" }, 404);
     }
     return json({ error: "busy" }, 503, { "Retry-After": "60" });
+}
+
+/**
+ * GET /v1/quota: where the install stands today, for the app's cold start. Signed like a mint but over
+ * "<install>:quota:<ts>", behind the same per-network limiter, and never counted. 404 quota_off when the
+ * counter is off (no QUOTA_DB): the same status an older relay without the route gives.
+ */
+async function quota(request, env, nowSec) {
+    const h = (name) => request.headers.get(name) || "";
+    if (!env.RELAY_KEY) return json({ error: "server_misconfigured", message: "RELAY_KEY not set" }, 500);
+    const install = h("X-Stash-Install");
+    if (!verifyQuota({ install, ts: h("X-Stash-Ts"), auth: h("X-Stash-Auth") }, nowSec, [env.RELAY_KEY, env.RELAY_KEY_PREV])) {
+        return json({ error: "unauthorized" }, 401, { "X-Stash-Server-Time": String(nowSec) });
+    }
+    if (env.MINT_RL) {
+        const { success } = await env.MINT_RL.limit({ key: networkOf(h("CF-Connecting-IP")) });
+        if (!success) return json({ error: "rate_limited" }, 429, { "Retry-After": "60" });
+    }
+    const standing = await standingOf(request, env, "i:" + install, nowSec);
+    if (!standing) return json({ error: "quota_off" }, 404);
+    return json(quotaBody(standing), 200, { ...losslessHeaders(standing), "Cache-Control": "no-store" });
+}
+
+/** Per QUOTA_DB binding (one per isolate in production): the stash-quota tables found missing, once a read failed on them. */
+const missingQuotaTables = new WeakMap();
+
+/**
+ * readStanding, but quiet about a stash-quota database whose migrations were never applied. quota.js logs every
+ * failed read, so with QUOTA_DB bound and its tables missing every request logged one. The first failed read
+ * here looks the tables up; when one is missing the relay says so once and from then on skips only the reads
+ * that can only fail, failing open exactly as a failed read does:
+ *   no `usage`          → every read fails: the counter is off for every request;
+ *   no `revoked_tokens` → only a valid supporter token's read joins it: that request is served with the counter
+ *                          off, while free requests are counted as usual.
+ * Any other failure (a transient D1 error) is left to quota.js, logged and failed open per request as before.
+ * Applying the migrations takes effect as isolates recycle; a redeploy applies it at once.
+ */
+async function standingOf(request, env, subject, nowSec) {
+    const db = env.QUOTA_DB;
+    const missing = db ? missingQuotaTables.get(db) : undefined;
+    if (missing) {
+        if (missing.usage) return null;
+        if (missing.revoked && (await hooks.entitlementOf(request, env, nowSec))) return null;
+        return readStanding(request, env, subject, nowSec);
+    }
+    const standing = await readStanding(request, env, subject, nowSec);
+    if (standing || !db || !subject) return standing; // counted, or off by design (no binding, no subject)
+    const found = await quotaTablesMissing(db);
+    if (found) {
+        missingQuotaTables.set(db, found);
+        const names = [found.usage && "usage", found.revoked && "revoked_tokens"].filter(Boolean).join(" and ");
+        console.error(`stash-quota has no ${names} table: the daily lossless counter fails open (${found.usage ? "off" : "off for supporter tokens"}) `
+            + "until infra/lossless-quota/migrations are applied; logged once per isolate");
+    }
+    return null;
+}
+
+/** `{ usage, revoked }` (true = that table is missing), or null when both exist or the lookup itself fails. */
+async function quotaTablesMissing(db) {
+    try {
+        const { results } = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('usage', 'revoked_tokens')").all();
+        const names = new Set((results || []).map((r) => r.name));
+        const missing = { usage: !names.has("usage"), revoked: !names.has("revoked_tokens") };
+        return missing.usage || missing.revoked ? missing : null;
+    } catch {
+        return null; // D1 itself is failing: a transient, not a schema problem
+    }
+}
+
+/**
+ * The counter headers for a lossless answer about to be served, with its one unit spent AFTER the answer:
+ * the bump (a D1 write to stash-quota) rides on ctx.waitUntil instead of holding up the stream. The header
+ * reports `used + 1`, the count this answer makes; under concurrency it can trail the row by the answers in
+ * flight, as the read-then-bump cap check already can (quota.js). Without a ctx (a direct caller) the bump
+ * is awaited. {} with the counter off. spendLossless never rejects, so neither does the deferred promise.
+ */
+async function spendAfter(standing, ctx) {
+    if (!standing) return {};
+    const headers = losslessHeaders({ ...standing, used: standing.used + 1 });
+    const bump = spendLossless(standing);
+    if (typeof ctx?.waitUntil === "function") ctx.waitUntil(bump);
+    else await bump;
+    return headers;
 }
 
 /**
@@ -325,9 +439,12 @@ function parseAccounts(env) {
     });
 }
 
-/** The spec §1 success shape. sample_rate is already Hz. `no-store`: the URL is short-lived and per-request headers gate it. */
-function ok(url, formatId, bitDepth, sampleRateHz, cache) {
-    return json({ url, format_id: formatId, bit_depth: bitDepth, sample_rate: sampleRateHz }, 200, { "X-Stash-Cache": cache, "Cache-Control": "no-store" });
+/**
+ * The spec §1 success shape. sample_rate is already Hz. `no-store`: the URL is short-lived and per-request headers gate it.
+ * `extra`: the daily lossless counter headers (none with the counter off).
+ */
+function ok(url, formatId, bitDepth, sampleRateHz, cache, extra = {}) {
+    return json({ url, format_id: formatId, bit_depth: bitDepth, sample_rate: sampleRateHz }, 200, { "X-Stash-Cache": cache, "Cache-Control": "no-store", ...extra });
 }
 
 function json(obj, status, extra = {}) {
