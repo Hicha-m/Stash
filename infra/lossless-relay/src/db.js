@@ -76,6 +76,18 @@ RETURNING label`).bind(nowSec, hourKey(nowSec), dayKey(nowSec), caps.hourly, cap
     return row ? row.label : null;
 }
 
+/**
+ * Whether an account in the secret (`labels`) other than `exclude` is live: cooling or over its caps
+ * right now, perhaps, but it will serve again today. A dead one (USER_BLOCKED included) is not: it has
+ * no second opinion to give. Read only on the rare uncross-checked refusal, so a full scan is fine.
+ */
+export async function hasOtherLiveAccount(db, exclude, labels) {
+    const row = await db.prepare(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE state = 'live' AND label IS NOT ?1 AND label IN (SELECT value FROM json_each(?2))) AS live",
+    ).bind(exclude, JSON.stringify(labels)).first();
+    return Boolean(row?.live);
+}
+
 /** Give every label in the secret a state row. INSERT OR IGNORE writes nothing for a known label. */
 export async function ensureAccounts(db, labels) {
     if (labels.length === 0) return;

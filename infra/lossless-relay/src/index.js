@@ -30,7 +30,7 @@ import { readStanding, spendLossless, losslessHeaders, capAnswer, quotaBody, pru
 import { mintFromQobuz } from "./qobuz.js";
 import {
     getCached, putCachedStmt, readQuota, readQuotas, bumpQuotaStmt,
-    selectAccount, ensureAccounts, coolAccountStmt, killAccount, prune, dayKey,
+    selectAccount, ensureAccounts, coolAccountStmt, killAccount, hasOtherLiveAccount, prune, dayKey,
 } from "./db.js";
 
 /** The lossless formats the client asks for (LosslessQualityTier → 6 / 7 / 27). Data Saver's 5 (MP3 320) is answered 404 below. */
@@ -207,11 +207,12 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         // (2026-10-17 audit: free, a network could keep the pool cooling at no cost to itself).
         else await env.DB.batch([coolAccountStmt(env.DB, label, nowSec + TRANSIENT_COOL_S), ...networkStmts(env.DB, day, keys)]);
     }
-    if (noSecondOpinion && accounts.length > 1) {
-        // The cross-check never ran: every other account was cooling, capped or dead. A 404 here is cached
-        // on the device as "not available" for good, so answer busy and let it ask again later. The
-        // refusal was a real Qobuz call, so it costs the network one unit, like a transient. (A one-account
-        // pool has no second opinion to wait for: its refusal stands, below.)
+    if (noSecondOpinion && accounts.length > 1 && await hasOtherLiveAccount(env.DB, refusedBy, accounts.map((a) => a.label))) {
+        // The cross-check never ran: every other live account was cooling or over its caps. A 404 here is
+        // cached on the device as "not available" for good, so answer busy and let it ask again later. The
+        // refusal was a real Qobuz call, so it costs the network one unit, like a transient. (A pool with no
+        // other LIVE account, one account or the rest dead, has no second opinion to wait for: its refusal
+        // stands, below. Waiting on a dead one would answer 503 to that track until a prune revives it.)
         const charge = networkStmts(env.DB, day, keys);
         if (charge.length) await env.DB.batch(charge); // none without IP_SALT, and D1 refuses an empty batch
         return json({ error: "busy" }, 503, { "Retry-After": "60" });

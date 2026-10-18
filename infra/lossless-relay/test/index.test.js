@@ -233,6 +233,28 @@ test("without IP_SALT the uncross-checked refusal is still a 503, with no empty 
     assert.deepEqual(errors, []); // answered on purpose, not by the catch-all
 });
 
+test("a codeless refusal when every other account is dead (blocked or not) → 404 like a one-account pool, quota once, not cooled", async () => {
+    for (const reason of ["USER_BLOCKED", "401"]) {
+        const e = env({ IP_SALT: "salt-1" });
+        assert.equal((await handle(mintReq(41, 27), e, qobuz([200, GOOD]), NOW)).status, 200); // rows for a and b; a served
+        await e.DB.prepare("UPDATE accounts SET state = 'dead', dead_reason = ?1 WHERE label = 'b'").bind(reason).run();
+        await e.DB.prepare("UPDATE accounts SET last_used_at = 0 WHERE label = 'a'").run();
+        const q = qobuz([200, { ...GOOD, sample: true }], [200, GOOD]);
+        const r = await handle(mintReq(42, 27), e, q, NOW + 1);
+        assert.equal(r.status, 404, reason);
+        assert.deepEqual(await r.json(), { error: "not_available" }, reason);
+        assert.equal(q.calls.length, 1, reason);
+        assert.equal((await e.DB.prepare("SELECT n FROM quota WHERE key = 'global'").first()).n, 2, reason); // the 200 and this 404
+        assert.equal((await e.DB.prepare("SELECT cooling_until FROM accounts WHERE label = 'a'").first()).cooling_until, 0, reason);
+    }
+    // The same pool with b merely cooling still waits for b's second opinion: 503.
+    const cooling = env();
+    assert.equal((await handle(mintReq(41, 27), cooling, qobuz([200, GOOD]), NOW)).status, 200);
+    await cooling.DB.prepare("UPDATE accounts SET cooling_until = ?1 WHERE label = 'b'").bind(NOW + 300).run();
+    await cooling.DB.prepare("UPDATE accounts SET last_used_at = 0 WHERE label = 'a'").run();
+    assert.equal((await handle(mintReq(42, 27), cooling, qobuz([200, { ...GOOD, sample: true }]), NOW + 1)).status, 503);
+});
+
 test("the account cooled by a cross-check sits out the next miss", async () => {
     const e = env(); const q = qobuz([200, { ...GOOD, sample: true }], [200, GOOD], [200, { ...GOOD, url: "https://cdn.example/g.flac?etsp=" + (NOW + 3599) }]);
     assert.equal((await handle(mintReq(42, 27), e, q, NOW)).status, 200);
