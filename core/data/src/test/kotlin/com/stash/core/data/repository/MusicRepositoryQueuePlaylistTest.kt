@@ -674,6 +674,7 @@ class MusicRepositoryQueuePlaylistTest {
             stashMixRecipeDao = mockk(relaxed = true),
             downloadNetworkPreference = network,
             streamingPreference = streaming,
+            libraryScopePreference = mockk(relaxed = true),
             localFileOps = mockk(relaxed = true),
             syncPreferencesManager = sync,
             singleTrackDownloadEnqueuer = enqueuer,

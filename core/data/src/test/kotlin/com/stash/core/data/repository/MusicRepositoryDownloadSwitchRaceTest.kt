@@ -132,6 +132,7 @@ class MusicRepositoryDownloadSwitchRaceTest {
             stashMixRecipeDao = mockk(relaxed = true),
             downloadNetworkPreference = mockk(relaxed = true),
             streamingPreference = streamingPreference,
+            libraryScopePreference = mockk(relaxed = true),
             localFileOps = mockk(relaxed = true),
             syncPreferencesManager = mockk(relaxed = true),
             singleTrackDownloadEnqueuer = mockk(relaxed = true),

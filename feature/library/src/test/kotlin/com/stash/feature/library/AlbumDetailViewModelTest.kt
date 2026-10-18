@@ -3,6 +3,7 @@ package com.stash.feature.library
 import androidx.lifecycle.SavedStateHandle
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.media.PlayerRepository
+import com.stash.core.media.streaming.ConnectivityMonitor
 import com.stash.core.model.PlayerState
 import com.stash.core.model.Track
 import kotlinx.coroutines.Dispatchers
@@ -21,9 +22,11 @@ import org.junit.Assert.assertEquals
 import org.junit.Before
 import org.junit.Test
 import org.mockito.kotlin.any
+import org.mockito.kotlin.argThat
 import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
+import org.mockito.kotlin.never
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 
@@ -156,39 +159,14 @@ class AlbumDetailViewModelTest {
     }
 
     @Test
-    fun albumTracks_include_rows_whose_credits_contain_the_primary_act() = runTest {
+    fun albumTracks_are_the_repository_songs_for_the_route_album_and_artist() = runTest {
+        // The credit match (collab rows in, other acts out) and the Download switch live in
+        // MusicRepository.getTracksByAlbum (MusicRepositoryLibraryScopeTest): the page lists
+        // what it returns for its own route.
         val album = "HEROES & VILLAINS"
         val tracks = listOf(
             Track(1L, "Superhero", "Metro Boomin, Future", album = album),
             Track(2L, "Niagara Falls", "Metro Boomin, Travis Scott, 21 Savage", album = album),
-            Track(3L, "Trance", "Metro Boomin, Travis Scott", album = album),
-            Track(4L, "Around Me", "Metro Boomin, Don Toliver", album = album),
-        )
-        // A different album must not leak in.
-        val otherAlbum = Track(5L, "Highest in the Room", "Travis Scott", album = "JACKBOYS")
-        val musicRepo = musicRepoMockWithTracks(tracks + otherAlbum)
-
-        val vm = buildVm(
-            musicRepository = musicRepo,
-            savedStateHandle = SavedStateHandle(
-                mapOf("albumName" to album, "artistName" to "Metro Boomin"),
-            ),
-        )
-
-        val state = vm.uiState.first { !it.isLoading }
-        assertEquals(listOf(1L, 2L, 3L, 4L), state.tracks.map { it.id })
-        // The route's artist is still surfaced in the header for context.
-        assertEquals("Metro Boomin", state.artistName)
-    }
-
-    @Test
-    fun albumTracks_drop_rows_whose_credits_omit_the_primary_act() = runTest {
-        // matchesArtistCredits pins on the album card's primary act: a row on
-        // the same album credited to a different act is excluded.
-        val album = "HEROES & VILLAINS"
-        val tracks = listOf(
-            Track(1L, "Superhero", "Metro Boomin, Future", album = album),
-            Track(2L, "Private Dancer", "Don Toliver", album = album),
         )
         val musicRepo = musicRepoMockWithTracks(tracks)
 
@@ -200,7 +178,108 @@ class AlbumDetailViewModelTest {
         )
 
         val state = vm.uiState.first { !it.isLoading }
-        assertEquals(listOf(1L), state.tracks.map { it.id })
+        assertEquals(listOf(1L, 2L), state.tracks.map { it.id })
+        verify(musicRepo).getTracksByAlbum(album, "Metro Boomin")
+        // The route's artist is still surfaced in the header for context.
+        assertEquals("Metro Boomin", state.artistName)
+    }
+
+    // ------------------------------------------------------------------
+    // Playing from the album page
+    // ------------------------------------------------------------------
+
+    /** Songs 1 and 3 are downloaded, 2 and 4 aren't (an album page in Stream only). */
+    private val albumSongs = listOf(
+        track(1L).copy(filePath = "/music/1.flac", isDownloaded = true),
+        track(2L),
+        track(3L).copy(filePath = "/music/3.flac", isDownloaded = true),
+        track(4L),
+    )
+
+    private fun kotlinx.coroutines.test.TestScope.albumVm(
+        playerRepo: PlayerRepository,
+        online: Boolean,
+        songs: List<Track> = albumSongs,
+    ): AlbumDetailViewModel {
+        val vm = buildVm(
+            playerRepository = playerRepo,
+            musicRepository = musicRepoMockWithTracks(songs),
+            connectivityMonitor = mock { on { isConnected() } doReturn online },
+        )
+        backgroundScope.launch { vm.uiState.collect {} }
+        runCurrent()
+        return vm
+    }
+
+    @Test
+    fun online_tapping_a_song_that_isnt_downloaded_plays_that_song_with_every_song_queued() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = albumVm(playerRepo, online = true)
+
+        vm.playTrack(2L)
+        runCurrent()
+
+        // Index 1 = song 2. It used to fall back to index 0 of the downloaded ones: song 1.
+        verify(playerRepo).setQueue(eq(albumSongs), eq(1), any())
+    }
+
+    @Test
+    fun offline_tapping_a_song_that_isnt_downloaded_says_why_and_plays_nothing() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = albumVm(playerRepo, online = false)
+        val messages = collectMessages(vm)
+
+        vm.playTrack(4L)
+        runCurrent()
+
+        verify(playerRepo, never()).setQueue(any(), any(), any())
+        assertEquals(listOf("This song isn't downloaded. Connect to play it."), messages)
+    }
+
+    @Test
+    fun offline_tapping_a_downloaded_song_queues_only_the_downloaded_ones() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = albumVm(playerRepo, online = false)
+
+        vm.playTrack(3L)
+        runCurrent()
+
+        verify(playerRepo).setQueue(eq(listOf(albumSongs[0], albumSongs[2])), eq(1), any())
+    }
+
+    @Test
+    fun online_shuffle_queues_every_song() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = albumVm(playerRepo, online = true)
+
+        vm.shuffleAll()
+        runCurrent()
+
+        verify(playerRepo).setQueue(argThat { toSet() == albumSongs.toSet() && size == albumSongs.size }, eq(0), any())
+    }
+
+    @Test
+    fun offline_shuffle_queues_only_the_downloaded_songs() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = albumVm(playerRepo, online = false)
+
+        vm.shuffleAll()
+        runCurrent()
+
+        verify(playerRepo).setQueue(argThat { toSet() == setOf(albumSongs[0], albumSongs[2]) && size == 2 }, eq(0), any())
+    }
+
+    @Test
+    fun offline_shuffle_with_nothing_downloaded_says_why() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = albumVm(playerRepo, online = false, songs = listOf(track(2L), track(4L)))
+        val messages = collectMessages(vm)
+
+        vm.shuffleAll()
+        runCurrent()
+
+        verify(playerRepo, never()).setQueue(any(), any(), any())
+        assertEquals(listOf("None of this album's songs are downloaded. Connect to play them."), messages)
     }
 
     // ------------------------------------------------------------------
@@ -224,13 +303,13 @@ class AlbumDetailViewModelTest {
     }
 
     private fun musicRepoMock(): MusicRepository = mock {
-        on { getAllTracks() } doReturn flowOf(emptyList())
+        on { getTracksByAlbum(any(), any()) } doReturn flowOf(emptyList())
         on { getUserCreatedPlaylists() } doReturn flowOf(emptyList())
         onBlocking { queueDownload(any()) } doReturn true
     }
 
     private fun musicRepoMockWithTracks(tracks: List<Track>): MusicRepository = mock {
-        on { getAllTracks() } doReturn flowOf(tracks)
+        on { getTracksByAlbum(any(), any()) } doReturn flowOf(tracks)
         on { getUserCreatedPlaylists() } doReturn flowOf(emptyList())
         onBlocking { queueDownload(any()) } doReturn true
     }
@@ -246,15 +325,17 @@ class AlbumDetailViewModelTest {
             on { playerState } doReturn MutableStateFlow(PlayerState())
         },
         musicRepository: MusicRepository = mock {
-            on { getAllTracks() } doReturn flowOf(emptyList())
+            on { getTracksByAlbum(any(), any()) } doReturn flowOf(emptyList())
             on { getUserCreatedPlaylists() } doReturn flowOf(emptyList())
         },
         savedStateHandle: SavedStateHandle = SavedStateHandle(
             mapOf("albumName" to "Album", "artistName" to "Artist"),
         ),
+        connectivityMonitor: ConnectivityMonitor = mock { on { isConnected() } doReturn true },
     ): AlbumDetailViewModel = AlbumDetailViewModel(
         savedStateHandle = savedStateHandle,
         musicRepository = musicRepository,
         playerRepository = playerRepository,
+        connectivityMonitor = connectivityMonitor,
     )
 }

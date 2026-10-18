@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.work.ListenableWorker
 import androidx.work.WorkerParameters
 import com.stash.core.data.db.dao.ArtistImageDao
+import com.stash.core.data.prefs.LibraryScopePreference
+import com.stash.core.data.prefs.StreamingPreference
 import com.stash.data.ytmusic.YTMusicApiClient
 import com.stash.data.ytmusic.model.ArtistPhotoResolution
 import io.mockk.coEvery
@@ -32,11 +34,45 @@ class ArtistImageBackfillWorkerTest {
     private val artistImageDao: ArtistImageDao = mockk(relaxed = true)
     private val ytMusicApiClient: YTMusicApiClient = mockk(relaxed = true)
 
-    private fun newWorker() =
-        ArtistImageBackfillWorker(appContext, workerParams, artistImageDao, ytMusicApiClient)
+    /** The Download switch: false = Download (the default install), true = Stream only. */
+    private fun streamingPreference(streamOnly: Boolean = false): StreamingPreference =
+        mockk { coEvery { current() } returns streamOnly }
+
+    /** The Artists tab's "In your library" filter (Stream only): false = Everything, the default. */
+    private fun libraryScopePreference(inLibraryOnly: Boolean = false): LibraryScopePreference =
+        mockk { coEvery { current() } returns inLibraryOnly }
+
+    private fun newWorker(streamOnly: Boolean = false, inLibraryOnly: Boolean = false) =
+        ArtistImageBackfillWorker(
+            appContext, workerParams, artistImageDao, ytMusicApiClient, streamingPreference(streamOnly),
+            libraryScopePreference(inLibraryOnly),
+        )
+
+    @Test fun `candidate scope follows the Download switch, like the Artists tab`() = runTest {
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns emptyList()
+
+        newWorker(streamOnly = false).doWork()
+        coVerify(exactly = 1) { artistImageDao.distinctArtistNames(false, false) }
+
+        // Stream only: the tab lists every song's artist, so photos are resolved for them too.
+        newWorker(streamOnly = true).doWork()
+        coVerify(exactly = 1) { artistImageDao.distinctArtistNames(true, false) }
+    }
+
+    @Test fun `candidate scope follows the In your library filter, in Stream only`() = runTest {
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns emptyList()
+
+        // Stream only, narrowed: only the artists the narrowed tab shows.
+        newWorker(streamOnly = true, inLibraryOnly = true).doWork()
+        coVerify(exactly = 1) { artistImageDao.distinctArtistNames(true, true) }
+
+        // Download ignores the saved filter, as the tab does.
+        newWorker(streamOnly = false, inLibraryOnly = true).doWork()
+        coVerify(exactly = 1) { artistImageDao.distinctArtistNames(false, false) }
+    }
 
     @Test fun `empty candidate set returns success without any resolution or write`() = runTest {
-        coEvery { artistImageDao.distinctArtistNames() } returns emptyList()
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns emptyList()
 
         val result = newWorker().doWork()
 
@@ -47,7 +83,7 @@ class ArtistImageBackfillWorkerTest {
 
     @Test fun `collapses raw credits to primary acts and stores photos keyed by display name`() =
         runTest {
-            coEvery { artistImageDao.distinctArtistNames() } returns
+            coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns
                 listOf("Aarne, Toxi$", "Kozak System")
             coEvery { ytMusicApiClient.resolveArtistPhoto("Aarne") } returns
                 ArtistPhotoResolution.Resolved("https://photo/aarne.jpg")
@@ -76,7 +112,7 @@ class ArtistImageBackfillWorkerTest {
         }
 
     @Test fun `NoAvatar stamps a permanent sentinel but Failed writes nothing`() = runTest {
-        coEvery { artistImageDao.distinctArtistNames() } returns
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns
             listOf("Mystery Band", "Aarne", "Down Act")
         coEvery { ytMusicApiClient.resolveArtistPhoto("Mystery Band") } returns
             ArtistPhotoResolution.NoAvatar
@@ -111,7 +147,7 @@ class ArtistImageBackfillWorkerTest {
     }
 
     @Test fun `a throwing resolution is treated as failed and never aborts the batch`() = runTest {
-        coEvery { artistImageDao.distinctArtistNames() } returns
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns
             listOf("Down Act", "Aarne")
         coEvery { ytMusicApiClient.resolveArtistPhoto("Down Act") } throws
             RuntimeException("rate limited")
@@ -135,7 +171,7 @@ class ArtistImageBackfillWorkerTest {
 
     @Test fun `skips names already attempted so they are never re-polled`() = runTest {
         coEvery { artistImageDao.observedNames() } returns listOf("Aarne", "Mystery Band")
-        coEvery { artistImageDao.distinctArtistNames() } returns
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns
             listOf("Aarne, Toxi$", "Mystery Band", "Kozak System")
         coEvery { ytMusicApiClient.resolveArtistPhoto("Kozak System") } returns
             ArtistPhotoResolution.Resolved("https://photo/kozak.jpg")
@@ -152,7 +188,7 @@ class ArtistImageBackfillWorkerTest {
         // The PK is COLLATE NOCASE and the observed set is lowercased — a
         // case-variant credit must not trigger a second resolution.
         coEvery { artistImageDao.observedNames() } returns listOf("Aarne")
-        coEvery { artistImageDao.distinctArtistNames() } returns listOf("AARNE")
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns listOf("AARNE")
 
         newWorker().doWork()
 
@@ -162,7 +198,7 @@ class ArtistImageBackfillWorkerTest {
 
     @Test fun `caps each run at BATCH_SIZE names leaving the remainder for a later run`() = runTest {
         val manyNames = (1..200).map { "Artist $it" }
-        coEvery { artistImageDao.distinctArtistNames() } returns manyNames
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns manyNames
         coEvery { ytMusicApiClient.resolveArtistPhoto(any()) } returns
             ArtistPhotoResolution.NoAvatar
 
@@ -177,7 +213,7 @@ class ArtistImageBackfillWorkerTest {
     @Test fun `primary-artist collapse dedupes collab credits into a single row`() = runTest {
         // Two different raw credits that both collapse to the same primary
         // act must produce a single deduplicated photo row.
-        coEvery { artistImageDao.distinctArtistNames() } returns
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns
             listOf("Aarne, Toxi$", "Aarne, Big Baby Tape")
         coEvery { ytMusicApiClient.resolveArtistPhoto("Aarne") } returns
             ArtistPhotoResolution.Resolved("https://photo/aarne.jpg")
@@ -200,7 +236,7 @@ class ArtistImageBackfillWorkerTest {
         // "Aarne" and "AARNE" both collapse to themselves (single-artist credits);
         // the case-insensitive dedup must keep only one instead of issuing two
         // YT Music searches for the same act.
-        coEvery { artistImageDao.distinctArtistNames() } returns
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns
             listOf("Aarne", "AARNE")
         coEvery { ytMusicApiClient.resolveArtistPhoto(any()) } returns
             ArtistPhotoResolution.Resolved("https://photo/aarne.jpg")
@@ -214,7 +250,7 @@ class ArtistImageBackfillWorkerTest {
         // Every candidate gets no response (API errors). No row is written,
         // and the worker signals WorkManager to retry with the configured
         // exponential backoff instead of silently succeeding.
-        coEvery { artistImageDao.distinctArtistNames() } returns listOf("Down Act", "Mystery Band")
+        coEvery { artistImageDao.distinctArtistNames(any(), any()) } returns listOf("Down Act", "Mystery Band")
         coEvery { ytMusicApiClient.resolveArtistPhoto(any()) } throws
             RuntimeException("rate limited")
 

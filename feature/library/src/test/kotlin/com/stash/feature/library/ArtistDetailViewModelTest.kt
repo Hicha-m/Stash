@@ -5,6 +5,7 @@ import com.stash.core.data.db.dao.ArtistImageDao
 import com.stash.core.data.db.entity.ArtistImageEntity
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.media.PlayerRepository
+import com.stash.core.media.streaming.ConnectivityMonitor
 import com.stash.core.model.PlayerState
 import com.stash.core.model.Track
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +29,7 @@ import org.mockito.kotlin.any
 import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
+import org.mockito.kotlin.never
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 
@@ -187,6 +189,92 @@ class ArtistDetailViewModelTest {
     }
 
     // ------------------------------------------------------------------
+    // Playing from the artist page
+    // ------------------------------------------------------------------
+
+    /** Songs 1 and 3 are downloaded, 2 and 4 aren't. */
+    private val artistSongs = listOf(
+        track(1L).copy(filePath = "/music/1.flac", isDownloaded = true),
+        track(2L),
+        track(3L).copy(filePath = "/music/3.flac", isDownloaded = true),
+        track(4L),
+    )
+
+    private fun kotlinx.coroutines.test.TestScope.artistVm(
+        playerRepo: PlayerRepository,
+        online: Boolean,
+    ): ArtistDetailViewModel {
+        val vm = buildVm(
+            playerRepository = playerRepo,
+            musicRepository = mock {
+                on { getTracksByArtist(any()) } doReturn flowOf(artistSongs)
+                on { getUserCreatedPlaylists() } doReturn flowOf(emptyList())
+            },
+            connectivityMonitor = mock { on { isConnected() } doReturn online },
+        )
+        backgroundScope.launch { vm.uiState.collect {} }
+        runCurrent()
+        return vm
+    }
+
+    @Test
+    fun online_tapping_a_song_that_isnt_downloaded_plays_it_with_every_song_queued() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = artistVm(playerRepo, online = true)
+
+        vm.playTrack(2L)
+        runCurrent()
+
+        verify(playerRepo).setQueue(eq(artistSongs), eq(1), any())
+    }
+
+    @Test
+    fun offline_tapping_a_song_that_isnt_downloaded_says_why_and_plays_nothing() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = artistVm(playerRepo, online = false)
+        val messages = collectMessages(vm)
+
+        vm.playTrack(4L)
+        runCurrent()
+
+        verify(playerRepo, never()).setQueue(any(), any(), any())
+        assertEquals(listOf("This song isn't downloaded. Connect to play it."), messages)
+    }
+
+    @Test
+    fun offline_tapping_a_downloaded_song_queues_only_the_downloaded_ones() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = artistVm(playerRepo, online = false)
+
+        vm.playTrack(3L)
+        runCurrent()
+
+        verify(playerRepo).setQueue(eq(listOf(artistSongs[0], artistSongs[2])), eq(1), any())
+    }
+
+    @Test
+    fun offline_shuffle_with_nothing_downloaded_says_why() = runTest {
+        val playerRepo = playerRepoMock()
+        val vm = buildVm(
+            playerRepository = playerRepo,
+            musicRepository = mock {
+                on { getTracksByArtist(any()) } doReturn flowOf(listOf(track(2L), track(4L)))
+                on { getUserCreatedPlaylists() } doReturn flowOf(emptyList())
+            },
+            connectivityMonitor = mock { on { isConnected() } doReturn false },
+        )
+        backgroundScope.launch { vm.uiState.collect {} }
+        runCurrent()
+        val messages = collectMessages(vm)
+
+        vm.shuffleAll()
+        runCurrent()
+
+        verify(playerRepo, never()).setQueue(any(), any(), any())
+        assertEquals(listOf("None of this artist's songs are downloaded. Connect to play them."), messages)
+    }
+
+    // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 
@@ -231,10 +319,12 @@ class ArtistDetailViewModelTest {
         savedStateHandle: SavedStateHandle = SavedStateHandle(
             mapOf("artistName" to "Artist"),
         ),
+        connectivityMonitor: ConnectivityMonitor = mock { on { isConnected() } doReturn true },
     ): ArtistDetailViewModel = ArtistDetailViewModel(
         savedStateHandle = savedStateHandle,
         musicRepository = musicRepository,
         playerRepository = playerRepository,
         artistImageDao = artistImageDao,
+        connectivityMonitor = connectivityMonitor,
     )
 }
