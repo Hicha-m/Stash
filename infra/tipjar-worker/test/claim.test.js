@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generateKeyPairSync, verify as nodeVerify, createPublicKey } from "node:crypto";
+import { createHash, generateKeyPairSync, verify as nodeVerify, createPublicKey } from "node:crypto";
 import worker from "../src/index.js";
 import { hashEmail } from "../src/access.js";
-import { CLAIM_KEYS, CLAIM_TTL_S, clock, codeHashOf, isDonation, LIMITS, MAILER_CLAIM_URL, MAX_TRIES, newCode } from "../src/claim.js";
+import { CLAIM_TTL_S, clock, codeHashOf, ipBucket, isDonation, LIMITS, MAILER_CLAIM_URL, MAX_TRIES, newCode } from "../src/claim.js";
+import { putClaim, takeTry } from "../src/claim-store.js";
 import { b64url, mintSupporterToken } from "../src/entitlement.js";
 import { donation, env, fakeKV, kofiPost } from "./fake-kv.js";
+import { fakeD1 } from "./fake-d1.js";
 
 const BASE = "https://stash-tipjar.example.workers.dev";
 const PEPPER = "pepper-for-tests";
@@ -44,7 +46,7 @@ function fakeRateLimit(limit = 1000) {
 const fakeCtx = () => ({ waiting: [], waitUntil(p) { this.waiting.push(p); } });
 
 const claimEnv = (over = {}) =>
-    env({ EMAIL_PEPPER: PEPPER, MAILER: fakeMailer(), MAILER_TOKEN: TOKEN, ENTITLEMENT_PRIVATE_KEY: PRIVATE_B64, CLAIM_RL: fakeRateLimit(), ...over });
+    env({ EMAIL_PEPPER: PEPPER, MAILER: fakeMailer(), MAILER_TOKEN: TOKEN, ENTITLEMENT_PRIVATE_KEY: PRIVATE_B64, CLAIM_RL: fakeRateLimit(), CLAIMS_DB: fakeD1(), ...over });
 
 const post = (path, body, ip = "203.0.113.7") =>
     new Request(`${BASE}${path}`, {
@@ -61,7 +63,19 @@ async function start(e, email = EMAIL, ip) {
     return { res, body: await res.json(), ctx };
 }
 
-const verifyReq = (e, code, email = EMAIL, ip) => worker.fetch(post("/claim/email/verify", { email, code }, ip), e, fakeCtx());
+/** Runs a verify and waits for its after-response work (deleting an exhausted claim). */
+async function verifyReq(e, code, email = EMAIL, ip) {
+    const ctx = fakeCtx();
+    const res = await worker.fetch(post("/claim/email/verify", { email, code }, ip), e, ctx);
+    await Promise.all(ctx.waiting);
+    return res;
+}
+
+/** verify's one failure answer, whatever the reason. */
+async function assertBadCode(res, why) {
+    assert.equal(res.status, 401, why);
+    assert.deepEqual(await res.json(), { error: "bad_code" }, why);
+}
 
 async function asDonor(e, email = EMAIL, source = "kofi") {
     const h = await hashEmail(email, PEPPER);
@@ -112,14 +126,26 @@ test("start for a Ko-fi donor: 202 {ok:true}, one code email through MAILER, a p
     assert.equal(call.body.email, EMAIL);
     assert.equal(call.body.kind, "code");
     assert.match(call.body.code, /^\d{6}$/);
-    const stored = e.ACCESS_KV.map.get(CLAIM_KEYS.claim(h));
-    assert.equal(stored.opts.expirationTtl, CLAIM_TTL_S);
-    const claim = JSON.parse(stored.value);
-    assert.deepEqual(Object.keys(claim).sort(), ["codeHash", "exp", "tries"]);
+    const claim = e.CLAIMS_DB.claim(h);
+    assert.deepEqual(Object.keys(claim).sort(), ["code_hash", "email_hash", "expires_at", "tries"]);
     assert.equal(claim.tries, 0);
-    assert.equal(claim.codeHash, await codeHashOf(call.body.code, h));
-    assert.ok(Math.abs(claim.exp - (Math.floor(Date.now() / 1000) + 600)) <= 2);
-    assert.ok(!stored.value.includes(call.body.code), "the code itself is not stored");
+    assert.equal(claim.code_hash, await codeHashOf(call.body.code, h, PEPPER));
+    assert.ok(Math.abs(claim.expires_at - (Math.floor(Date.now() / 1000) + CLAIM_TTL_S)) <= 2);
+    assert.ok(!JSON.stringify(claim).includes(call.body.code), "the code itself is not stored");
+    assert.equal([...e.ACCESS_KV.map.keys()].filter((k) => k.startsWith("claim:")).length, 0, "nothing of the claim in KV");
+});
+
+test("the stored code hash is keyed with EMAIL_PEPPER: without it a D1 read can't test a guess", async () => {
+    const h = await hashEmail(EMAIL, PEPPER);
+    const keyed = await codeHashOf("123456", h, PEPPER);
+    assert.match(keyed, /^[0-9a-f]{64}$/);
+    assert.equal(keyed, await codeHashOf("123456", h, PEPPER), "deterministic");
+    assert.notEqual(keyed, await codeHashOf("123456", h, "another-pepper"));
+    assert.notEqual(keyed, await codeHashOf("123457", h, PEPPER));
+    assert.notEqual(keyed, await codeHashOf("123456", "0".repeat(64), PEPPER), "bound to the address");
+    for (const unkeyed of [`123456${h}`, `${h}123456`, `claim-code:v1:${h}:123456`, "123456"]) {
+        assert.notEqual(keyed, createHash("sha256").update(unkeyed).digest("hex"));
+    }
 });
 
 test("start for an address that never donated: the same 202, one no-donation email, no claim", async () => {
@@ -128,7 +154,7 @@ test("start for an address that never donated: the same 202, one no-donation ema
     assert.equal(res.status, 202);
     assert.deepEqual(body, { ok: true });
     assert.deepEqual(e.MAILER.calls.map((c) => c.body), [{ email: EMAIL, kind: "no_donation" }]);
-    assert.equal([...e.ACCESS_KV.map.keys()].filter((k) => k.startsWith("claim:")).length, 0);
+    assert.equal(e.CLAIMS_DB.count("claims"), 0);
 });
 
 test("only source kofi is a donation: approved, manual and open entries get the no-donation email", async () => {
@@ -162,6 +188,7 @@ test("start with an invalid email is 400 bad_email; a non-JSON body is 400 bad_r
         assert.deepEqual(await res.json(), { error: "bad_email" });
         assert.equal(e.MAILER.calls.length, 0);
         assert.equal(e.ACCESS_KV.map.size, 0);
+        assert.equal(e.CLAIMS_DB.count("claims") + e.CLAIMS_DB.count("claim_counters"), 0);
     }
     for (const raw of ["{not json", "[]", '"a@b.co"']) {
         const e = claimEnv();
@@ -221,10 +248,26 @@ test("start and verify: the CLAIM_RL burst binding answers 429 with Retry-After 
     assert.equal(res.status, 429);
     assert.equal(res.headers.get("retry-after"), "60");
     assert.ok(e.CLAIM_RL.keys.every((k) => /^start:[0-9a-f]{64}$/.test(k)), "no raw IP in the key");
-    assert.equal((await verifyReq(e, "000000")).status, 410, "verify has its own bucket");
+    await assertBadCode(await verifyReq(e, "000000"), "verify has its own bucket");
     const second = await verifyReq(e, "000000");
     assert.equal(second.status, 429);
+    assert.equal(second.headers.get("retry-after"), "60");
     assert.deepEqual(await second.json(), { error: "rate_limited" });
+});
+
+test("verify is also limited per email hash (v:<hash>), whatever the IP", async () => {
+    const e = claimEnv({ CLAIM_RL: fakeRateLimit(2) });
+    const h = await hashEmail(EMAIL, PEPPER);
+    await assertBadCode(await verifyReq(e, "000000", EMAIL, "198.51.100.1"));
+    await assertBadCode(await verifyReq(e, "000000", EMAIL, "198.51.100.2"));
+    const third = await verifyReq(e, "000000", EMAIL, "198.51.100.3");
+    assert.equal(third.status, 429, "a fresh IP doesn't help");
+    assert.deepEqual(await third.json(), { error: "rate_limited" });
+    const verifyKeys = e.CLAIM_RL.keys.filter((k) => !k.startsWith("start:"));
+    assert.ok(verifyKeys.includes(`v:${h}`));
+    assert.ok(verifyKeys.every((k) => /^(verify:|v:)[0-9a-f]{64}$/.test(k)), "no raw IP or email in a key");
+    // Another address from a fresh IP is unaffected.
+    await assertBadCode(await verifyReq(e, "000000", "bob@example.org", "198.51.100.4"));
 });
 
 test("start: no raw IP or email in any KV key or value", async () => {
@@ -235,24 +278,69 @@ test("start: no raw IP or email in any KV key or value", async () => {
         assert.ok(!k.includes("203.0.113.7") && !String(v.value).includes("203.0.113.7"), k);
         assert.ok(!k.includes(EMAIL) && !String(v.value).includes(EMAIL), k);
     }
+    const code = e.MAILER.calls[0].body.code;
+    const rows = JSON.stringify([...e.CLAIMS_DB.raw.prepare("SELECT * FROM claims").all(), ...e.CLAIMS_DB.raw.prepare("SELECT * FROM claim_counters").all()]);
+    for (const secret of ["203.0.113.7", EMAIL, code]) assert.ok(!rows.includes(secret), secret);
 });
 
-test("start: a failing mailer still gets the 202 (the outcome is never revealed); a new start replaces the claim", async () => {
-    const e = claimEnv({ MAILER: fakeMailer(() => new Response("boom", { status: 500 })) });
+test("start: a failing mailer still gets the 202 (the outcome is never revealed), and stores no claim", async () => {
+    const failures = [
+        () => new Response("boom", { status: 500 }),
+        () => Response.json({ sent: false, error: "E_RATE_LIMIT_EXCEEDED" }),
+        () => Response.json({ error: "too_many_calls" }, { status: 429 }),
+        () => {
+            throw new Error("network");
+        },
+    ];
+    for (const respond of failures) {
+        const e = claimEnv({ MAILER: fakeMailer(respond) });
+        const h = await asDonor(e);
+        const { result } = await logsOf(() => start(e));
+        assert.equal(result.res.status, 202);
+        assert.deepEqual(result.body, { ok: true });
+        assert.equal(e.CLAIMS_DB.claim(h), null, "a code nobody received is not stored");
+    }
+});
+
+test("start the mailer refuses (its one-a-minute limit) leaves the pending claim and its code as they were", async () => {
+    let refuse = false;
+    const e = claimEnv({ MAILER: fakeMailer(() => (refuse ? Response.json({ sent: false, error: "rate_limited" }) : Response.json({ sent: true }))) });
     const h = await asDonor(e);
-    const { res } = await start(e);
-    assert.equal(res.status, 202);
-    const first = e.ACCESS_KV.json(CLAIM_KEYS.claim(h));
-    await e.ACCESS_KV.put(CLAIM_KEYS.claim(h), JSON.stringify({ ...first, tries: 3 }));
-    await start(e, EMAIL, "192.0.2.1");
-    const second = e.ACCESS_KV.json(CLAIM_KEYS.claim(h));
-    assert.equal(second.tries, 0);
+    await start(e);
+    const firstCode = e.MAILER.calls[0].body.code;
+    await assertBadCode(await verifyReq(e, firstCode === "000000" ? "111111" : "000000"));
+    const before = e.CLAIMS_DB.claim(h);
+    assert.equal(before.tries, 1);
+
+    refuse = true;
+    const { result } = await logsOf(() => start(e, EMAIL, "192.0.2.1"));
+    assert.equal(result.res.status, 202, "still the same 202");
+    assert.equal(e.MAILER.calls.length, 2, "the mailer was asked");
+    assert.deepEqual(e.CLAIMS_DB.claim(h), before, "untouched: same code, same tries, same expiry");
+    assert.equal((await verifyReq(e, firstCode)).status, 200, "the code the donor holds still works");
 });
 
-test("start: 503 not_configured without the pepper, the mailer, its token or the signing key", async () => {
-    for (const missing of ["EMAIL_PEPPER", "MAILER", "MAILER_TOKEN", "ENTITLEMENT_PRIVATE_KEY"]) {
+test("start the mailer sends replaces the claim: new code, tries back to 0; the old code stops working", async () => {
+    const e = claimEnv();
+    const h = await asDonor(e);
+    await start(e);
+    const oldCode = e.MAILER.calls[0].body.code;
+    await assertBadCode(await verifyReq(e, oldCode === "000000" ? "111111" : "000000"));
+    assert.equal(e.CLAIMS_DB.claim(h).tries, 1);
+    let newCodeSent;
+    do {
+        await start(e, EMAIL, `192.0.2.${e.MAILER.calls.length}`);
+        newCodeSent = e.MAILER.calls.at(-1).body.code;
+    } while (newCodeSent === oldCode); // one in a million
+    assert.equal(e.CLAIMS_DB.claim(h).tries, 0);
+    await assertBadCode(await verifyReq(e, oldCode), "the replaced code");
+    assert.equal((await verifyReq(e, newCodeSent)).status, 200);
+});
+
+test("start: 503 not_configured without the pepper, the mailer, its token, the signing key or CLAIMS_DB", async () => {
+    for (const missing of ["EMAIL_PEPPER", "MAILER", "MAILER_TOKEN", "ENTITLEMENT_PRIVATE_KEY", "CLAIMS_DB"]) {
         const e = claimEnv({ [missing]: undefined });
-        const res = await worker.fetch(post("/claim/email/start", { email: EMAIL }), e, fakeCtx());
+        const { result: res } = await logsOf(() => worker.fetch(post("/claim/email/start", { email: EMAIL }), e, fakeCtx()));
         assert.equal(res.status, 503, missing);
         assert.deepEqual(await res.json(), { error: "not_configured" });
     }
@@ -296,9 +384,9 @@ test("verify with the right code: 200 {token}, the token verifies with the publi
     assert.ok(Number.isInteger(payload.iat) && payload.iat >= before && payload.iat <= before + 5, "epoch seconds");
     assert.equal(raw, `{"tier":"supporter","iat":${payload.iat},"tid":"${payload.tid}","v":1}`);
     assert.ok(!raw.includes("ann"), "no personal data");
-    assert.equal(e.ACCESS_KV.map.has(CLAIM_KEYS.claim(h)), false);
+    assert.equal(e.CLAIMS_DB.claim(h), null);
     // The code is single-use.
-    assert.equal((await verifyReq(e, code)).status, 410);
+    await assertBadCode(await verifyReq(e, code), "a used code");
 });
 
 test("verify: a code sent as a number is the same code", async () => {
@@ -316,55 +404,127 @@ test("verify with a wrong code: 401 bad_code and the try is counted; the right c
     await start(e);
     const code = e.MAILER.calls[0].body.code;
     const wrong = code === "123456" ? "654321" : "123456";
-    const res = await verifyReq(e, wrong);
-    assert.equal(res.status, 401);
-    assert.deepEqual(await res.json(), { error: "bad_code" });
-    assert.equal(e.ACCESS_KV.json(CLAIM_KEYS.claim(h)).tries, 1);
-    assert.equal((await verifyReq(e, "12ab56")).status, 401, "malformed counts as wrong");
-    assert.equal(e.ACCESS_KV.json(CLAIM_KEYS.claim(h)).tries, 2);
+    await assertBadCode(await verifyReq(e, wrong));
+    assert.equal(e.CLAIMS_DB.claim(h).tries, 1);
+    await assertBadCode(await verifyReq(e, "12ab56"), "malformed counts as wrong");
+    assert.equal(e.CLAIMS_DB.claim(h).tries, 2);
     assert.equal((await verifyReq(e, code)).status, 200);
 });
 
-test("verify: the 5th wrong code deletes the claim and answers 429 too_many_tries; the right code then is 410", async () => {
+test("verify: the 5th wrong code deletes the claim and answers the same 401 bad_code; the right code then is bad_code too", async () => {
     const e = claimEnv();
     const h = await asDonor(e);
     await start(e);
     const code = e.MAILER.calls[0].body.code;
     const wrong = code === "000000" ? "999999" : "000000";
-    for (let i = 1; i < MAX_TRIES; i++) assert.equal((await verifyReq(e, wrong)).status, 401, `try ${i}`);
-    const res = await verifyReq(e, wrong);
-    assert.equal(res.status, 429);
-    assert.deepEqual(await res.json(), { error: "too_many_tries" });
-    assert.equal(e.ACCESS_KV.map.has(CLAIM_KEYS.claim(h)), false);
-    assert.equal((await verifyReq(e, code)).status, 410);
+    for (let i = 1; i <= MAX_TRIES; i++) await assertBadCode(await verifyReq(e, wrong), `try ${i}`);
+    assert.equal(e.CLAIMS_DB.claim(h), null, "deleted (after the response)");
+    await assertBadCode(await verifyReq(e, code), "the right code after the claim is spent");
 });
 
-test("verify with no pending claim, or an expired one, is 410 expired", async () => {
+test("verify: the right code on the 5th (last) try still works", async () => {
     const e = claimEnv();
-    const res = await verifyReq(e, "123456");
-    assert.equal(res.status, 410);
-    assert.deepEqual(await res.json(), { error: "expired" });
+    await asDonor(e);
+    await start(e);
+    const code = e.MAILER.calls[0].body.code;
+    const wrong = code === "000000" ? "999999" : "000000";
+    for (let i = 1; i < MAX_TRIES; i++) await assertBadCode(await verifyReq(e, wrong), `try ${i}`);
+    assert.equal((await verifyReq(e, code)).status, 200);
+});
+
+test("verify with no pending claim, an expired one, or a non-donor's address is the same 401 bad_code", async () => {
+    const e = claimEnv();
+    await assertBadCode(await verifyReq(e, "123456"), "no claim");
 
     const h = await asDonor(e);
     await start(e);
     const code = e.MAILER.calls[0].body.code;
-    const claim = e.ACCESS_KV.json(CLAIM_KEYS.claim(h));
-    await e.ACCESS_KV.put(CLAIM_KEYS.claim(h), JSON.stringify({ ...claim, exp: Math.floor(Date.now() / 1000) - 1 }));
-    assert.equal((await verifyReq(e, code)).status, 410);
-    assert.equal(e.ACCESS_KV.map.has(CLAIM_KEYS.claim(h)), false, "the stale claim is cleared");
+    e.CLAIMS_DB.setClaim(h, { expires_at: Math.floor(Date.now() / 1000) - 1 });
+    await assertBadCode(await verifyReq(e, code), "expired, even with the right code");
+    assert.equal(e.CLAIMS_DB.claim(h).tries, 0, "an expired claim takes no tries");
+
+    const other = claimEnv();
+    await start(other);
+    await assertBadCode(await verifyReq(other, "123456"), "a non-donor who never got a code");
 });
 
-test("verify for a non-donor (who never got a code) is 410", async () => {
+test("verify reveals nothing: no claim, expired, wrong code and used-up tries get byte-identical answers", async () => {
+    const answer = async (res) => ({ status: res.status, headers: [...res.headers], body: await res.text() });
+    const wrongFor = (code) => (code === "000000" ? "111111" : "000000");
+
+    const none = await answer(await verifyReq(claimEnv(), "123456"));
+
+    const ex = claimEnv();
+    const exHash = await asDonor(ex);
+    await start(ex);
+    ex.CLAIMS_DB.setClaim(exHash, { expires_at: 1 });
+    const expired = await answer(await verifyReq(ex, ex.MAILER.calls[0].body.code));
+
+    const wr = claimEnv();
+    await asDonor(wr);
+    await start(wr);
+    const wrong = await answer(await verifyReq(wr, wrongFor(wr.MAILER.calls[0].body.code)));
+
+    const tm = claimEnv();
+    await asDonor(tm);
+    await start(tm);
+    const tmCode = tm.MAILER.calls[0].body.code;
+    for (let i = 1; i < MAX_TRIES; i++) await verifyReq(tm, wrongFor(tmCode));
+    const lastTry = await answer(await verifyReq(tm, wrongFor(tmCode)));
+    const afterLimit = await answer(await verifyReq(tm, tmCode));
+
+    for (const [name, a] of Object.entries({ expired, wrong, lastTry, afterLimit })) assert.deepEqual(a, none, name);
+    assert.equal(none.status, 401);
+    assert.equal(none.body, '{"error":"bad_code"}');
+});
+
+test("verify under parallel requests: 20 wrong guesses at once use 5 tries, not 20; the claim is then spent", async () => {
     const e = claimEnv();
+    const h = await asDonor(e);
     await start(e);
-    assert.equal((await verifyReq(e, "123456")).status, 410);
+    const code = e.MAILER.calls[0].body.code;
+    const guesses = [];
+    for (let i = 0; guesses.length < 20; i++) {
+        const g = String(i).padStart(6, "0");
+        if (g !== code) guesses.push(g);
+    }
+    const results = await Promise.all(guesses.map((g, i) => verifyReq(e, g, EMAIL, `198.51.100.${i}`)));
+    for (const res of results) await assertBadCode(res);
+    assert.equal(e.CLAIMS_DB.claim(h), null, "the claim is spent and deleted");
+    await assertBadCode(await verifyReq(e, code), "the right code can't ride on a 6th try");
 });
 
-test("verify: 503 not_configured without ENTITLEMENT_PRIVATE_KEY (checked first); 503 for an unreadable key, claim kept", async () => {
-    const e = claimEnv({ ENTITLEMENT_PRIVATE_KEY: undefined });
-    const res = await verifyReq(e, "123456");
-    assert.equal(res.status, 503);
-    assert.deepEqual(await res.json(), { error: "not_configured" });
+test("takeTry is atomic: of 50 parallel calls on one claim exactly MAX_TRIES get a row, with tries 1..MAX_TRIES", async () => {
+    const db = fakeD1();
+    const nowS = Math.floor(Date.now() / 1000);
+    await putClaim(db, "h".repeat(64), "c".repeat(64), nowS + 600);
+    const rows = await Promise.all(Array.from({ length: 50 }, () => takeTry(db, "h".repeat(64), MAX_TRIES, nowS)));
+    const granted = rows.filter(Boolean);
+    assert.equal(granted.length, MAX_TRIES);
+    assert.deepEqual(granted.map((r) => r.tries).sort((a, b) => a - b), Array.from({ length: MAX_TRIES }, (_, i) => i + 1));
+    assert.equal(db.claim("h".repeat(64)).tries, MAX_TRIES);
+});
+
+test("verify under parallel requests: the right code sent 5 times at once mints exactly one token", async () => {
+    const e = claimEnv();
+    const h = await asDonor(e);
+    await start(e);
+    const code = e.MAILER.calls[0].body.code;
+    const results = await Promise.all(Array.from({ length: MAX_TRIES }, (_, i) => verifyReq(e, code, EMAIL, `198.51.100.${i}`)));
+    const ok = results.filter((r) => r.status === 200);
+    assert.equal(ok.length, 1, "single use holds under a race");
+    for (const res of results.filter((r) => r.status !== 200)) await assertBadCode(res);
+    checkToken((await ok[0].json()).token);
+    assert.equal(e.CLAIMS_DB.claim(h), null);
+});
+
+test("verify: 503 not_configured without ENTITLEMENT_PRIVATE_KEY or CLAIMS_DB (checked first); 503 for an unreadable key, claim kept", async () => {
+    for (const missing of ["ENTITLEMENT_PRIVATE_KEY", "CLAIMS_DB", "EMAIL_PEPPER"]) {
+        const e = claimEnv({ [missing]: undefined });
+        const { result: res } = await logsOf(() => verifyReq(e, "123456"));
+        assert.equal(res.status, 503, missing);
+        assert.deepEqual(await res.json(), { error: "not_configured" });
+    }
 
     const bad = claimEnv();
     const h = await asDonor(bad);
@@ -373,7 +533,90 @@ test("verify: 503 not_configured without ENTITLEMENT_PRIVATE_KEY (checked first)
     bad.ENTITLEMENT_PRIVATE_KEY = Buffer.from("not a key").toString("base64");
     const { result } = await logsOf(() => verifyReq(bad, code));
     assert.equal(result.status, 503);
-    assert.equal(bad.ACCESS_KV.map.has(CLAIM_KEYS.claim(h)), true);
+    assert.notEqual(bad.CLAIMS_DB.claim(h), null, "kept for a retry once the key is fixed");
+    bad.ENTITLEMENT_PRIVATE_KEY = PRIVATE_B64;
+    assert.equal((await verifyReq(bad, code)).status, 200);
+});
+
+// ---- start abuse: IPv6 /64, the no-donation cap ----
+
+test("ipBucket: IPv4 as is, IPv6 by its /64, IPv4-mapped as the IPv4 address", () => {
+    assert.equal(ipBucket("203.0.113.7"), "203.0.113.7");
+    assert.equal(ipBucket("2001:db8:1:2:3:4:5:6"), "2001:0db8:0001:0002::/64");
+    assert.equal(ipBucket("2001:DB8:1:2::9"), "2001:0db8:0001:0002::/64");
+    assert.equal(ipBucket("2001:db8:1:2:ffff:ffff:ffff:ffff"), "2001:0db8:0001:0002::/64");
+    assert.notEqual(ipBucket("2001:db8:1:3::1"), ipBucket("2001:db8:1:2::1"), "the next /64 is another bucket");
+    assert.equal(ipBucket("2001:db8::1"), "2001:0db8:0000:0000::/64");
+    assert.equal(ipBucket("::ffff:192.0.2.1"), "192.0.2.1");
+    assert.equal(ipBucket("::ffff:c000:201"), "192.0.2.1");
+    assert.equal(ipBucket("fe80::1%eth0"), "fe80:0000:0000:0000::/64");
+    assert.equal(ipBucket("64:ff9b::192.0.2.1"), "0064:ff9b:0000:0000::/64");
+    for (const junk of ["1::2::3", "1:2:3:4:5:6:7", "zz::1", "1:2:3:4:5:6:7:8:9"]) assert.equal(ipBucket(junk), junk, junk);
+    assert.equal(ipBucket(""), "unknown");
+});
+
+test("start: addresses in one IPv6 /64 share the hourly IP limit; another /64 doesn't", async () => {
+    const e = claimEnv();
+    for (let i = 0; i < LIMITS.ipPerHour; i++) {
+        assert.equal((await start(e, `u${i}@example.org`, `2001:db8:aa:bb::${i + 1}`)).res.status, 202);
+    }
+    const { res } = await start(e, "late@example.org", "2001:db8:aa:bb:dead:beef:1:2");
+    assert.equal(res.status, 429, "a fresh address in the same /64");
+    assert.equal((await start(e, "late@example.org", "2001:db8:aa:bc::1")).res.status, 202, "the next /64");
+});
+
+test("start: the burst key is the /64 too", async () => {
+    const e = claimEnv({ CLAIM_RL: fakeRateLimit(1) });
+    assert.equal((await start(e, "a@example.org", "2001:db8:aa:bb::1")).res.status, 202);
+    assert.equal((await start(e, "b@example.org", "2001:db8:aa:bb::2")).res.status, 429);
+});
+
+test(`start: past ${LIMITS.noDonationPerHour} no-donation emails an hour the rest are skipped silently (still 202); donors still get codes`, async () => {
+    const e = claimEnv();
+    const realNow = clock.now;
+    try {
+        clock.now = () => Date.UTC(2026, 9, 17, 10, 5, 0);
+        const cap = LIMITS.noDonationPerHour;
+        for (let i = 0; i < cap + 3; i++) {
+            const { res, body } = await logsOf(() => start(e, `nobody${i}@example.org`, `198.51.${Math.floor(i / 200)}.${i % 200}`)).then((r) => r.result);
+            assert.equal(res.status, 202, `start ${i}`);
+            assert.deepEqual(body, { ok: true });
+        }
+        assert.equal(e.MAILER.calls.length, cap, "emails stop at the cap");
+        assert.ok(e.MAILER.calls.every((c) => c.body.kind === "no_donation"));
+
+        await asDonor(e, "donor@example.org");
+        await start(e, "donor@example.org", "192.0.2.50");
+        assert.equal(e.MAILER.calls.at(-1).body.kind, "code", "a donor's code isn't held back by the cap");
+
+        clock.now = () => Date.UTC(2026, 9, 17, 11, 0, 1);
+        await start(e, "nobody-next-hour@example.org", "192.0.2.51");
+        assert.equal(e.MAILER.calls.at(-1).body.kind, "no_donation", "the next hour has its own count");
+    } finally {
+        clock.now = realNow;
+    }
+});
+
+test("the daily cron drops expired claims and counters, and keeps live ones", async () => {
+    const e = claimEnv();
+    const nowS = Math.floor(Date.now() / 1000);
+    await putClaim(e.CLAIMS_DB, "a".repeat(64), "c".repeat(64), nowS - 1);
+    await putClaim(e.CLAIMS_DB, "b".repeat(64), "c".repeat(64), nowS + 600);
+    e.CLAIMS_DB.raw.prepare("INSERT INTO claim_counters (key, n, expires_at) VALUES ('nodonation:1', 3, ?), ('nodonation:2', 3, ?)").run(nowS - 1, nowS + 3600);
+    await logsOf(() => worker.scheduled({}, e));
+    assert.equal(e.CLAIMS_DB.claim("a".repeat(64)), null);
+    assert.notEqual(e.CLAIMS_DB.claim("b".repeat(64)), null);
+    assert.equal(e.CLAIMS_DB.count("claim_counters"), 1);
+});
+
+test("verify: a CLAIMS_DB failure is 503 unavailable with Retry-After, not a bad_code (an outage isn't an answer)", async () => {
+    const down = { prepare: () => ({ bind: () => ({ first: async () => { throw new Error("D1_ERROR: boom"); } }) }) };
+    const e = claimEnv({ CLAIMS_DB: down });
+    const { result: res, logs } = await logsOf(() => verifyReq(e, "123456"));
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("retry-after"), "30");
+    assert.deepEqual(await res.json(), { error: "unavailable" });
+    assert.match(logs, /CLAIMS_DB failed/);
 });
 
 test("verify: bad email 400, bad body 400", async () => {

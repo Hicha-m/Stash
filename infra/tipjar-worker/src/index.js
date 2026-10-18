@@ -12,7 +12,8 @@
  *           a Ko-fi donor proves their email and gets a signed supporter
  *           token (src/claim.js, src/entitlement.js). Every other POST path
  *           is still the Ko-fi webhook, as before.
- * And a daily cron (wrangler.toml) that rebuilds the supporter list.
+ * And a daily cron (wrangler.toml) that rebuilds the supporter list and
+ * drops expired supporter claims from CLAIMS_DB.
  *
  * Storage: Cloudflare KV. Each supporter has a key of their own,
  * supporter:<time>:<id>, and `supporters`, the JSON the app reads, is
@@ -37,6 +38,7 @@
 
 import { dedupeId, KEYS, KOFI_TXN_TTL_S, recordKofiSupport, sameSecret } from "./access.js";
 import { handleClaimStart, handleClaimVerify } from "./claim.js";
+import { purgeExpired } from "./claim-store.js";
 import { addSupporter, LIST_KEY, rebuildSupporters, storedSupporter } from "./supporters.js";
 import { sendWelcome } from "./welcome.js";
 
@@ -45,7 +47,7 @@ export default {
         if (request.method === "POST") {
             const path = new URL(request.url).pathname;
             if (path === "/claim/email/start") return handleClaimStart(request, env, ctx);
-            if (path === "/claim/email/verify") return handleClaimVerify(request, env);
+            if (path === "/claim/email/verify") return handleClaimVerify(request, env, ctx);
             return handleKofiWebhook(request, env, ctx);
         }
         if (request.method === "GET") {
@@ -62,11 +64,21 @@ export default {
      * The daily cron (wrangler.toml [triggers]): rebuilds the supporter list from the supporter:* keys, so a
      * donor that a webhook's rebuild missed (two at once, or KV's list() lagging) is listed within a day. Also
      * moves the list from before 2026-10 to keys of its own if no donation has done it yet. A failure shows as a
-     * failed cron run in the dashboard and changes nothing.
+     * failed cron run in the dashboard and changes nothing. Then drops expired supporter claims and claim
+     * counters from CLAIMS_DB (every query already ignores them; this keeps the tables small). That step is on its
+     * own: its failure is logged and never fails the rebuild.
      */
     async scheduled(controller, env) {
         const listed = await rebuildSupporters(env);
         console.log(`supporters list rebuilt: ${listed} listed`);
+        if (env.CLAIMS_DB) {
+            try {
+                const dropped = await purgeExpired(env.CLAIMS_DB, Math.floor(Date.now() / 1000));
+                console.log(`claims: ${dropped} expired rows dropped`);
+            } catch (err) {
+                console.error(`claims: purge failed: ${String(err?.message ?? err).slice(0, 120)}`);
+            }
+        }
     },
 };
 

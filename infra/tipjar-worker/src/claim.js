@@ -2,41 +2,54 @@
  * The supporter claim: a Ko-fi donor proves they own the email they donated with and gets a supporter token
  * (src/entitlement.js). Design: docs/superpowers/specs/2026-10-17-lossless-daily-counter-design.md, "Supporters".
  *
- *   POST /claim/email/start   {"email"}          -> 202 {"ok":true}, then ONE email through the stash-mailer Worker
- *   POST /claim/email/verify  {"email","code"}   -> 200 {"token"}
+ *   POST /claim/email/start   {"email"}          -> 202 {"ok":true}, then at most ONE email through the stash-mailer Worker
+ *   POST /claim/email/verify  {"email","code"}   -> 200 {"token"}, or 401 {"error":"bad_code"} for every failure
  *
- * start never says whether the address donated: every valid, non-rate-limited request gets the same 202, and
- * the whole lookup (access list, pending claim, email) runs after the response (ctx.waitUntil), so its timing
- * says nothing either. The email is what differs:
- *   - a donor (ACCESS_KV access:<hash> with source "kofi", see isDonation) gets a 6-digit code, valid 10 minutes;
- *   - anyone else is told no donation was found for the address and that any amount on Ko-fi unlocks unlimited
- *     lossless.
+ * Neither route says whether the address donated.
+ *   - start: every valid, non-rate-limited request gets the same 202, and the whole lookup (access list, email,
+ *     claim write) runs after the response (ctx.waitUntil), so its timing says nothing either. The email is what
+ *     differs: a donor (ACCESS_KV access:<hash> with source "kofi", see isDonation) gets a 6-digit code, valid 10
+ *     minutes; anyone else is told no donation was found and that any amount on Ko-fi unlocks unlimited lossless.
+ *   - verify: no pending claim, an expired one, a wrong code and a claim whose tries are used up all get the same
+ *     401 {"error":"bad_code"}, after the same work (two HMACs, one D1 statement, one constant-time compare). An
+ *     exhausted claim is deleted after the response.
  *
- * Pending claim: ACCESS_KV claim:<hash> = { codeHash: SHA-256 hex of (code + hash), tries, exp (epoch s) }, with a
- * 10-minute expirationTtl. A new start replaces it (new code, tries back to 0). verify allows MAX_TRIES wrong codes,
- * then deletes it.
+ * Pending claim: a row in the D1 database CLAIMS_DB (src/claim-store.js, ../migrations/0001_claims.sql), keyed by
+ * the email hash, holding a keyed hash of the code (codeHashOf), its tries and its expiry. D1 makes the try limit
+ * and the single use atomic: each try is taken with one UPDATE ... RETURNING before the code is compared, and a
+ * right code is consumed with one DELETE ... RETURNING, so parallel requests can't get more than MAX_TRIES guesses
+ * or mint two tokens from one code.
  *
- * Rate limits (all answer 429 {"error":"rate_limited"} with Retry-After):
- *   - CLAIM_RL (Cloudflare [[ratelimits]] binding, wrangler.toml): a per-IP burst limit on start and verify.
- *     Optional: without the binding (local tests) the burst limit is skipped.
+ * A claim is stored (or replaced) only once the mailer says the code email was sent: a start the mailer refuses
+ * (its one-per-minute-per-address limit, a failure) leaves the previous claim, and the code its owner holds, as
+ * it was.
+ *
+ * Rate limits (start and verify answer 429 {"error":"rate_limited"} with Retry-After):
+ *   - CLAIM_RL (Cloudflare [[ratelimits]] binding, wrangler.toml, 10 a minute per key): start per IP; verify per
+ *     IP and per email hash. "Per IP" is the full address for IPv4 and its /64 for IPv6 (ipBucket): one host gets
+ *     a whole /64, so a per-address IPv6 limit would limit nothing. Optional: without the binding (local tests)
+ *     these are skipped.
  *   - KV counters in ACCESS_KV, fixed one-hour windows, on start only: per IP (LIMITS.ipPerHour) and per email hash
- *     (LIMITS.emailPerHour). The ratelimits binding only counts over 10 or 60 seconds, so the hourly limits need
- *     KV. KV isn't atomic, so a burst of parallel requests can slip a few past a limit: the burst binding is what
- *     bounds that.
+ *     (LIMITS.emailPerHour). KV isn't atomic, so a burst of parallel requests can slip a few past these: the burst
+ *     binding bounds that, and these only limit email volume (nothing secret depends on them).
+ *   - A global cap on "no donation found" emails (LIMITS.noDonationPerHour, an atomic D1 counter): past it those
+ *     emails are skipped without a word (still 202), so start can't be turned into a mass mailer. Donors' code
+ *     emails don't count against it.
  *
  * Logs never hold the email (not even masked), the code, the IP or the token.
  *
  * The emails themselves are the mailer's (templates in stash-mailer, like the welcome): this Worker sends
  *   POST https://stash-mailer/supporter-claim   Authorization: Bearer <MAILER_TOKEN>
  *     {"email","kind":"code","code":"123456"}  or  {"email","kind":"no_donation"}
- * and expects 200 {"sent":true}. See ../README.md, "Supporter claim", for the contract and the copy.
+ * and counts only 200 {"sent":true} as sent. See ../README.md, "Supporter claim", for the contract and the copy.
  */
 import { hashEmail, KEYS, normalizeEmail, sameSecret } from "./access.js";
+import { consumeClaim, countWithin, dropExhausted, putClaim, takeTry } from "./claim-store.js";
 import { mintSupporterToken } from "./entitlement.js";
 
 export const CLAIM_TTL_S = 10 * 60;
 export const MAX_TRIES = 5;
-export const LIMITS = { ipPerHour: 5, emailPerHour: 3 };
+export const LIMITS = { ipPerHour: 5, emailPerHour: 3, noDonationPerHour: 30 };
 /** The burst binding's window (wrangler.toml [[ratelimits]] simple.period), for Retry-After. */
 const BURST_PERIOD_S = 60;
 const WINDOW_S = 3600;
@@ -47,9 +60,10 @@ const MAX_BODY_BYTES = 4096;
 export const MAILER_CLAIM_URL = "https://stash-mailer/supporter-claim";
 
 export const CLAIM_KEYS = {
-    claim: (hash) => `claim:${hash}`,
-    /** A start counter: <kind> is "ip" or "email", <id> a hash, <window> the hour (epoch s / 3600). */
+    /** A start counter in ACCESS_KV: <kind> is "ip" or "email", <id> a hash, <window> the hour (epoch s / 3600). */
     rate: (kind, id, window) => `claimrl:${kind}:${id}:${window}`,
+    /** The no-donation email counter in CLAIMS_DB claim_counters, per hour. */
+    noDonation: (window) => `nodonation:${window}`,
 };
 
 /** Clock seam for tests (milliseconds). */
@@ -72,10 +86,29 @@ export const validEmail = (email) => typeof email === "string" && email.length <
 
 const enc = new TextEncoder();
 const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
-const sha256Hex = async (text) => hex(await crypto.subtle.digest("SHA-256", enc.encode(text)));
 
-/** What the claim stores for a code: SHA-256 hex of (code + email hash), so a KV read alone doesn't give the code. */
-export const codeHashOf = (code, hash) => sha256Hex(`${code}${hash}`);
+/** The HMAC key for a pepper, imported once per isolate per pepper value. */
+let hmacCache = { pepper: null, key: null };
+async function hmacKey(pepper) {
+    if (hmacCache.pepper === pepper && hmacCache.key) return hmacCache.key;
+    const key = await crypto.subtle.importKey("raw", enc.encode(pepper), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    hmacCache = { pepper, key };
+    return key;
+}
+
+/**
+ * What a claim stores for a code: HMAC-SHA256 hex, keyed with EMAIL_PEPPER, of "claim-code:v1:<email hash>:<code>".
+ * There are only a million codes, so an unkeyed hash would fall to a brute force in moments; keyed with the
+ * pepper, a D1 read alone (an export, a backup, a dashboard query) gives no way to test a guess. The prefix keeps
+ * it apart from the email hash, which uses the same pepper.
+ */
+export async function codeHashOf(code, emailHash, pepper) {
+    const mac = await crypto.subtle.sign("HMAC", await hmacKey(pepper), enc.encode(`claim-code:v1:${emailHash}:${code}`));
+    return hex(mac);
+}
+
+/** Compared against when there is no claim, so that path does the same constant-time compare as a real one. */
+const NO_CLAIM_HASH = "0".repeat(64);
 
 /** A uniform 6-digit code, "000000" to "999999" (rejection sampling, so no digit is more likely than another). */
 export function newCode() {
@@ -90,6 +123,15 @@ const json = (status, body, headers = {}) =>
     new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
 
 const limited = (retryAfterS) => json(429, { error: "rate_limited" }, { "retry-after": String(Math.max(1, Math.ceil(retryAfterS))) });
+
+/** verify's one failure answer: no claim, expired, wrong code and too many tries are indistinguishable. */
+const badCode = () => json(401, { error: "bad_code" });
+
+/** CLAIMS_DB failed (an outage, not an answer about the claim): 503 unavailable, for the app to retry later. */
+function storeDown(err) {
+    console.error(`claim: CLAIMS_DB failed: ${String(err?.message ?? err).slice(0, 120)}`);
+    return json(503, { error: "unavailable" }, { "retry-after": "30" });
+}
 
 /** The JSON body as an object, or null (not JSON, too big, or not an object). */
 async function readJson(request) {
@@ -112,16 +154,60 @@ async function readJson(request) {
 /** The client's IP (Cloudflare sets CF-Connecting-IP), or "unknown" off Cloudflare (local runs, tests). */
 const clientIp = (request) => request.headers.get("cf-connecting-ip") || "unknown";
 
-/** The IP's id in limit keys: keyed with EMAIL_PEPPER like the email (hashEmail), so no raw IP is stored. */
-const ipId = (ip, pepper) => hashEmail(`ip:${ip}`, pepper);
+/**
+ * What a per-IP limit counts by: an IPv4 address as is; an IPv6 address by its /64 ("2001:db8:0:1::/64"), since
+ * one host is routinely given a whole /64 and could otherwise pick a fresh address for every request. An
+ * IPv4-mapped IPv6 address ("::ffff:192.0.2.1") counts as the IPv4 one. Anything unparseable is used as is: still
+ * a key, just a narrow one.
+ */
+export function ipBucket(ip) {
+    const s = String(ip ?? "").trim().toLowerCase().replace(/%.*$/, ""); // drop a zone id ("fe80::1%eth0")
+    if (!s.includes(":")) return s || "unknown";
+    const g = ipv6Groups(s);
+    if (!g) return s;
+    if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return [g[6] >> 8, g[6] & 255, g[7] >> 8, g[7] & 255].join(".");
+    return `${g.slice(0, 4).map((x) => x.toString(16).padStart(4, "0")).join(":")}::/64`;
+}
 
-/** The burst limit (CLAIM_RL). True when the request may go on; skipped (true) when the binding isn't there. */
-async function burstAllowed(env, route, ipHash) {
+/** An IPv6 address as its eight 16-bit groups, or null when it doesn't parse. A dotted IPv4 tail is two groups. */
+function ipv6Groups(s) {
+    const halves = s.split("::");
+    if (halves.length > 2) return null;
+    const parse = (part, last) => {
+        if (!part) return [];
+        const items = part.split(":");
+        const out = [];
+        for (let i = 0; i < items.length; i++) {
+            const x = items[i];
+            if (x.includes(".")) {
+                const o = x.split(".");
+                if (!last || i !== items.length - 1 || o.length !== 4 || !o.every((n) => /^\d{1,3}$/.test(n) && Number(n) < 256)) return null;
+                out.push((Number(o[0]) << 8) | Number(o[1]), (Number(o[2]) << 8) | Number(o[3]));
+            } else {
+                if (!/^[0-9a-f]{1,4}$/.test(x)) return null;
+                out.push(Number.parseInt(x, 16));
+            }
+        }
+        return out;
+    };
+    const head = parse(halves[0], halves.length === 1);
+    const tail = halves.length === 2 ? parse(halves[1], true) : [];
+    if (!head || !tail) return null;
+    if (halves.length === 1) return head.length === 8 ? head : null;
+    const missing = 8 - head.length - tail.length;
+    return missing >= 1 ? [...head, ...Array(missing).fill(0), ...tail] : null;
+}
+
+/** The IP's id in limit keys: its bucket, keyed with EMAIL_PEPPER like the email (hashEmail), so no raw IP is stored. */
+const ipId = (ip, pepper) => hashEmail(`ip:${ipBucket(ip)}`, pepper);
+
+/** One CLAIM_RL check. True when the request may go on; skipped (true) when the binding isn't there. */
+async function burstAllowed(env, key) {
     if (!env.CLAIM_RL || typeof env.CLAIM_RL.limit !== "function") return true;
     try {
-        return (await env.CLAIM_RL.limit({ key: `${route}:${ipHash}` })).success !== false;
+        return (await env.CLAIM_RL.limit({ key })).success !== false;
     } catch (err) {
-        // A failing limiter shouldn't take the claim down; the hourly KV limits still apply.
+        // A failing limiter shouldn't take the claim down; the other limits still apply.
         console.error(`claim: CLAIM_RL failed: ${String(err?.message ?? err).slice(0, 80)}`);
         return true;
     }
@@ -149,7 +235,11 @@ async function hourlyLimit(kv, ipHash, emailHash, nowS) {
     return null;
 }
 
-/** Asks the mailer for one claim email. Resolves true when it says sent; never rejects; logs no address or code. */
+/**
+ * Asks the mailer for one claim email. Resolves true only when it answers 200 {"sent":true}; anything else (its
+ * per-address limit's 200 {"sent":false}, an error status, a network failure) is false. Never rejects; logs no
+ * address or code.
+ */
 async function sendClaimMail(env, message) {
     try {
         const res = await env.MAILER.fetch(MAILER_CLAIM_URL, {
@@ -176,28 +266,48 @@ async function sendClaimMail(env, message) {
 }
 
 /**
- * Everything start does after its 202: look the address up, store a claim for a donor, send the one email.
- * Never rejects (it runs in waitUntil).
+ * Everything start does after its 202: look the address up; for a donor send a code and, once the mailer says
+ * it's sent, store it as the pending claim; for anyone else send the no-donation email, within the global cap.
+ * Resolves true when an email went out. Never rejects (it runs in waitUntil).
  */
 export async function deliverClaim(env, email, hash, nowMs = clock.now()) {
     try {
+        const nowS = Math.floor(nowMs / 1000);
         const entry = await env.ACCESS_KV.get(KEYS.access(hash), "json");
-        if (!isDonation(entry)) return await sendClaimMail(env, { email, kind: "no_donation" });
+        if (!isDonation(entry)) {
+            const window = Math.floor(nowS / WINDOW_S);
+            const within = await countWithin(env.CLAIMS_DB, CLAIM_KEYS.noDonation(window), LIMITS.noDonationPerHour, (window + 1) * WINDOW_S + WINDOW_S);
+            if (!within) {
+                console.log("claim: no_donation email skipped: hourly cap reached");
+                return false;
+            }
+            return await sendClaimMail(env, { email, kind: "no_donation" });
+        }
         const code = newCode();
-        const claim = { codeHash: await codeHashOf(code, hash), tries: 0, exp: Math.floor(nowMs / 1000) + CLAIM_TTL_S };
-        await env.ACCESS_KV.put(CLAIM_KEYS.claim(hash), JSON.stringify(claim), { expirationTtl: CLAIM_TTL_S });
-        return await sendClaimMail(env, { email, kind: "code", code });
+        // Hashed before the send, so nothing but the store is left to do once the mailer answers.
+        const codeHash = await codeHashOf(code, hash, env.EMAIL_PEPPER);
+        // Send first, store after: a code the mailer refused (its one-per-minute limit, a failure) never reaches
+        // anyone, so it must not replace the claim whose code the donor already holds.
+        if (!(await sendClaimMail(env, { email, kind: "code", code }))) return false;
+        await putClaim(env.CLAIMS_DB, hash, codeHash, nowS + CLAIM_TTL_S);
+        return true;
     } catch (err) {
         console.error(`claim: start failed after the response: ${String(err?.message ?? err).slice(0, 120)}`);
         return false;
     }
 }
 
+/** Runs [work] after the response when the runtime allows it, else before (local runs, tests). */
+async function afterResponse(ctx, work) {
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(work);
+    else await work;
+}
+
 /** POST /claim/email/start. */
 export async function handleClaimStart(request, env, ctx) {
     // Without these a donor would get no code, or (no pepper) a hash that matches nobody on the access list.
-    if (!env.ACCESS_KV || !env.EMAIL_PEPPER || !env.MAILER || !env.MAILER_TOKEN || !env.ENTITLEMENT_PRIVATE_KEY) {
-        console.error("claim: not configured (ACCESS_KV, EMAIL_PEPPER, MAILER, MAILER_TOKEN, ENTITLEMENT_PRIVATE_KEY)");
+    if (!env.ACCESS_KV || !env.CLAIMS_DB || !env.EMAIL_PEPPER || !env.MAILER || !env.MAILER_TOKEN || !env.ENTITLEMENT_PRIVATE_KEY) {
+        console.error("claim: not configured (ACCESS_KV, CLAIMS_DB, EMAIL_PEPPER, MAILER, MAILER_TOKEN, ENTITLEMENT_PRIVATE_KEY)");
         return json(503, { error: "not_configured" });
     }
     const body = await readJson(request);
@@ -206,22 +316,20 @@ export async function handleClaimStart(request, env, ctx) {
     if (!validEmail(email)) return json(400, { error: "bad_email" });
 
     const ipHash = await ipId(clientIp(request), env.EMAIL_PEPPER);
-    if (!(await burstAllowed(env, "start", ipHash))) return limited(BURST_PERIOD_S);
+    if (!(await burstAllowed(env, `start:${ipHash}`))) return limited(BURST_PERIOD_S);
     const hash = await hashEmail(email, env.EMAIL_PEPPER);
     const nowMs = clock.now();
     const wait = await hourlyLimit(env.ACCESS_KV, ipHash, hash, Math.floor(nowMs / 1000));
     if (wait !== null) return limited(wait);
 
-    const work = deliverClaim(env, email, hash, nowMs);
-    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(work);
-    else await work;
+    await afterResponse(ctx, deliverClaim(env, email, hash, nowMs));
     return json(202, { ok: true });
 }
 
 /** POST /claim/email/verify. */
-export async function handleClaimVerify(request, env) {
-    if (!env.ENTITLEMENT_PRIVATE_KEY || !env.ACCESS_KV || !env.EMAIL_PEPPER) {
-        console.error("claim: not configured (ENTITLEMENT_PRIVATE_KEY, ACCESS_KV, EMAIL_PEPPER)");
+export async function handleClaimVerify(request, env, ctx) {
+    if (!env.ENTITLEMENT_PRIVATE_KEY || !env.CLAIMS_DB || !env.EMAIL_PEPPER) {
+        console.error("claim: not configured (ENTITLEMENT_PRIVATE_KEY, CLAIMS_DB, EMAIL_PEPPER)");
         return json(503, { error: "not_configured" });
     }
     const body = await readJson(request);
@@ -231,48 +339,54 @@ export async function handleClaimVerify(request, env) {
     const code = typeof body.code === "string" || typeof body.code === "number" ? String(body.code).trim() : "";
 
     const ipHash = await ipId(clientIp(request), env.EMAIL_PEPPER);
-    if (!(await burstAllowed(env, "verify", ipHash))) return limited(BURST_PERIOD_S);
-
-    const kv = env.ACCESS_KV;
+    if (!(await burstAllowed(env, `verify:${ipHash}`))) return limited(BURST_PERIOD_S);
     const hash = await hashEmail(email, env.EMAIL_PEPPER);
-    const key = CLAIM_KEYS.claim(hash);
+    // Per address too, whatever the IP: a guesser spread over many IPs still meets this (and MAX_TRIES).
+    if (!(await burstAllowed(env, `v:${hash}`))) return limited(BURST_PERIOD_S);
+
+    const db = env.CLAIMS_DB;
     const nowMs = clock.now();
     const nowS = Math.floor(nowMs / 1000);
-    let claim = null;
+    // The same work on every path: the code's hash, one D1 statement, one constant-time compare.
+    const candidate = await codeHashOf(code.slice(0, 64), hash, env.EMAIL_PEPPER);
+    let claim;
     try {
-        claim = await kv.get(key, "json");
-    } catch {
-        claim = null; // unreadable: treated as no claim
+        claim = await takeTry(db, hash, MAX_TRIES, nowS);
+    } catch (err) {
+        return storeDown(err);
     }
-    if (!claim || typeof claim.codeHash !== "string" || !(Number(claim.exp) > nowS)) {
-        if (claim) await kv.delete(key);
-        return json(410, { error: "expired" });
-    }
+    const same = await sameSecret(candidate, claim ? claim.codeHash : NO_CLAIM_HASH);
+    // A malformed code is just a wrong one (and has used a try).
+    const ok = !!claim && same && /^\d{6}$/.test(code);
 
-    // Constant time: both sides are hashed and compared without an early exit (sameSecret). A malformed code is
-    // just a wrong one, and counts as a try.
-    const ok = /^\d{6}$/.test(code) && (await sameSecret(await codeHashOf(code, hash), claim.codeHash));
     if (!ok) {
-        const tries = (Number(claim.tries) || 0) + 1;
-        if (tries >= MAX_TRIES) {
-            await kv.delete(key);
-            return json(429, { error: "too_many_tries" });
+        // That was the last try: the claim is dead (takeTry refuses it from now on); tidy it away after the response,
+        // so this answer takes no longer than any other bad_code.
+        if (claim && claim.tries >= MAX_TRIES) {
+            await afterResponse(
+                ctx,
+                dropExhausted(db, hash, MAX_TRIES).catch((err) => console.error(`claim: exhausted claim not deleted: ${String(err?.message ?? err).slice(0, 80)}`)),
+            );
         }
-        // Keep the claim's own expiry (KV needs it at least 60 s out; exp above is what counts).
-        const expiration = Math.max(Number(claim.exp), nowS + KV_MIN_TTL_S);
-        await kv.put(key, JSON.stringify({ ...claim, tries }), { expiration });
-        return json(401, { error: "bad_code" });
+        return badCode();
     }
 
     let token;
     try {
+        // Minted before the claim is consumed, so a malformed key leaves the claim for a retry once it's fixed.
         token = await mintSupporterToken(env.ENTITLEMENT_PRIVATE_KEY, nowMs);
     } catch (err) {
-        // A malformed key. The claim stays, so the donor can try again once the secret is fixed.
         console.error(`claim: token not minted (ENTITLEMENT_PRIVATE_KEY unreadable?): ${String(err?.name ?? "error")}`);
         return json(503, { error: "not_configured" });
     }
-    await kv.delete(key);
+    // Single use: of parallel right answers, only the one whose DELETE removed the row hands its token out.
+    let consumed;
+    try {
+        consumed = await consumeClaim(db, hash, claim.codeHash, nowS);
+    } catch (err) {
+        return storeDown(err);
+    }
+    if (!consumed) return badCode();
     console.log("claim: supporter token issued");
     return json(200, { token });
 }
