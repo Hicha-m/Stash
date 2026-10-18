@@ -4,7 +4,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.stash.core.auth.TokenManager
 import com.stash.core.auth.model.AuthState
-import com.stash.core.common.matchesArtistCredits
 import com.stash.core.common.primaryArtist
 import com.stash.core.data.db.dao.ArtistImageDao
 import com.stash.core.data.prefs.StreamingPreference
@@ -122,6 +121,10 @@ class LibraryViewModel @Inject constructor(
     private val sharedMixRepository: com.stash.core.data.share.SharedMixRepository,
     /** Link Stash on the web's mirror (null in tests that don't need it). */
     private val mirror: com.stash.core.data.weblink.mirror.MirrorEngine? = null,
+    /** Offline, the artist and album cards play only downloaded songs (null in tests = online). */
+    private val connectivityMonitor: com.stash.core.media.streaming.ConnectivityMonitor? = null,
+    /** Artists and Albums' "Show" choice in Stream only (null in tests = Everything). */
+    private val libraryScopePreference: com.stash.core.data.prefs.LibraryScopePreference? = null,
 ) : ViewModel() {
 
     /** The playlist mirrors with Stash on the web: deleting it asks Everywhere / Only here (spec §2.4). */
@@ -347,6 +350,17 @@ class LibraryViewModel @Inject constructor(
     ) { controls, query -> controls.copy(searchQuery = query) }
 
     /**
+     * The Artists tab's cards, each counting what its artist page lists ([buildArtistCards]).
+     * Built here, not in the [uiState] pipeline, so typing a search or switching tabs doesn't
+     * redo the credit index; and only when the DAO rows actually change (every tracks write
+     * re-runs the query, a play count included).
+     */
+    private val artistCards: Flow<List<ArtistInfo>> = musicRepository.getAllArtists()
+        .distinctUntilChanged()
+        .map { buildArtistCards(it) }
+        .flowOn(Dispatchers.Default)
+
+    /**
      * [pipelineControls] with the Downloaded / Online filters read as All outside
      * Stream-only mode. Those chips only exist in Stream-only, so a saved Online
      * choice would otherwise empty the Songs list in Download mode with no chip to
@@ -368,7 +382,7 @@ class LibraryViewModel @Inject constructor(
         effectiveControls,
         downloadedTracks,
         libraryDataFlow,
-        musicRepository.getAllArtists(),
+        artistCards,
         musicRepository.getAllAlbums(),
     ) { controls, allTracks, libraryData, allArtists, allAlbums ->
         DataSnapshot(controls, allTracks, libraryData, allArtists, allAlbums)
@@ -385,24 +399,9 @@ class LibraryViewModel @Inject constructor(
         val query = controls.searchQuery.trim().lowercase()
 
         // -- Map DAO projections to UI models --
-        // Artists are regrouped by PRIMARY act so a track credit like
-        // "Aarne, Toxi$, Big Baby Tape" lands under a single "Aarne" card
-        // instead of fragmenting the artist across a wall of "Aarne …" rows.
+        // Artists arrive as cards already (see [artistCards]): one per PRIMARY act, so
+        // "Aarne, Toxi$, Big Baby Tape" lands on a single "Aarne" card.
         val artists = allArtists
-            .map { ArtistInfo(it.artist, it.trackCount, it.totalDurationMs, it.artUrl) }
-            .groupBy { it.name.primaryArtist() }
-            .map { (primary, group) ->
-                ArtistInfo(
-                    name = primary,
-                    trackCount = group.sumOf { it.trackCount },
-                    totalDurationMs = group.sumOf { it.totalDurationMs },
-                    // Prefer art from a release credited to the primary act
-                    // alone (their own album), falling back to any collab art —
-                    // "Aarne" shows his own cover, not SLAANG's.
-                    artUrl = group.firstOrNull { it.name == primary }?.artUrl
-                        ?: group.firstNotNullOfOrNull { it.artUrl },
-                )
-            }
         val albums = mergeDuplicateAlbums(
             // Album card shows the lead act of a collaboration credit
             // ("Metro Boomin" for "Metro Boomin, Travis Scott"), so the card
@@ -512,8 +511,15 @@ class LibraryViewModel @Inject constructor(
         libraryState.copy(
             currentlyPlayingTrackId = playerState.currentTrack?.id,
         )
-    }.combine(streamingPreference.enabled) { libraryState, streaming ->
-        libraryState.copy(streamingMode = streaming)
+    }.combine(
+        combine(
+            streamingPreference.enabled,
+            libraryScopePreference?.inLibraryOnly ?: flowOf(false),
+        ) { streaming, inLibraryOnly -> streaming to inLibraryOnly },
+    ) { libraryState, (streaming, inLibraryOnly) ->
+        // The repository applies "In your library" to the artist and album rows in Stream only
+        // (MusicRepositoryImpl.libraryScope); this only tells the sheet and the chip.
+        libraryState.copy(streamingMode = streaming, libraryOnly = streaming && inLibraryOnly)
     }.combine(artistImageDao.observeAll()) { libraryState, images ->
         // Overlay real artist photos (ArtistImageBackfillWorker output) keyed
         // by the SAME primary-artist name the Artists tab groups by. Artists
@@ -670,6 +676,14 @@ class LibraryViewModel @Inject constructor(
         sourceFilterUserSet = true
         _controls.update { it.copy(sourceFilter = filter) }
         viewModelScope.launch { libraryPreferencesStore.setSourceFilter(filter) }
+    }
+
+    /**
+     * Artists and Albums' "Show" choice in Stream only: true = "In your library" (the songs Songs
+     * lists), false = "Everything". Saved for every launch; the artist and album pages follow it.
+     */
+    fun setLibraryOnly(libraryOnly: Boolean) {
+        viewModelScope.launch { libraryScopePreference?.setInLibraryOnly(libraryOnly) }
     }
 
     /**
@@ -1051,36 +1065,46 @@ class LibraryViewModel @Inject constructor(
     // ── Artist actions ──────────────────────────────────────────────────
 
     /**
-     * Load all downloaded tracks by [artistName] and begin playback from the first track.
+     * Plays the songs [artistName]'s page lists, from the first: every song in Stream only (those
+     * not downloaded stream), the downloaded ones in Download. Offline, only songs on the phone
+     * play (see [playableNow]); with none, says it needs a connection.
      */
     fun playArtist(artistName: String) {
         viewModelScope.launch {
-            val tracks = musicRepository.getTracksByArtist(artistName).first()
-            val downloaded = tracks.filter { it.filePath != null }
-            if (downloaded.isNotEmpty()) {
-                playerRepository.setQueue(
-                    downloaded,
-                    startIndex = 0,
-                    source = com.stash.core.model.PlaybackSource.Artist(artistName),
-                )
-            }
+            val tracks = playableFromCard(musicRepository.getTracksByArtist(artistName).first(), ARTIST_NEEDS_CONNECTION)
+            if (tracks.isEmpty()) return@launch
+            playerRepository.setQueue(
+                tracks,
+                startIndex = 0,
+                source = com.stash.core.model.PlaybackSource.Artist(artistName),
+            )
+        }
+    }
+
+    /** Appends the songs [playArtist] would play to the queue, under the same rule. */
+    fun addArtistToQueue(artistName: String) {
+        viewModelScope.launch {
+            val tracks = playableFromCard(musicRepository.getTracksByArtist(artistName).first(), ARTIST_NEEDS_CONNECTION)
+            if (tracks.isNotEmpty()) playerRepository.addToQueue(tracks)
         }
     }
 
     /**
-     * Load all downloaded tracks by [artistName] and append each to the playback queue.
+     * [listed] narrowed to what can play now ([playableNow]). Offline with songs listed but none
+     * on the phone, it says so with [needsConnection] and returns nothing.
      */
-    fun addArtistToQueue(artistName: String) {
-        viewModelScope.launch {
-            val tracks = musicRepository.getTracksByArtist(artistName).first()
-            val downloaded = tracks.filter { it.filePath != null }
-            downloaded.forEach { playerRepository.addToQueue(it) }
-        }
+    private fun playableFromCard(listed: List<Track>, needsConnection: String): List<Track> {
+        // No monitor only in tests that don't care: treat as online, as before this rule.
+        val playable = playableNow(listed, online = connectivityMonitor?.isConnected() ?: true)
+        if (playable.isEmpty() && listed.isNotEmpty()) _userMessages.tryEmit(needsConnection)
+        return playable
     }
 
     /**
      * Delete the downloaded songs on [artistName]'s card from disk and DB — exactly the
-     * [ArtistInfo.trackCount] songs the confirm dialog names (see [artistCardTracks]).
+     * [ArtistInfo.downloadedCount] songs the confirm dialog names (see [artistCardTracks]). Not
+     * the card's [ArtistInfo.trackCount]: that counts what the artist page lists, features and
+     * (in Stream only) songs that aren't downloaded included.
      *
      * [MusicRepository.getTracksByArtist] is a credit search (any credit, album artist too,
      * downloaded or not): deleting all of it also took "Future, Drake" songs from Future's card,
@@ -1106,42 +1130,28 @@ class LibraryViewModel @Inject constructor(
     // ── Album actions ───────────────────────────────────────────────────
 
     /**
-     * Load all downloaded tracks matching [albumName] by [artist] and begin playback.
-     * Filters from allTracks since there is no dedicated getTracksByAlbum query.
-     * Artist matching uses [matchesArtistCredits] so a collaboration album
-     * ("Metro Boomin, Travis Scott") plays from its primary-act card tap.
+     * Plays the songs [albumName]'s page lists, from the first: the album's songs crediting
+     * [artist] ([MusicRepository.getTracksByAlbum], so a collaboration album plays from its
+     * primary-act card), every one in Stream only, the downloaded ones in Download. Offline,
+     * only songs on the phone play; with none, says it needs a connection.
      */
     fun playAlbum(albumName: String, artist: String) {
         viewModelScope.launch {
-            val allTracks = musicRepository.getAllTracks().first()
-            val downloaded = allTracks.filter {
-                it.album.equals(albumName, ignoreCase = true)
-                    && matchesArtistCredits(it.artist, it.albumArtist, artist)
-                    && it.filePath != null
-            }
-            if (downloaded.isNotEmpty()) {
-                playerRepository.setQueue(
-                    downloaded,
-                    startIndex = 0,
-                    source = com.stash.core.model.PlaybackSource.Album(albumName, artist),
-                )
-            }
+            val tracks = playableFromCard(musicRepository.getTracksByAlbum(albumName, artist).first(), ALBUM_NEEDS_CONNECTION)
+            if (tracks.isEmpty()) return@launch
+            playerRepository.setQueue(
+                tracks,
+                startIndex = 0,
+                source = com.stash.core.model.PlaybackSource.Album(albumName, artist),
+            )
         }
     }
 
-    /**
-     * Load all downloaded tracks matching [albumName] by [artist] and append each to the queue.
-     * Artist matching uses [matchesArtistCredits] like [playAlbum].
-     */
+    /** Appends the songs [playAlbum] would play to the queue, under the same rule. */
     fun addAlbumToQueue(albumName: String, artist: String) {
         viewModelScope.launch {
-            val allTracks = musicRepository.getAllTracks().first()
-            val downloaded = allTracks.filter {
-                it.album.equals(albumName, ignoreCase = true)
-                    && matchesArtistCredits(it.artist, it.albumArtist, artist)
-                    && it.filePath != null
-            }
-            downloaded.forEach { playerRepository.addToQueue(it) }
+            val tracks = playableFromCard(musicRepository.getTracksByAlbum(albumName, artist).first(), ALBUM_NEEDS_CONNECTION)
+            if (tracks.isNotEmpty()) playerRepository.addToQueue(tracks)
         }
     }
 
@@ -1247,7 +1257,7 @@ private data class DataSnapshot(
     val controls: ControlState,
     val allTracks: List<Track>,
     val libraryData: LibraryData,
-    val allArtists: List<com.stash.core.data.db.dao.ArtistSummary>,
+    val allArtists: List<ArtistInfo>,
     val allAlbums: List<com.stash.core.data.db.dao.AlbumSummary>,
 )
 
@@ -1262,10 +1272,11 @@ private data class LibraryData(
 )
 
 /**
- * The songs an Artists-tab card counts: DOWNLOADED rows whose credit's primary act is
- * [artistName]. Mirrors how the card is built (`getAllArtists` counts `is_downloaded` rows per
- * exact credit, then the tab regroups credits by [primaryArtist]), so a destructive action on
- * the card touches exactly the songs its count, and its confirm dialog, promise.
+ * The songs "Delete All by Artist" removes from a card: DOWNLOADED rows whose credit's primary
+ * act is [artistName], out of [candidates] (the artist page's credit search). Mirrors
+ * [ArtistInfo.downloadedCount] (see [buildArtistCards]), so the delete touches exactly the songs
+ * its confirm dialog names. Never a song that isn't downloaded, whatever the Download switch
+ * lists: deleting one would take a synced song out of its playlists and Liked for good.
  */
 internal fun artistCardTracks(candidates: List<Track>, artistName: String): List<Track> =
     candidates.filter { it.isDownloaded && it.artist.primaryArtist() == artistName }

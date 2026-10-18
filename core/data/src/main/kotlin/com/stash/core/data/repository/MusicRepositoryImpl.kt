@@ -25,6 +25,7 @@ import com.stash.core.data.sync.workers.DiscoveryDownloadWorker
 import com.stash.core.data.sync.workers.constraintsForManualTrigger
 import com.stash.core.model.Playlist
 import com.stash.core.model.Track
+import com.stash.core.model.isScannedSong
 import com.stash.core.model.share.toTrack
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +35,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
@@ -66,6 +68,7 @@ class MusicRepositoryImpl @Inject constructor(
     private val stashMixRecipeDao: com.stash.core.data.db.dao.StashMixRecipeDao,
     private val downloadNetworkPreference: com.stash.core.data.prefs.DownloadNetworkPreference,
     private val streamingPreference: com.stash.core.data.prefs.StreamingPreference,
+    private val libraryScopePreference: com.stash.core.data.prefs.LibraryScopePreference,
     private val localFileOps: com.stash.core.data.files.LocalFileOps,
     private val syncPreferencesManager: com.stash.core.data.sync.SyncPreferencesManager,
     private val singleTrackDownloadEnqueuer: com.stash.core.data.sync.SingleTrackDownloadEnqueuer,
@@ -301,7 +304,9 @@ class MusicRepositoryImpl @Inject constructor(
         trackDao.getLibraryWithOnlineByDateAdded().map { rows -> rows.map { it.toDomain() } }
 
     override fun getTracksByArtist(artist: String): Flow<List<Track>> =
-        trackDao.getByArtist(artist)
+        libraryScope { includeNotDownloaded, libraryOnly ->
+            trackDao.getByArtist(artist, includeNotDownloaded, libraryOnly)
+        }
             .map { entities ->
                 entities
                     .filter { matchesArtistCredits(it.artist, it.albumArtist, artist) }
@@ -311,17 +316,49 @@ class MusicRepositoryImpl @Inject constructor(
             // candidate superset and off the main thread.
             .flowOn(Dispatchers.Default)
 
-    // v0.9.30 Path A: Library Songs/Albums/Artists views are curated =
-    // downloaded-only, always. Streaming mode does NOT change what shows
-    // in those Library sub-views — it would only expose ghost rows from
-    // historic failed downloads. The Spotify/Apple Music mental model:
-    // Library is YOUR saved music; search/streaming is a separate surface.
-    //
-    // EXCEPTION: getTracksByPlaylist. A playlist shows ALL of its tracks,
-    // streamable and downloaded, in every mode — streaming is always allowed,
-    // and tapping a streamable track streams it. (Until 2026-09-17 this
-    // followed the Online/Offline switch and hid streamable rows offline.)
-    // Tap-time playability is governed by live connectivity, not a preference.
+    override fun getTracksByAlbum(album: String, artist: String): Flow<List<Track>> =
+        libraryScope { includeNotDownloaded, libraryOnly ->
+            trackDao.getByAlbum(album, includeNotDownloaded, libraryOnly)
+        }
+            .map { entities ->
+                entities
+                    .filter {
+                        it.album.equals(album, ignoreCase = true) &&
+                            matchesArtistCredits(it.artist, it.albumArtist, artist)
+                    }
+                    .map { it.toDomain() }
+            }
+            .flowOn(Dispatchers.Default)
+
+    /**
+     * The Library's Artists and Albums tabs, their counts, and the artist and album pages follow
+     * the Download switch ([com.stash.core.data.prefs.StreamingPreference.enabled]): Stream only
+     * shows every song, Download only the downloaded ones. [query] gets `includeNotDownloaded`
+     * and is re-run when the switch flips, so an open tab or page follows it live.
+     *
+     * This replaced "v0.9.30 Path A" (those views were downloaded-only in every mode), which
+     * left a Stream only listener with an artist card counting 3 songs whose page listed 40. The
+     * Songs tab has its own feed, and a playlist is not a Library view: it shows every song in
+     * every mode (see [getTracksByPlaylist]).
+     *
+     * In Stream only, the sort sheet's "In your library" ([com.stash.core.data.prefs.LibraryScopePreference.inLibraryOnly])
+     * narrows all of them to the songs the Songs tab lists: [query] gets `libraryOnly`, false in
+     * Download whatever was saved. Every Library artist and album read goes through here, so a
+     * card's count and the page it opens always agree.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun <T> libraryScope(query: (includeNotDownloaded: Boolean, libraryOnly: Boolean) -> Flow<T>): Flow<T> =
+        combine(streamingPreference.enabled, libraryScopePreference.inLibraryOnly) { streamOnly, inLibraryOnly ->
+            streamOnly to (streamOnly && inLibraryOnly)
+        }
+            .distinctUntilChanged()
+            .flatMapLatest { (streamOnly, libraryOnly) -> query(streamOnly, libraryOnly) }
+
+    // A playlist shows ALL of its tracks, streamable and downloaded, in every
+    // mode — streaming is always allowed, and tapping a streamable track
+    // streams it. (Until 2026-09-17 this followed the Online/Offline switch
+    // and hid streamable rows offline.) Tap-time playability is governed by
+    // live connectivity, not a preference.
     @OptIn(ExperimentalCoroutinesApi::class)
     override fun getTracksByPlaylist(playlistId: Long): Flow<List<Track>> =
         trackDao.getByPlaylist(playlistId, includeStreamable = true)
@@ -330,19 +367,18 @@ class MusicRepositoryImpl @Inject constructor(
             .flowOn(Dispatchers.Default)
 
     /**
-     * Artists for the Library Artists tab: downloaded tracks only, like the
-     * Songs and Albums tabs (Liked and playlist detail show everything). Not
-     * tied to the Download switch — since v0.9.107 that switch decides what
-     * Sync writes to disk, never what a screen shows. If the Library is ever
-     * widened to stream-only content, widen this AND
-     * `ArtistImageDao.distinctArtistNames` together, so photos are resolved
-     * for exactly the artists the tab lists.
+     * Credit pairs for the Library Artists tab, in the Download switch's scope (see
+     * [libraryScope]): every song in Stream only (or the songs in your library, under that
+     * filter), downloaded songs in Download.
+     * `ArtistImageDao.distinctArtistNames` takes the same scope, so photos are resolved for
+     * exactly the artists the tab lists; change the two together.
      */
     override fun getAllArtists(): Flow<List<ArtistSummary>> =
-        trackDao.getAllArtists(includeStreamable = false)
+        libraryScope { includeNotDownloaded, libraryOnly -> trackDao.getAllArtists(includeNotDownloaded, libraryOnly) }
 
+    /** Albums for the Library Albums tab, in the same scope as [getAllArtists]. */
     override fun getAllAlbums(): Flow<List<AlbumSummary>> =
-        trackDao.getAllAlbums(includeStreamable = false)
+        libraryScope { includeNotDownloaded, libraryOnly -> trackDao.getAllAlbums(includeNotDownloaded, libraryOnly) }
 
     override fun getRecentlyAdded(limit: Int): Flow<List<Track>> =
         trackDao.getRecentlyAdded(limit).map { entities -> entities.map { it.toDomain() } }
@@ -489,6 +525,11 @@ class MusicRepositoryImpl @Inject constructor(
         trackDao.insert(track.toEntity())
 
     override suspend fun ensureTrackPersisted(track: Track): Long {
+        // An All Songs file is not a library song. Saving one would give it a stream-only row
+        // (or, by its words, adopt a library song of the same name), so a like, a download, a
+        // block or a playlist save would land on something else. Refused: callers already turn a
+        // throw into their "Couldn't ..." message.
+        check(!track.isScannedSong) { "An All Songs file is never saved to the library" }
         // Quick exit: real DB row already. Not for a synthetic stream id
         // (`videoId.hashCode().toLong()`, e.g. RadioStationGenerator): it is
         // positive half the time, and one equal to an unrelated row's id would
@@ -610,6 +651,8 @@ class MusicRepositoryImpl @Inject constructor(
     }
 
     override suspend fun deleteTrack(track: Track): Boolean {
+        // An All Songs file is the user's own file outside Stash: never deleted from here.
+        if (track.isScannedSong) return false
         // Best-effort file deletion -- the file may already be gone.
         track.filePath?.let { deleteTrackAudio(track.id, it) }
         // Album art lives in the app cache (internal only) but route it

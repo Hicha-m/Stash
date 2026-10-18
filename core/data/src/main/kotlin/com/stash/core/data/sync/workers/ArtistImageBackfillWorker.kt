@@ -15,6 +15,8 @@ import com.stash.core.common.ArtUrlUpgrader
 import com.stash.core.common.primaryArtist
 import com.stash.core.data.db.dao.ArtistImageDao
 import com.stash.core.data.db.entity.ArtistImageEntity
+import com.stash.core.data.prefs.LibraryScopePreference
+import com.stash.core.data.prefs.StreamingPreference
 import com.stash.data.ytmusic.YTMusicApiClient
 import com.stash.data.ytmusic.model.ArtistPhotoResolution
 import dagger.assisted.Assisted
@@ -61,6 +63,8 @@ class ArtistImageBackfillWorker @AssistedInject constructor(
     @Assisted params: WorkerParameters,
     private val artistImageDao: ArtistImageDao,
     private val ytMusicApiClient: YTMusicApiClient,
+    private val streamingPreference: StreamingPreference,
+    private val libraryScopePreference: LibraryScopePreference,
 ) : CoroutineWorker(appContext, params) {
 
     companion object {
@@ -120,8 +124,16 @@ class ArtistImageBackfillWorker @AssistedInject constructor(
 
         // Distinct raw track credits → primary acts, matching exactly what the
         // Artists tab groups by — a photo keyed on the displayed name is a
-        // clean 1:1 lookup for the UI.
-        val missing = artistImageDao.distinctArtistNames()
+        // clean 1:1 lookup for the UI. The tab follows the Download switch
+        // (Stream only lists every song's artist, Download the downloaded
+        // ones), so the candidate set does too; batch and pacing are unchanged.
+        // Its "In your library" filter applies in Stream only, as in
+        // MusicRepositoryImpl.libraryScope.
+        val streamOnly = streamingPreference.current()
+        val missing = artistImageDao.distinctArtistNames(
+            includeNotDownloaded = streamOnly,
+            libraryOnly = streamOnly && libraryScopePreference.current(),
+        )
             .asSequence()
             .map { it.primaryArtist() }
             .filter { it.isNotBlank() && it.lowercase() !in observed }

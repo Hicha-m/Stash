@@ -113,6 +113,7 @@ class MusicRepositoryRunMigrationsTest {
         stashMixRecipeDao = mockk(relaxed = true),
         downloadNetworkPreference = mockk(relaxed = true),
         streamingPreference = mockk(relaxed = true),
+        libraryScopePreference = mockk(relaxed = true),
         localFileOps = localFileOps,
         syncPreferencesManager = syncPrefs,
         singleTrackDownloadEnqueuer = mockk(relaxed = true),

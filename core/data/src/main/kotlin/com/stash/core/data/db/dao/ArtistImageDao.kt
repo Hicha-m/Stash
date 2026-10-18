@@ -39,15 +39,25 @@ interface ArtistImageDao {
 
     /**
      * Every distinct track artist credit the Library Artists tab can show —
-     * the same scope as `TrackDao.getAllArtists(includeStreamable = false)`:
-     * downloaded tracks only. Kept identical on purpose: every name here costs
-     * one InnerTube search, so the set must be exactly the cards the tab
-     * renders, no more. (Stream-only liked songs and playlist members are not
-     * on the Artists tab today; if the Library is widened to them, widen both
-     * queries together.)
+     * the same scope as `TrackDao.getAllArtists(includeNotDownloaded, libraryOnly)`, whose
+     * credits the tab turns into cards by primary act. Kept identical on
+     * purpose: every name here costs one InnerTube search, so the set must be
+     * exactly the cards the tab renders, no more. Change the two together.
+     *
+     * [includeNotDownloaded] is the Download switch: false (Download) =
+     * downloaded tracks only, true (Stream only) = every track, as the tab
+     * shows in that mode. [libraryOnly] is the tab's "In your library" filter ([IN_LIBRARY],
+     * false in Download), so a narrowed tab doesn't spend searches on artists it hides. The worker
+     * passes the current settings.
      */
-    @Query("SELECT DISTINCT artist FROM tracks WHERE artist != '' AND is_downloaded = 1")
-    suspend fun distinctArtistNames(): List<String>
+    @Query(
+        """
+        SELECT DISTINCT artist FROM tracks t
+        WHERE artist != '' AND (is_downloaded = 1 OR :includeNotDownloaded)
+          AND (:libraryOnly = 0 OR (""" + IN_LIBRARY + """))
+        """,
+    )
+    suspend fun distinctArtistNames(includeNotDownloaded: Boolean, libraryOnly: Boolean): List<String>
 
     /**
      * Insert or replace photo rows in ONE transaction ([ArtistImageEntity.artistName]

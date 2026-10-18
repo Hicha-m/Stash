@@ -41,10 +41,16 @@ data class LibraryUiState(
 
     /** Stream-only mode: Songs shows online rows too, and the Downloaded/Online filter is offered. */
     val streamingMode: Boolean = false,
+
+    /**
+     * Stream only's "In your library" choice for Artists and Albums: they, their counts and the
+     * pages they open list only the songs Songs lists. Always false in Download, which ignores it.
+     */
+    val libraryOnly: Boolean = false,
 )
 
 /** Tabs available in the library browser. LIKED sits between Songs and Playlists. */
-enum class LibraryTab { PLAYLISTS, TRACKS, LIKED, ARTISTS, ALBUMS }
+enum class LibraryTab { PLAYLISTS, TRACKS, LIKED, ARTISTS, ALBUMS, DEVICE }
 
 /** Source sift for the Liked subcategory: all likes, or one origin. */
 enum class LikedFilter { ALL, STASH, SPOTIFY, YOUTUBE }
@@ -66,9 +72,12 @@ enum class SourceFilter { ALL, YOUTUBE, SPOTIFY, FLAC, NON_FLAC, DOWNLOADED, ONL
 
 /**
  * @property name           Display name of the artist.
- * @property trackCount     Number of tracks by this artist in the library.
- * @property totalDurationMs Combined duration of all tracks in milliseconds.
+ * @property trackCount     Songs the artist's page lists (see [buildArtistCards]): every song
+ *                          crediting them in Stream only, the downloaded ones in Download.
+ * @property totalDurationMs Combined duration of those songs in milliseconds.
  * @property artUrl         Remote artwork URL (album art proxy from their top track).
+ * @property downloadedCount What "Delete All by Artist" removes and its dialog names: the
+ *                          downloaded songs whose credit leads with this artist. 0 hides it.
  */
 data class ArtistInfo(
     val name: String,
@@ -76,6 +85,7 @@ data class ArtistInfo(
     val totalDurationMs: Long,
     val artUrl: String? = null,
     val photoUrl: String? = null,
+    val downloadedCount: Int = 0,
 )
 
 /**
