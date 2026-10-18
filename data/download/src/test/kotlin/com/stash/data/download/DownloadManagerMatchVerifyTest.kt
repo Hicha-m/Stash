@@ -152,6 +152,7 @@ class DownloadManagerMatchVerifyTest {
         losslessHealthGate = mockk<com.stash.data.download.lossless.LosslessSourceHealthGate>(relaxed = true),
         // Every fetched file counts as audio here; DownloadManagerJunkBodyTest checks the gate.
         localFileOps = mockk<com.stash.core.data.files.LocalFileOps> { every { acceptDownloadOrDelete(any()) } returns true },
+        losslessQuota = com.stash.data.download.lossless.quota.LosslessQuota.inMemory(),
     )
 
     /** Spotify's "Patient Zero". */

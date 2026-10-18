@@ -42,6 +42,7 @@ import com.stash.core.ui.components.LocalListenTogetherRole
 import com.stash.core.ui.theme.LocalUiScaleMax
 import com.stash.core.ui.theme.StashTheme
 import com.stash.data.download.files.LocalImportCoordinator
+import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.squid.CaptchaExpiredNotifier
 import dagger.hilt.android.AndroidEntryPoint
 import com.stash.core.data.social.LikeCoordinator
@@ -117,6 +118,10 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var likeCoordinator: LikeCoordinator
+
+    /** The daily lossless allowance: its once-a-day heads-ups (50 left, limit reached) snackbar in [StashScaffold]. */
+    @Inject
+    lateinit var losslessQuota: LosslessQuota
 
     /**
      * What every song Share sheet's "Stash link" uses to make a short link (via [LocalCreateTrackLink]). Null on any
@@ -271,6 +276,7 @@ class MainActivity : ComponentActivity() {
                         pendingDeepLink = pendingDeepLink.value,
                         onDeepLinkConsumed = { pendingDeepLink.value = null },
                         startTab = startTab,
+                        losslessNotices = losslessQuota.noticeEvents,
                     )
                 }
             }

@@ -21,6 +21,10 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.layout.WindowInsetsSides
@@ -39,17 +43,25 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import com.stash.core.data.prefs.StartTab
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.stash.app.RequestNotificationPermissionOnce
 import com.stash.core.ui.theme.StashTheme
+import com.stash.data.download.lossless.quota.LosslessQuotaNotice
+import com.stash.data.download.lossless.quota.LosslessQuotaText
 import com.stash.data.download.lossless.squid.CaptchaExpiredNotifier
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import com.stash.feature.nowplaying.MiniPlayer
 import com.stash.feature.nowplaying.PlayerQueueSheet
 import com.stash.app.ambient.AlbumColorsViewModel
@@ -70,14 +82,16 @@ import dev.chrisbanes.haze.rememberHazeState
  * floating just above it. Every screen draws edge to edge under that bottom chrome so
  * the glass can blur it (Haze: the nav host is the `hazeSource`, the mini player and tab
  * bar the effects); screens pad their scrolling content by [LocalBottomChromeInset].
- * Also publishes the app-wide album colour ([LocalAlbumChrome]) and hosts the queue
- * sheet the mini player opens.
+ * Also publishes the app-wide album colour ([LocalAlbumChrome]), hosts the queue
+ * sheet the mini player opens, and shows the daily lossless allowance's heads-ups
+ * ([losslessNotices]) as a snackbar above the bottom chrome on any screen.
  */
 @Composable
 fun StashScaffold(
     pendingDeepLink: String? = null,
     onDeepLinkConsumed: () -> Unit = {},
     startTab: StartTab = StartTab.HOME,
+    losslessNotices: Flow<LosslessQuotaNotice> = emptyFlow(),
 ) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
@@ -111,6 +125,13 @@ fun StashScaffold(
 
     // Android 13+ runtime permission for notifications. One-shot per install.
     RequestNotificationPermissionOnce()
+
+    // The lossless allowance's once-a-day heads-ups (50 left, limit reached), with the
+    // supporter nudge; "Unlock" opens Audio & Quality, where the Ko-fi claim is. Collected
+    // while the app is visible: one raised in the background waits in its buffer.
+    val snackbarHostState = remember { SnackbarHostState() }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
 
     // Canonical bottom-nav tab switch (save/restore semantics + reselect-pop).
     // Local fun rather than inline in StashBottomBar's onNavigate so screens
@@ -201,10 +222,29 @@ fun StashScaffold(
         }
     }
 
+    LaunchedEffect(lifecycleOwner, losslessNotices) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            losslessNotices.collect { n ->
+                val result = snackbarHostState.showSnackbar(
+                    message = LosslessQuotaText.notice(n, LosslessQuotaText.resetTime(context, n.resetsAtMs)),
+                    actionLabel = LosslessQuotaText.NOTICE_ACTION,
+                    withDismissAction = true,
+                    duration = SnackbarDuration.Long,
+                )
+                if (result == SnackbarResult.ActionPerformed) {
+                    // Audio & Quality reads its view model from Settings' entry: Settings first.
+                    navigateToTab(TopLevelDestination.SETTINGS)
+                    navController.navigate(SettingsAudioQualityRoute) { launchSingleTop = true }
+                }
+            }
+        }
+    }
+
     ProvideAlbumChrome(albumColors) {
     CompositionLocalProvider(LocalChromeHazeState provides hazeState) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         // Use Scaffold's default safe-drawing insets so screens automatically
         // avoid the status bar (top) and gesture / 3-button nav (bottom).
         // The previous `WindowInsets(0.dp)` override was leaking content under

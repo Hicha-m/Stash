@@ -10,6 +10,7 @@ import com.stash.core.data.db.dao.TrackDao
 import com.stash.core.data.prefs.StreamingPreference
 import com.stash.core.data.sync.SingleTrackDownloadEnqueuer
 import com.stash.core.model.DownloadStatus
+import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessDownloadPurpose
 import kotlinx.coroutines.withContext
 import dagger.assisted.Assisted
@@ -35,6 +36,12 @@ import dagger.assisted.AssistedInject
  * too — and asks WorkManager to retry later (its backoff grows each time), so
  * a waiting library drains as the day's pool allows.
  *
+ * The sweep booked for the daily allowance's reset ([KEY_AT_RESET]) resolves nothing: a lookup
+ * here and the download's own would count two lossless answers per song against the new day.
+ * It re-queues every waiting row as it is and the download makes the one lookup (a row with no
+ * lossless anywhere simply waits again). Run before the reset on the relays' clock (still
+ * [LosslessQuota.isSpent]), it touches nothing and retries later.
+ *
  * ponytail: a row whose track is genuinely unavailable is re-resolved on every
  * sweep (a Qobuz "locked" answer costs one relay quota each time); add a
  * per-row attempt count if the waiting set grows large.
@@ -59,9 +66,16 @@ class LosslessRetryWorker @AssistedInject constructor(
     private val registry: LosslessSourceRegistry,
     private val singleTrackDownloadEnqueuer: SingleTrackDownloadEnqueuer,
     private val streamingPreference: StreamingPreference,
+    private val quota: LosslessQuota,
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
+        val atReset = inputData.getBoolean(KEY_AT_RESET, false)
+        if (atReset) {
+            quota.awaitLoaded()
+            // Early on the relays' clock: every download would be skipped (or capped) again.
+            if (quota.isSpent()) return Result.retry()
+        }
         // Every row resolved here downloads at once, so a sync's row that shouldn't
         // download now is left out before it costs a lookup, still waiting: in Stream-only
         // mode one nobody asked for (#474), in Download mode one whose playlist was
@@ -86,6 +100,11 @@ class LosslessRetryWorker @AssistedInject constructor(
             // the recording they rejected, and asked the shared relay again
             // on every trigger, only for the download to wait again.
             if (track.matchPickedAt != null) continue
+            if (atReset) {
+                requeue(entry.id)
+                resolvedCount++
+                continue
+            }
             // runCatching mirrors DownloadManager's defensive pattern:
             // a single bad source / network blip mustn't halt the whole
             // sweep. Sources are also expected to swallow their own
@@ -103,11 +122,7 @@ class LosslessRetryWorker @AssistedInject constructor(
                 ) }
             }.getOrNull()
             if (match != null) {
-                downloadQueueDao.updateStatus(
-                    id = entry.id,
-                    status = DownloadStatus.PENDING,
-                )
-                singleTrackDownloadEnqueuer.enqueue(entry.id)
+                requeue(entry.id)
                 resolvedCount++
             } else if (purpose.pacedRetryAfterSec != null) {
                 // The pool is ahead of today's pace: every later row would be paced too.
@@ -122,8 +137,20 @@ class LosslessRetryWorker @AssistedInject constructor(
         )
     }
 
+    /** Back to PENDING, and its download starts now. */
+    private suspend fun requeue(queueId: Long) {
+        downloadQueueDao.updateStatus(id = queueId, status = DownloadStatus.PENDING)
+        singleTrackDownloadEnqueuer.enqueue(queueId)
+    }
+
     companion object {
         const val UNIQUE_WORK_NAME = "lossless-retry"
+
+        /**
+         * Input-data key: true for the sweep booked for the daily allowance's reset, which
+         * re-queues without resolving (see the class doc).
+         */
+        const val KEY_AT_RESET = "lossless_retry_at_reset"
 
         /** Output-data key: how many WAITING_FOR_LOSSLESS rows were flipped to PENDING this sweep. */
         const val KEY_RESOLVED = "lossless_retry_resolved"

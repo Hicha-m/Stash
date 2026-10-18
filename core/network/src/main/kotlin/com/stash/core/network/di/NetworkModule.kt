@@ -33,6 +33,19 @@ object NetworkModule {
 
     private const val TIMEOUT_SECONDS = 30L
 
+    /**
+     * Headers never printed, should the log level ever show headers: credentials, edit and
+     * Community keys, the relay request signature and the Ko-fi supporter token.
+     */
+    internal val REDACTED_HEADERS = listOf(
+        "Authorization",
+        "Cookie",
+        "X-Stash-Edit-Key",
+        "X-Stash-Community-Key",
+        "X-Stash-Auth",
+        "X-Stash-Entitlement",
+    )
+
     @Provides
     @Singleton
     fun provideOkHttpClient(
@@ -52,10 +65,7 @@ object NetworkModule {
             } else {
                 HttpLoggingInterceptor.Level.NONE
             }
-            redactHeader("Authorization")
-            redactHeader("Cookie")
-            redactHeader("X-Stash-Edit-Key")
-            redactHeader("X-Stash-Community-Key")
+            REDACTED_HEADERS.forEach(::redactHeader)
         }
 
         return OkHttpClient.Builder()
