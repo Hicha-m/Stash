@@ -42,6 +42,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
+import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessDownloadPurpose
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -139,6 +140,8 @@ class DownloadManager @Inject constructor(
     private val losslessHealthGate: LosslessSourceHealthGate,
     /** Checks each fetched temp file before the commit ([acceptBeforeCommit]). */
     private val localFileOps: LocalFileOps,
+    /** The daily lossless allowance: once spent, a FLAC-only download waits for its reset. */
+    private val losslessQuota: LosslessQuota,
 ) {
     /**
      * Test/build seam for the debug-build lossy-fallback carve-out below.
@@ -346,6 +349,13 @@ class DownloadManager @Inject constructor(
                 } else {
                     // Tidal AAC has its own switch ("Tidal AAC when no FLAC"), so it
                     // still runs with the YouTube fallback off; nothing else lossy does.
+                    // Not while the day's lossless allowance is spent: the song has not
+                    // shown it has no FLAC, only that FLAC must wait for the reset, and
+                    // with the fallback off nothing lossy is saved meanwhile.
+                    if (losslessQuota.isSpent()) {
+                        Log.i(TAG, "deferring '${track.artist} - ${track.title}': daily lossless allowance spent, fallback off")
+                        return TrackDownloadResult.Deferred
+                    }
                     if (losslessPrefs.enabledNow()) tryTidalAacDownload(track)?.let { return it }
                     Log.i(
                         TAG,
