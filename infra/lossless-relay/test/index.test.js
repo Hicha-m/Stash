@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { fakeD1, QUOTA_MIGRATIONS } from "./fake-d1.js";
-import worker, { handle, networkOf, network48Of, refusalNamesTrack } from "../src/index.js";
+import worker, { handle as handleWithCtx, networkOf, network48Of, refusalNamesTrack } from "../src/index.js";
 import { bumpQuotaStmt } from "../src/db.js";
 import { hooks } from "../src/quota.js";
 import { keypair, token, tidOf } from "./entitlement-keys.js";
@@ -15,6 +15,20 @@ const ACCOUNTS = [
     { label: "b", token: "tok-b", app_id: "111111111", app_secret: "s-b" },
 ];
 const GOOD = { url: "https://cdn.example/f.flac?etsp=" + (NOW + 3599), format_id: 7, bit_depth: 24, sampling_rate: 96 };
+
+/** A Worker ExecutionContext that keeps what waitUntil was handed; settle() awaits all of it. */
+function execCtx() {
+    const pending = [];
+    return { pending, waitUntil: (p) => { pending.push(p); }, passThroughOnException() {}, settle: () => Promise.all(pending) };
+}
+
+/** handle() as the runtime calls it (with a ctx), then every waitUntil settled: D1 rows are final when it returns. */
+async function handle(request, e, fetchImpl, nowSec) {
+    const ctx = execCtx();
+    const r = await handleWithCtx(request, e, fetchImpl, nowSec, ctx);
+    await ctx.settle();
+    return r;
+}
 
 function env(over = {}) {
     return {
@@ -654,6 +668,59 @@ test("a lossless MISS and every cache HIT count one unit for the install, with t
     assert.equal(other.headers.get("X-Stash-Lossless"), "1/500", "per install");
     assert.equal(usage(e), 2);
     assert.equal(usage(e, "i:install-0002"), 1);
+});
+
+/** QUOTA_DB whose writes (the counter's INSERT … RETURNING) wait until open(): reads pass straight through. */
+function gatedWrites(db) {
+    let open;
+    const gate = new Promise((r) => { open = r; });
+    const prepare = (sql) => {
+        const s = db.prepare(sql);
+        if (!/^\s*INSERT/i.test(sql)) return s;
+        const g = { bind: (...a) => { s.bind(...a); return g; }, first: async () => { await gate; return s.first(); }, all: async () => { await gate; return s.all(); } };
+        return g;
+    };
+    return { db: { ...db, prepare }, open };
+}
+
+test("the counter's bump never holds up the answer: it rides on ctx.waitUntil and the header reports used + 1", async () => {
+    const e = quotaEnv(); const q = qobuz([200, GOOD]);
+    await handle(mintReq(42, 27), e, q, NOW); // one unit already spent
+    for (const cache of ["HIT", "MISS"]) {
+        const ctx = execCtx();
+        const gated = gatedWrites(e.QUOTA_DB);
+        const ge = { ...e, QUOTA_DB: gated.db };
+        const track = cache === "HIT" ? 42 : 43;
+        const fq = qobuz([200, { ...GOOD, url: "https://cdn.example/g.flac?etsp=" + (NOW + 3599) }]);
+        const r = await handleWithCtx(mintReq(track, 27), ge, fq, NOW + 1, ctx); // resolves with the write still blocked
+        assert.equal(r.status, 200);
+        assert.equal(r.headers.get("X-Stash-Cache"), cache);
+        assert.equal(r.headers.get("X-Stash-Lossless"), "2/500", cache); // the read said 1; this answer makes 2
+        assert.equal(ctx.pending.length, 1, cache);
+        assert.equal(usage(e), 1, `${cache}: not written yet`);
+        gated.open();
+        await ctx.settle();
+        assert.equal(usage(e), 2, `${cache}: written after the answer`);
+        e.QUOTA_DB.raw.prepare("UPDATE usage SET n = 1").run(); // back to one for the next round
+    }
+    // A direct caller with no ctx still gets the unit written before handle() returns.
+    const direct = await handleWithCtx(mintReq(42, 27), e, qobuz(), NOW + 2);
+    assert.equal(direct.headers.get("X-Stash-Lossless"), "2/500");
+    assert.equal(usage(e), 2);
+});
+
+test("a supporter's deferred bump writes both rows and the header reads <used + 1>/unlimited", async () => {
+    const e = quotaEnv({ FREE_LOSSLESS_DAILY: "1" });
+    const original = hooks.entitlementOf;
+    hooks.entitlementOf = async () => ({ tid: "0123456789abcdef0123456789abcdef" });
+    try {
+        const ctx = execCtx();
+        const r = await handleWithCtx(mintReq(42, 27), e, qobuz([200, GOOD]), NOW, ctx);
+        assert.equal(r.headers.get("X-Stash-Lossless"), "1/unlimited");
+        await ctx.settle();
+        assert.equal(usage(e), 1);
+        assert.equal(usage(e, "t:0123456789abcdef0123456789abcdef"), 1);
+    } finally { hooks.entitlementOf = original; }
 });
 
 test("not counted: Data Saver's format 5, a Qobuz 404, a busy 503, a bad signature", async () => {

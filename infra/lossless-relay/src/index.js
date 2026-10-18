@@ -17,7 +17,8 @@
  *
  * State: D1 (accounts' rotation state, the shared mint cache, daily quotas), plus QUOTA_DB: the daily
  * lossless counter shared with the Tidal relay (src/quota.js). A lossless mint answered (a cache HIT
- * included) costs the install one unit; at FREE_LOSSLESS_DAILY it is answered 429 daily_lossless_cap.
+ * included) costs the install one unit, written after the answer (ctx.waitUntil); at FREE_LOSSLESS_DAILY it is
+ * answered 429 daily_lossless_cap, checked before the cache and the pool are touched.
  * A valid supporter token (optional header X-Stash-Entitlement, on mints and /v1/quota) lifts that limit and
  * INSTALL_DAILY_CAP, up to SUPPORTER_DAILY_CAP a day per token; the network, /48 and global caps still apply.
  * Secrets: RELAY_KEY, RELAY_KEY_PREV (optional), QOBUZ_ACCOUNTS, QOBUZ_ACCOUNTS_EXTRA and
@@ -58,7 +59,7 @@ export function refusalNamesTrack(reason) {
 const ensured = new WeakMap();
 
 export default {
-    fetch: (request, env) => handle(request, env, globalThis.fetch, Math.floor(Date.now() / 1000)),
+    fetch: (request, env, ctx) => handle(request, env, globalThis.fetch, Math.floor(Date.now() / 1000), ctx),
     scheduled: async (event, env) => {
         const nowSec = Math.floor(Date.now() / 1000);
         await prune(env.DB, nowSec);
@@ -71,22 +72,24 @@ export default {
  * Any throw (a D1 error mid-request) is answered 503 busy: the base cools 60 s and the device tries
  * the next one. Uncaught, it became Cloudflare's bare 500 page, which the client reads as "broken"
  * and cools for 5 minutes.
+ * `ctx`: the Worker's ExecutionContext. Its waitUntil carries the daily lossless counter's bump past the
+ * answer (spendAfter); tests pass one and await what it collected.
  */
-export async function handle(request, env, fetchImpl, nowSec) {
+export async function handle(request, env, fetchImpl, nowSec, ctx) {
     const url = new URL(request.url);
     if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
     if (url.pathname === "/v1/status") return json({ ok: true }, 200);
     if (url.pathname !== "/v1/qobuz/file" && url.pathname !== "/v1/quota") return json({ error: "not_found" }, 404);
     try {
         if (url.pathname === "/v1/quota") return await quota(request, env, nowSec);
-        return await mint(request, url, env, fetchImpl, nowSec);
+        return await mint(request, url, env, fetchImpl, nowSec, ctx);
     } catch (e) {
         console.error(e); // visible in `wrangler tail`
         return json({ error: "busy" }, 503, { "Retry-After": "60" });
     }
 }
 
-async function mint(request, url, env, fetchImpl, nowSec) {
+async function mint(request, url, env, fetchImpl, nowSec, ctx) {
     const h = (name) => request.headers.get(name) || "";
     if (h("X-Stash-Version") !== "1") return json({ error: "bad_version" }, 400);
     const trackRaw = url.searchParams.get("track_id") || "";
@@ -115,8 +118,9 @@ async function mint(request, url, env, fetchImpl, nowSec) {
         if (!success) return json({ error: "rate_limited" }, 429, { "Retry-After": "60" });
     }
 
-    // The daily lossless counter, shared with the Tidal relay. Checked before any answer: a cache HIT
-    // is still a lossless stream for the user, so it counts too. Off (null) without QUOTA_DB.
+    // The daily lossless counter, shared with the Tidal relay. Checked before any answer, before the
+    // cache and the pool are touched: a cache HIT is still a lossless stream for the user, so it counts
+    // too. Off (null) without QUOTA_DB. Only the check waits; the bump runs after the answer (spendAfter).
     const standing = await readStanding(request, env, "i:" + install, nowSec);
     if (standing?.over) {
         const cap = capAnswer(standing, nowSec);
@@ -124,7 +128,7 @@ async function mint(request, url, env, fetchImpl, nowSec) {
     }
 
     const cached = await getCached(env.DB, trackId, formatId, nowSec);
-    if (cached) return ok(cached.url, cached.got_format_id, cached.bit_depth, cached.sample_rate, "HIT", losslessHeaders(await spendLossless(standing)));
+    if (cached) return ok(cached.url, cached.got_format_id, cached.bit_depth, cached.sample_rate, "HIT", await spendAfter(standing, ctx));
 
     const day = dayKey(nowSec);
     const caps = vars(env);
@@ -200,7 +204,7 @@ async function mint(request, url, env, fetchImpl, nowSec) {
             if (r.kind === "ok" && r.etsp) writes.push(putCachedStmt(env.DB, trackId, formatId, r)); // no etsp → serve once, never cache
             await env.DB.batch(writes);
             if (r.kind !== "ok") return json({ error: "not_available" }, 404); // a 404 never counts as lossless
-            return ok(r.url, r.formatId, r.bitDepth, r.sampleRateHz, "MISS", losslessHeaders(await spendLossless(standing)));
+            return ok(r.url, r.formatId, r.bitDepth, r.sampleRateHz, "MISS", await spendAfter(standing, ctx));
         }
         if (r.kind === "dead") await killAccount(env.DB, label, r.reason);
         // A transient reached Qobuz and cools an account, so it costs the caller's network one unit
@@ -244,6 +248,22 @@ async function quota(request, env, nowSec) {
     const standing = await readStanding(request, env, "i:" + install, nowSec);
     if (!standing) return json({ error: "quota_off" }, 404);
     return json(quotaBody(standing), 200, { ...losslessHeaders(standing), "Cache-Control": "no-store" });
+}
+
+/**
+ * The counter headers for a lossless answer about to be served, with its one unit spent AFTER the answer:
+ * the bump (a D1 write to stash-quota) rides on ctx.waitUntil instead of holding up the stream. The header
+ * reports `used + 1`, the count this answer makes; under concurrency it can trail the row by the answers in
+ * flight, as the read-then-bump cap check already can (quota.js). Without a ctx (a direct caller) the bump
+ * is awaited. {} with the counter off. spendLossless never rejects, so neither does the deferred promise.
+ */
+async function spendAfter(standing, ctx) {
+    if (!standing) return {};
+    const headers = losslessHeaders({ ...standing, used: standing.used + 1 });
+    const bump = spendLossless(standing);
+    if (typeof ctx?.waitUntil === "function") ctx.waitUntil(bump);
+    else await bump;
+    return headers;
 }
 
 /**

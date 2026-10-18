@@ -48,6 +48,8 @@ Code: `src/quota.js` (an identical copy lives in `tidal-worker/src/quota.js`).
 - **Headers** on every counted `200`, the `daily_lossless_cap` 429 and `/v1/quota`:
   `X-Stash-Lossless: <used>/<limit>` (`used` after this answer; `<used>/unlimited` for a supporter) and
   `X-Stash-Lossless-Reset: <epoch s>`. The relay sets no CORS headers, so there is no expose list to extend.
+  The unit is written after the answer (`ctx.waitUntil`), so the counter adds no D1 write in front of a stream;
+  the header is the count read before serving plus one.
 - **`GET /v1/quota`:** headers `X-Stash-Install`, `X-Stash-Ts`, `X-Stash-Auth` =
   `hex(HMAC-SHA256(RELAY_KEY, "<install>:quota:<ts>"))` (key as its UTF-8 string, ±300 s, like a mint). Answers
   `200 {"used":n,"limit":500,"resetsAt":T,"supporter":false}` (`limit: null` for a supporter) with the headers;
