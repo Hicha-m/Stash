@@ -1,7 +1,9 @@
 package com.stash.data.download.lossless.qobuz
 
 import com.google.common.truth.Truth.assertThat
+import com.stash.core.model.MusicSource
 import com.stash.data.download.lossless.TrackQuery
+import com.stash.data.download.lossless.forLibrarySource
 import org.junit.Test
 
 /**
@@ -335,5 +337,26 @@ class QobuzCandidateMatcherTest {
     @Test fun `version words match whole words only`() {
         assertThat(QobuzCandidateMatcher.versionWords("Alive (Stay Alive) - Olive Remixed")).isEmpty()
         assertThat(score("Stay Alive", "Stay Alive (Alive)", candVersion = "Alive")).isEqualTo(1.0f)
+    }
+
+    @Test fun `re-recordings, outtakes, performances and concerts are other takes`() {
+        assertThat(score("Song", "Song", candVersion = "2011 Re-recording")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(score("Song", "Song (Outtake)")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(score("Song", "Song", candVersion = "Live Performance")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(score("Song", "Song (In Concert)")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        // "Live in Concert" and "Live" name the same take.
+        assertThat(score("Song (Live in Concert)", "Song", candVersion = "Live")).isEqualTo(1.0f)
+    }
+
+    @Test fun `a film performance on a YouTube row does not take the 217 s studio cut`() {
+        // Uploaded by Vaughan Walton: the "Control" film's performance, not Joy Division's single.
+        val q = TrackQuery(
+            artist = "Vaughan Walton",
+            title = "Joy Division - Transmission (Performance From \"Control\")",
+            durationMs = 217_000,
+        ).forLibrarySource(MusicSource.YOUTUBE)
+        assertThat(q.artist).isEqualTo("Joy Division")
+        val studio = QobuzCandidateMatcher.confidence(q, "Transmission", "Joy Division", null, 217, true, candAlbum = "Transmission")
+        assertThat(studio).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
     }
 }

@@ -89,4 +89,18 @@ class VersionWordsTest {
         assertEquals(" – Remastered 2011", VersionWords.DASH_SUFFIX.find("Song – Remastered 2011")?.value)
         assertEquals(null, VersionWords.DASH_SUFFIX.find("Jay-Z Re-Recorded"))
     }
+
+    @Test fun `the matcher reads more takes as versions than the library rule does`() {
+        // The library's same-song rule ([of]) is unchanged by these words...
+        for (text in listOf("(2011 Re-recording)", "(Outtake)", "(Performance From \"Control\")", "(In Concert)", "- A COLORS SHOW")) {
+            assertEquals(text, emptySet<String>(), words(text))
+        }
+        // ...while the lossless matcher reads them as another take.
+        assertEquals(setOf("re-recorded"), VersionWords.forCatalogMatch("(2011 Re-recording)"))
+        assertEquals(setOf("outtake"), VersionWords.forCatalogMatch("(Studio Outtakes)"))
+        assertEquals(setOf("live"), VersionWords.forCatalogMatch("(Performance From \"Control\")"))
+        assertEquals(setOf("live"), VersionWords.forCatalogMatch("(Live in Concert)"))
+        assertEquals(setOf("live"), VersionWords.forCatalogMatch("Until Morning - A COLORS SHOW"))
+        assertEquals(setOf("mix", "live"), VersionWords.forCatalogMatch("(Live Remix)"))
+    }
 }

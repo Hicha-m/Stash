@@ -8,7 +8,8 @@ import java.text.Normalizer
  * "Artist - Song (Official Video)", "KEXP | Phantogram - When I'm Small (Live on KEXP)", a channel
  * as the artist ("ArtistVEVO", "neilyoungchannel"), so the lossless lookups searched and scored
  * against noise. Of 6,843 labelled library rows, the raw fields named the right artist and title
- * 78.9% of the time; [parse] gets 91%+ (pinned by YouTubeSongTitleTest).
+ * 78.9% of the time; [parse] gets 91.7%, and keeps 88% of the labelled performance versions
+ * (pinned by YouTubeSongTitleTest).
  *
  * Text only, no network: a row whose identity needs outside knowledge (a label channel, a
  * misspelled artist) is left as close to its fields as the rules allow. Not the library's identity
@@ -19,7 +20,8 @@ object YouTubeSongTitle {
     /**
      * @property artist the performing artist, as the row names it.
      * @property title the song title without the artist, upload noise or version.
-     * @property version the version the row names ("Live on KEXP", "2018 Remix"), or "".
+     * @property version every version the row names, comma-joined ("Live on KEXP", "2015 Remaster,
+     *   Live"), or "".
      */
     data class Parsed(val artist: String, val title: String, val version: String) {
         /** The title as a lookup query carries it: the version back in brackets, where the matcher reads it. */
@@ -42,7 +44,8 @@ object YouTubeSongTitle {
     /** Words that make a bracket, bar or dash part a version of the song rather than more title. */
     private val VERSION = Regex(
         "\\b(live|remix|mix|acoustic|unplugged|session|sessions|demo|instrumental|cover|edit|version|remaster(ed)?|mono|" +
-            "stereo|sped|slowed|reverb|piano|orchestral|a ?cappella|karaoke|extended|radio|club|dub|rework|bootleg|vip|bonus)\\b",
+            "stereo|sped|slowed|reverb|piano|orchestral|a ?cappella|karaoke|extended|radio|club|dub|rework|bootleg|vip|bonus|" +
+            "re-?record(ed|ing)?|outtakes?|performance|concert|colors show)\\b",
         RegexOption.IGNORE_CASE,
     )
     private val CREDIT = Regex("^(feat|ft|with|prod|arr)\\b", RegexOption.IGNORE_CASE)
@@ -65,6 +68,9 @@ object YouTubeSongTitle {
     private val COMPOSER_PREFIX = Regex("^([^:]{2,40}):\\s+(.+)$")
     private val FROM_NOTE = Regex("^from\\b", RegexOption.IGNORE_CASE)
 
+    /** The last " - part" of a string, its text in group 1. */
+    private val DASH_TAIL = Regex("\\s+[-\u2013\u2014]\\s*([^-\u2013\u2014]*)$")
+
     /**
      * @param title the row's title as YouTube had it.
      * @param artist the row's artist (often the uploading channel).
@@ -72,15 +78,22 @@ object YouTubeSongTitle {
     fun parse(title: String, artist: String): Parsed {
         var t = title.trim()
         var a = cleanArtist(artist)
-        var version = ""
+        // Every version the row names is kept: "Purple Rain (2015 Remaster) (Live)" is the live take.
+        val versions = mutableListOf<String>()
+        fun addVersion(v: String) {
+            val clean = LEADING_DASH.replace(v, "").trim()
+            if (clean.isNotEmpty() && versions.none { it.equals(clean, ignoreCase = true) }) versions += clean
+        }
         var hadNoise = false
 
         // 1. Bracket groups: noise goes, a version is kept apart, anything else is part of the title.
+        // A version word beats a noise phrase: "(Official Live Video)" is still the live take.
         t = BRACKET.replace(t) { m ->
             val inner = m.groupValues[1].trim()
             when {
-                NOISE.matches(inner) || NOISE_PHRASE.containsMatchIn(inner) -> { hadNoise = true; "" }
-                VERSION.containsMatchIn(inner) && !CREDIT.containsMatchIn(inner) -> { if (version.isEmpty()) version = inner; "" }
+                NOISE.matches(inner) -> { hadNoise = true; "" }
+                VERSION.containsMatchIn(inner) && !CREDIT.containsMatchIn(inner) -> { addVersion(inner); "" }
+                NOISE_PHRASE.containsMatchIn(inner) -> { hadNoise = true; "" }
                 else -> m.value
             }
         }
@@ -95,23 +108,29 @@ object YouTubeSongTitle {
             } else {
                 t = bar[0]
                 val rest = bar.drop(1).joinToString(" ")
-                if (VERSION.containsMatchIn(rest) && version.isEmpty()) version = rest.trim()
+                if (VERSION.containsMatchIn(rest)) addVersion(rest)
                 hadNoise = true
             }
         }
 
         // 3. Artist "Title", or "Title" - Artist.
+        // Version words after the quote stay: 'Cage The Elephant performing "Cold Cold Cold" Live on KCRW'.
         QUOTED.find(t)?.let { q ->
             val (before, quoted, after) = q.destructured
+            val beforeDash = DASH_TAIL.find(before)
             if (before.isBlank() && LEADING_DASH.containsMatchIn(after) && after.trim().length > 1) {
                 a = LEADING_DASH.replace(after, "").trim()
                 t = quoted.trim()
+            } else if (beforeDash != null && FROM_NOTE.containsMatchIn(beforeDash.groupValues[1])) {
+                // 'Lose Yourself - From "8 Mile" Soundtrack': a soundtrack note, not an artist and a title.
+                t = before.substring(0, beforeDash.range.first)
             } else if (before.isNotBlank() && (jaccard(FEAT_TAIL.replace(before, ""), a) >= 0.5f || hadNoise ||
                     CHANNELISH.containsMatchIn(artist) || PERFORMING.containsMatchIn(before))
             ) {
                 val lead = PERFORMING.replace(FEAT_TAIL.replace(before, ""), "").trimEnd('.', ' ', '-').trim()
                 if (lead.isNotEmpty() && jaccard(lead, a) < 0.5f) a = lead
                 t = quoted.trim()
+                if (VERSION.containsMatchIn(after)) addVersion(after)
             }
         }
 
@@ -124,34 +143,42 @@ object YouTubeSongTitle {
             val credited = artist.contains(',') // "Orchestra, Conductor, Composer": a catalog-style credit
             val keepsDash = credited || left.contains(':')
             val right = segs[1]
+            val channel = CHANNELISH.containsMatchIn(artist)
             var rest = segs.drop(1)
             when {
                 leftIsArtist -> { if (left.length >= a.length) a = left; t = rest.first(); rest = rest.drop(1) }
                 jaccard(right, a) >= 0.5f -> { t = left; rest = rest.drop(1) } // "Title - Artist"
-                VERSION.containsMatchIn(right) && !CHANNELISH.containsMatchIn(artist) -> t = left
+                // A real artist's row keeps its artist when the right side is a version or a note,
+                // not a title: "Until Morning - A COLORS SHOW" (James Vickery), "Song - From X".
+                (VERSION.containsMatchIn(right) || FROM_NOTE.containsMatchIn(right)) && !channel -> t = left
+                // ...or when the left side is a version: "BBC Sessions - Love Or Confusion" (Jimi Hendrix).
+                !keepsDash && VERSION.containsMatchIn(left) && tokens(left).size >= 2 && !VERSION.containsMatchIn(right) && !channel -> {
+                    addVersion(left); t = right; rest = rest.drop(1)
+                }
                 keepsDash -> t = left
                 else -> { a = left; t = rest.first(); rest = rest.drop(1) }
             }
             for (r in rest) {
                 when {
                     FROM_NOTE.containsMatchIn(r) || NOISE.matches(r.trim()) -> Unit
-                    VERSION.containsMatchIn(r) -> if (version.isEmpty()) version = r.trim()
+                    VERSION.containsMatchIn(r) -> addVersion(r)
                     keepsDash -> t = "$t - $r"
                 }
             }
         }
 
         t = stripComposer(t, a)
-        return Parsed(artist = a.trim(), title = t.replace(WHITESPACE, " ").trim(), version = version)
+        return Parsed(artist = a.trim(), title = t.replace(WHITESPACE, " ").trim(), version = versions.joinToString(", "))
     }
 
     private val WHITESPACE = Regex("\\s+")
 
+    private val TOPIC_SUFFIX = Regex("\\s*-\\s*topic$", RegexOption.IGNORE_CASE)
+    private val VEVO_SUFFIX = Regex("vevo$", RegexOption.IGNORE_CASE)
+    private val OFFICIAL_SUFFIX = Regex("\\s+official$", RegexOption.IGNORE_CASE)
+
     private fun cleanArtist(a: String): String =
-        a.replace(Regex("\\s*-\\s*topic$", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("vevo$", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\s+official$", RegexOption.IGNORE_CASE), "")
-            .trim()
+        a.replace(TOPIC_SUFFIX, "").replace(VEVO_SUFFIX, "").replace(OFFICIAL_SUFFIX, "").trim()
 
     /** "Chopin: Nocturne…" when Chopin is already in the artist credit. */
     private fun stripComposer(t: String, a: String): String {
@@ -163,12 +190,19 @@ object YouTubeSongTitle {
 
     /** Comparison words: accents folded, brackets and "feat." tails dropped, punctuation out. */
     internal fun tokens(s: String): Set<String> =
-        Normalizer.normalize(s, Normalizer.Form.NFD).replace(Regex("\\p{Mn}+"), "").lowercase()
-            .replace(Regex("\\([^)]*\\)|\\[[^]]*]"), " ")
-            .replace(Regex("\\b(feat\\.?|ft\\.?|featuring)\\b.*"), " ")
-            .replace(Regex("['’`]"), "")
-            .replace(Regex("[^\\p{L}\\p{N}\\p{S}\\s]"), " ")
+        Normalizer.normalize(s, Normalizer.Form.NFD).replace(TOKEN_MARKS, "").lowercase()
+            .replace(TOKEN_BRACKETS, " ")
+            .replace(TOKEN_FEAT, " ")
+            .replace(TOKEN_APOSTROPHES, "")
+            .replace(TOKEN_PUNCT, " ")
             .split(WHITESPACE).filter { it.isNotEmpty() }.toSet()
+
+    // tokens() runs several times per row; its patterns are compiled once.
+    private val TOKEN_MARKS = Regex("\\p{Mn}+")
+    private val TOKEN_BRACKETS = Regex("\\([^)]*\\)|\\[[^]]*]")
+    private val TOKEN_FEAT = Regex("\\b(feat\\.?|ft\\.?|featuring)\\b.*")
+    private val TOKEN_APOSTROPHES = Regex("['’`]")
+    private val TOKEN_PUNCT = Regex("[^\\p{L}\\p{N}\\p{S}\\s]")
 
     internal fun jaccard(a: String, b: String): Float {
         val x = tokens(a)

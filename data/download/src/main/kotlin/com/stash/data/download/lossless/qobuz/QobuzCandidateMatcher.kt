@@ -233,9 +233,10 @@ object QobuzCandidateMatcher {
     /**
      * The version words [text] names. The list (whole words; a year, stereo, mono, single... mix
      * is the same song; "Edit" left out, radio edits are fine) is the library's too, so it lives in
-     * core:common: [VersionWords].
+     * core:common: [VersionWords]. The matcher also reads a few words the library rule doesn't
+     * (re-recording, outtake, performance, concert, COLORS show: [VersionWords.forCatalogMatch]).
      */
-    internal fun versionWords(text: String): Set<String> = VersionWords.of(text)
+    internal fun versionWords(text: String): Set<String> = VersionWords.forCatalogMatch(text)
 
     // ── Pure-function helpers ────────────────────────────────────────────
 

@@ -60,6 +60,32 @@ object VersionWords {
             .map { fold(it.value) }
             .toSet()
 
+    /**
+     * Words only the lossless matcher reads as versions, on top of [of]: "Re-recording", "Outtake",
+     * "Performance", "Concert", "A COLORS SHOW". They name another take of a song as surely as
+     * "Live" does, so a catalog lookup must not trade one for the studio cut (or the reverse). They
+     * stay out of [WORDS] because the library's same-song rule ([TrackCanonical]) reads that list,
+     * and the library's identity must not move with the matcher.
+     */
+    private val MATCH_ONLY_WORDS = Regex("\\b(re-?recording|outtakes?|performance|concert|colors show)\\b")
+
+    /**
+     * [of] plus [MATCH_ONLY_WORDS], folded the same way: a performance, a concert or a COLORS show
+     * is a live take ("live"), a re-recording is "re-recorded". For the lossless matcher only.
+     *
+     * @param text the parts of a title that may name a version, in any case.
+     */
+    fun forCatalogMatch(text: String): Set<String> {
+        val extra = MATCH_ONLY_WORDS.findAll(text.lowercase()).map {
+            when {
+                it.value.startsWith("re") -> "re-recorded"
+                it.value.startsWith("outtake") -> "outtake"
+                else -> "live"
+            }
+        }
+        return of(text) + extra
+    }
+
     /** One spelling per word, so two titles that name it differently still compare equal. */
     private fun fold(word: String): String = when {
         word == "remix" -> "mix"
