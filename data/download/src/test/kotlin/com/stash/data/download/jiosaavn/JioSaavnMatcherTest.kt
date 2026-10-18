@@ -21,6 +21,15 @@ class JioSaavnMatcherTest {
     }
 
     @Test
+    fun `a YouTube video row keeps the strict length window, so nothing is fetched to be rejected`() {
+        // durationReliable=false eases the lossless matcher only. DownloadManager keeps a JioSaavn
+        // file within max(8 s, 3%) of the row's length, and this matcher uses the same window.
+        val video = TrackQuery("Arijit Singh", "Kesariya", durationMs = 330_000L, durationReliable = false)
+        assertThat(JioSaavnMatcher.best(video, listOf(song(duration = 268)))).isNull()
+        assertThat(JioSaavnMatcher.best(video.copy(durationMs = 270_000L), listOf(song(duration = 268)))).isNotNull()
+    }
+
+    @Test
     fun `parenthetical decoration on the query title still matches the plain title`() {
         // Device-verified miss 2026-08-13: Spotify names the track
         // 'Apna Bana Le (From "Bhediya")', JioSaavn names it 'Apna Bana Le'.
