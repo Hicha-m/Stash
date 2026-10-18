@@ -5,19 +5,24 @@ import android.text.format.DateFormat
 import java.util.Date
 
 /**
- * The words for the daily lossless allowance, in one place so the global message and the
+ * The words for the daily lossless allowance, in one place so the app-wide snackbar and the
  * Settings line say the same thing. Times arrive already formatted ([resetTime]) so the copy
  * stays testable on the JVM.
  */
 object LosslessQuotaText {
 
-    /** The message for [n]; [time] is its reset in the user's local time ("8:00 PM"). */
+    /** Both heads-ups end with it. */
+    const val SUPPORTER_NUDGE = "Unlimited lossless for supporters: any amount on Ko-fi"
+
+    /** The snackbar action: opens Settings → Audio & Quality, where the supporter claim is. */
+    const val NOTICE_ACTION = "Unlock"
+
+    /** The snackbar for [n]; [time] is its reset in the user's local time ("8:00 PM"). */
     fun notice(n: LosslessQuotaNotice, time: String): String = when (n) {
         is LosslessQuotaNotice.RunningLow ->
-            "${n.left} lossless ${if (n.left == 1) "song" else "songs"} left today"
+            "${n.left} lossless ${if (n.left == 1) "song" else "songs"} left today. $SUPPORTER_NUDGE"
         is LosslessQuotaNotice.Spent ->
-            "Daily lossless limit reached — playing in high quality until $time. " +
-                "Unlimited lossless for supporters: any amount on Ko-fi"
+            "Daily lossless limit reached — playing in high quality until $time. $SUPPORTER_NUDGE"
     }
 
     /**

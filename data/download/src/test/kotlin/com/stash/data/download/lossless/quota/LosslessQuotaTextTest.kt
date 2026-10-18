@@ -5,11 +5,11 @@ import org.junit.Test
 
 class LosslessQuotaTextTest {
 
-    @Test fun `running low names what is left`() {
+    @Test fun `running low names what is left and the supporter option`() {
         assertThat(LosslessQuotaText.notice(LosslessQuotaNotice.RunningLow(50, 0L), "8:00 PM"))
-            .isEqualTo("50 lossless songs left today")
+            .isEqualTo("50 lossless songs left today. Unlimited lossless for supporters: any amount on Ko-fi")
         assertThat(LosslessQuotaText.notice(LosslessQuotaNotice.RunningLow(1, 0L), "8:00 PM"))
-            .isEqualTo("1 lossless song left today")
+            .isEqualTo("1 lossless song left today. Unlimited lossless for supporters: any amount on Ko-fi")
     }
 
     @Test fun `the limit names the reset and the supporter option`() {
