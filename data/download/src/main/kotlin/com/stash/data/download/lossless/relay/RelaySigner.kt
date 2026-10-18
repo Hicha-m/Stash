@@ -7,6 +7,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import okhttp3.Request
 import okhttp3.Response
 
@@ -53,7 +54,9 @@ class RelaySigner @Inject constructor(
      */
     suspend fun sign(b: Request.Builder, payload: String, nowMs: Long): Boolean {
         val key = config.relayKey.value ?: return false
-        val install = runCatching { config.installId() }.getOrElse { UUID.randomUUID().toString() }
+        val install = runCatching { config.installId() }
+            // A cancelled request stays cancelled; only a store failure falls back.
+            .getOrElse { e -> if (e is CancellationException) throw e else UUID.randomUUID().toString() }
         val ts = nowMs / 1000 + clockOffsetSec
         val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key.toByteArray(), "HmacSHA256")) }
         val sig = mac.doFinal("$install:$payload:$ts".toByteArray()).joinToString("") { "%02x".format(it) }
