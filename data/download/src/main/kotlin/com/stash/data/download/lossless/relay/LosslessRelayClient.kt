@@ -198,17 +198,20 @@ class LosslessRelayClient @Inject constructor(
                 .also { if (download != null) it.header("X-Stash-Purpose", "download") }
             val signed = signer.sign(b, "$trackId:$formatId", clock())
             // A supporter's token goes to the signed config's relays only, never a user's own endpoint.
-            if (signer.isOwnerRelay(base)) signer.entitle(b)
+            val owner = signer.isOwnerRelay(base)
+            if (owner) signer.entitle(b)
             val req = b.get().build()
             return httpClient.newCall(req).execute().use { r ->
                 val body = r.body?.string().orEmpty()
-                // Every answer may carry the day's lossless count; the cap answer also has it in its body.
-                quota.onResponse(r)
-                val capped = r.code == 429 && quota.onCapBody(body, r.header("Retry-After")?.trim()?.toLongOrNull())
+                // Every owner relay answer may carry the day's lossless count; the cap answer also
+                // has it in its body. A user's own endpoint keeps no shared count: its headers, a
+                // cap-shaped body and its clock are not the owner relays' and change nothing here.
+                if (owner) quota.onResponse(r)
+                val capped = owner && r.code == 429 && quota.onCapBody(body)
                 when (r.code) {
                     // A signed mint refused with the relay's time attached: our clock is off.
                     // Adopt the offset and ask once more; a second 401 cools like any other.
-                    401 if signed && mayRetrySkew && signer.adoptServerTime(r, clock()) -> {
+                    401 if signed && owner && mayRetrySkew && signer.adoptServerTime(r, clock()) -> {
                         note(base, startedAt, "401 clock offset ${signer.clockOffsetSec}s; re-signing")
                         null
                     }

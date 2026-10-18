@@ -1,6 +1,7 @@
 package com.stash.data.download.lossless
 
 import android.content.Context
+import androidx.work.BackoffPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkManager
@@ -19,6 +20,8 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -153,26 +156,52 @@ class LosslessRetrySchedulerTest {
     }
 
     @Test
-    fun `a spent allowance books one sweep just after the reset, under its own name`() = runTest(UnconfinedTestDispatcher()) {
+    fun `a spent allowance books a re-queue-only sweep just after the reset, under its own name`() = runTest(UnconfinedTestDispatcher()) {
         newSubject(backgroundScope)
-        val request = slot<OneTimeWorkRequest>()
+        val requests = mutableListOf<OneTimeWorkRequest>()
         every {
-            workManager.enqueueUniqueWork(LosslessRetryScheduler.RESET_WORK_NAME, ExistingWorkPolicy.KEEP, capture(request))
+            workManager.enqueueUniqueWork(LosslessRetryScheduler.RESET_WORK_NAME, ExistingWorkPolicy.KEEP, capture(requests))
         } returns mockk(relaxed = true)
 
         val resetsAt = now / 1000 + 7200
         quota.onHeaders("499/500", "$resetsAt")
+        advanceUntilIdle()
+        assertTrue("not spent yet: nothing booked", requests.isEmpty())
+
         quota.onHeaders("500/500", "$resetsAt")
-        quota.onCapBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":$resetsAt}""", null)
         advanceUntilIdle()
 
-        verify(exactly = 1) {
-            workManager.enqueueUniqueWork(LosslessRetryScheduler.RESET_WORK_NAME, ExistingWorkPolicy.KEEP, any<OneTimeWorkRequest>())
+        // KEEP on its own name: WorkManager keeps the one already waiting.
+        assertTrue(requests.isNotEmpty())
+        verify(exactly = 0) {
+            workManager.enqueueUniqueWork(LosslessRetryWorker.UNIQUE_WORK_NAME, any(), any<OneTimeWorkRequest>())
         }
-        org.junit.Assert.assertEquals(
-            TimeUnit.SECONDS.toMillis(7200 + LosslessRetryScheduler.RESET_SLACK_SEC),
-            request.captured.workSpec.initialDelay,
-        )
+        requests.forEach { r ->
+            assertEquals(TimeUnit.SECONDS.toMillis(7200 + LosslessRetryScheduler.RESET_SLACK_SEC), r.workSpec.initialDelay)
+            assertTrue(r.workSpec.input.getBoolean(LosslessRetryWorker.KEY_AT_RESET, false))
+            assertEquals(BackoffPolicy.LINEAR, r.workSpec.backoffPolicy)
+        }
+    }
+
+    @Test
+    fun `the same spent day reported again books again, for a sweep that ran too early`() = runTest(UnconfinedTestDispatcher()) {
+        newSubject(backgroundScope)
+        val requests = mutableListOf<OneTimeWorkRequest>()
+        every {
+            workManager.enqueueUniqueWork(LosslessRetryScheduler.RESET_WORK_NAME, ExistingWorkPolicy.KEEP, capture(requests))
+        } returns mockk(relaxed = true)
+        val resetsAt = now / 1000 + 7200
+        quota.onHeaders("500/500", "$resetsAt")
+        advanceUntilIdle()
+        val first = requests.size
+
+        // The sweep has run; a download it re-queued comes back capped for the same day.
+        now += 3_600_000
+        quota.onCapBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":$resetsAt}""")
+        advanceUntilIdle()
+
+        assertEquals(first + 1, requests.size)
+        assertEquals(TimeUnit.SECONDS.toMillis(3600 + LosslessRetryScheduler.RESET_SLACK_SEC), requests.last().workSpec.initialDelay)
     }
 
     @Test

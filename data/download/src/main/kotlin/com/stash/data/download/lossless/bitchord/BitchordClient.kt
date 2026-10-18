@@ -280,7 +280,7 @@ class BitchordClient @Inject constructor(
                         .addPathSegment("search")
                         .addQueryParameter("q", "${query.artist} ${query.title}".trim())
                         .build()
-                    val body = when (val r = get(searchUrl, token)) {
+                    val body = when (val r = get(searchUrl, token, owner = !server.userOwned)) {
                         is Reply.Ok -> r.body
                         is Reply.Busy -> return@withContext busy(r.untilMs)
                         Reply.Spent -> return@withContext TidalLookup.Spent(quota.resetsAtMs())
@@ -322,7 +322,7 @@ class BitchordClient @Inject constructor(
                 // Only the owner's relay (from the signed config) verifies install headers; a
                 // user's own server never sees our install id.
                 val sign = if (!server.userOwned) "td:${id.removePrefix("td:")}" else null
-                when (val r = get(streamUrl, token, signPayload = sign)) {
+                when (val r = get(streamUrl, token, owner = !server.userOwned, signPayload = sign)) {
                     is Reply.Ok -> {
                         val stream = toStream(json.decodeFromString<BitchordStreamResponse>(r.body), match, allowAac)
                         if (stream == null) {
@@ -475,9 +475,10 @@ class BitchordClient @Inject constructor(
      * One GET. With [signPayload] (a `/stream` to the owner's relay) the request carries the
      * install headers ([RelaySigner], message `<install>:td:<numeric id>:<ts>`) and a stored
      * supporter token; a 401 that names the relay's time re-signs once on that clock, like a
-     * Qobuz mint.
+     * Qobuz mint. Only an [owner] relay's answers feed the daily allowance: a user's own server
+     * keeps no shared count.
      */
-    private suspend fun get(url: HttpUrl, token: String?, signPayload: String? = null): Reply {
+    private suspend fun get(url: HttpUrl, token: String?, owner: Boolean, signPayload: String? = null): Reply {
         var mayRetrySkew = true
         while (true) {
             val b = Request.Builder().url(url).get()
@@ -489,7 +490,7 @@ class BitchordClient @Inject constructor(
                 if (r.code == 401 && signed && mayRetrySkew && signer.adoptServerTime(r, nowMs())) {
                     null
                 } else {
-                    reply(r)
+                    reply(r, owner)
                 }
             }
             if (reply != null) return reply
@@ -497,10 +498,10 @@ class BitchordClient @Inject constructor(
         }
     }
 
-    /** Sorts one relay response into a [Reply]. */
-    private fun reply(r: okhttp3.Response): Reply {
-        // Every answer may carry the day's lossless count.
-        quota.onResponse(r)
+    /** Sorts one relay response into a [Reply]; [owner]: the signed config's relay. */
+    private fun reply(r: okhttp3.Response, owner: Boolean): Reply {
+        // Every owner relay answer may carry the day's lossless count.
+        if (owner) quota.onResponse(r)
         if (!r.isSuccessful) {
             // Code only: the path may carry the access token as its prefix.
             Log.d(TAG, "HTTP ${r.code}")
@@ -513,7 +514,7 @@ class BitchordClient @Inject constructor(
                 503 -> Reply.Busy(now + retryAfterMs(r, BUSY_MIN_RETRY_AFTER_MS, BUSY_MAX_RETRY_AFTER_MS))
                 // The daily lossless cap is this install's allowance, not a busy pool: AAC and
                 // other installs' traffic are unaffected, so it must not open the busy circuit.
-                429 -> if (boundedBody(r)?.let { quota.onCapBody(it, r.header("Retry-After")?.trim()?.toLongOrNull()) } == true) {
+                429 -> if (owner && boundedBody(r)?.let { quota.onCapBody(it) } == true) {
                     Reply.Spent
                 } else {
                     // network_daily_cap answers Retry-After 3600, hence the 1 h ceiling.

@@ -200,6 +200,7 @@ class LosslessRelayClientTest {
 
     @Test fun `a 401 with X-Stash-Server-Time re-signs once with the relay's clock and keeps the offset`() = runTest {
         relayKey.value = "k-secret"
+        relays.value = listOf(RelayEntry(base))
         now = 1_700_000_000_000L
         val relayTs = 1_700_000_000L + 600 // the device is 10 minutes slow
         server.enqueue(MockResponse().setResponseCode(401).setHeader("X-Stash-Server-Time", relayTs.toString()).setBody("""{"error":"bad_ts"}"""))
@@ -224,6 +225,7 @@ class LosslessRelayClientTest {
 
     @Test fun `a second 401 after the skew retry cools the base as today`() = runTest {
         relayKey.value = "k-secret"
+        relays.value = listOf(RelayEntry(base))
         repeat(2) {
             server.enqueue(MockResponse().setResponseCode(401).setHeader("X-Stash-Server-Time", (now / 1000 + 900).toString()))
         }
@@ -280,6 +282,7 @@ class LosslessRelayClientTest {
     // ── Daily lossless allowance ─────────────────────────────────────────────────────────
 
     @Test fun `every answer's lossless headers reach the quota`() = runTest {
+        relays.value = listOf(RelayEntry(base))
         server.enqueue(MockResponse().setBody("""{"url":"https://cdn.example/f.flac?etsp=1"}""")
             .setHeader("X-Stash-Lossless", "412/500").setHeader("X-Stash-Lossless-Reset", "1792281600"))
         client.mint(base, 42, 27)
@@ -288,6 +291,7 @@ class LosslessRelayClientTest {
     }
 
     @Test fun `429 daily_lossless_cap is Spent, records the cap, and neither cools nor reads as a miss`() = runTest {
+        relays.value = listOf(RelayEntry(base))
         server.enqueue(MockResponse().setResponseCode(429).setHeader("Retry-After", "3600")
             .setBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":${now / 1000 + 3600}}"""))
         val purpose = LosslessDownloadPurpose()
@@ -296,6 +300,27 @@ class LosslessRelayClientTest {
         assertThat(client.isCooled(base)).isFalse()
         assertThat(purpose.searchIncomplete).isTrue()
         assertThat(purpose.pacedRetryAfterSec).isNull() // not paced: a lossy fallback may still run
+    }
+
+    @Test fun `a user's own endpoint changes neither the shared count, the spent day nor the clock offset`() = runTest {
+        relayKey.value = "k-secret" // keyed, so the 401 below would re-sign on an owner relay
+        server.enqueue(MockResponse().setBody("""{"url":"https://cdn.example/f.flac?etsp=1"}""")
+            .setHeader("X-Stash-Lossless", "412/500").setHeader("X-Stash-Lossless-Reset", "1792281600"))
+        server.enqueue(MockResponse().setResponseCode(429)
+            .setBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":${now / 1000 + 3600}}"""))
+        server.enqueue(MockResponse().setResponseCode(401).setHeader("X-Stash-Server-Time", (now / 1000 + 900).toString()))
+        val signer = RelaySigner(config, supporter())
+        client = LosslessRelayClient(OkHttpClient(), signer, quota).also { it.clock = { now } }
+
+        client.mint(base, 42, 27) // not in the config: a user's own endpoint
+        assertThat(client.mint(base, 43, 27)).isEqualTo(RelayMint.Unavailable) // an ordinary 429: cools
+        now += LosslessRelayClient.UNAVAILABLE_COOLDOWN_MS + 1
+        assertThat(client.mint(base, 44, 27)).isEqualTo(RelayMint.Unavailable)
+
+        assertThat(quota.current()).isNull()
+        assertThat(quota.isSpent()).isFalse()
+        assertThat(signer.clockOffsetSec).isEqualTo(0L)
+        assertThat(server.requestCount).isEqualTo(3) // the 401 was not re-signed
     }
 
     @Test fun `a supporter token goes to the signed config's relays only`() = runTest {

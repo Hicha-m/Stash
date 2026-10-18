@@ -9,6 +9,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
@@ -80,19 +82,76 @@ class LosslessQuotaTest {
     }
 
     @Test fun `a daily_lossless_cap body records spent, any other 429 body does not`() {
-        assertThat(quota.onCapBody("""{"error":"network_daily_cap"}""", 3600)).isFalse()
-        assertThat(quota.onCapBody("<html>", 3600)).isFalse()
+        assertThat(quota.onCapBody("""{"error":"network_daily_cap"}""")).isFalse()
+        assertThat(quota.onCapBody("<html>")).isFalse()
         assertThat(quota.current()).isNull()
 
-        assertThat(quota.onCapBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":$RESET}""", 1)).isTrue()
+        assertThat(quota.onCapBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":$RESET}""")).isTrue()
         assertThat(quota.isSpent()).isTrue()
         assertThat(quota.current()).isEqualTo(LosslessAllowance(500, 500, RESET))
     }
 
-    @Test fun `a cap body without resetsAt falls back to Retry-After`() {
-        assertThat(quota.onCapBody("""{"error":"daily_lossless_cap"}""", 600)).isTrue()
-        assertThat(quota.current()).isEqualTo(LosslessAllowance(500, 500, now / 1000 + 600))
+    @Test fun `a cap body without resetsAt resets at the next UTC midnight`() {
+        assertThat(quota.onCapBody("""{"error":"daily_lossless_cap"}""")).isTrue()
+        assertThat(quota.current()).isEqualTo(LosslessAllowance(500, 500, RESET))
         assertThat(quota.isSpent()).isTrue()
+        // So the relays' later answers for the same day read as the same day.
+        quota.onHeaders("500/500", "$RESET")
+        assertThat(quota.current()).isEqualTo(LosslessAllowance(500, 500, RESET))
+    }
+
+    @Test fun `the day is judged on the clock it is given (the relays'), not the device's`() {
+        // The device runs 10 minutes fast: its clock alone would already read the day as reset.
+        val deviceMs = RESET * 1000 + 5 * 60_000
+        val offsetMs = -10 * 60_000L
+        val q = LosslessQuota.inMemory { deviceMs + offsetMs }
+        q.onHeaders("500/500", "$RESET")
+        assertThat(q.isSpent()).isTrue()
+        assertThat(q.nowSec()).isEqualTo(RESET - 5 * 60)
+    }
+
+    @Test fun `every spent answer is announced for booking, repeats included`() = runTest {
+        val seen = mutableListOf<Long>()
+        val job = launch(UnconfinedTestDispatcher(testScheduler)) { quota.spentAnswers.collect { seen += it } }
+        quota.onHeaders("499/500", "$RESET")
+        quota.onHeaders("500/500", "$RESET")
+        quota.onCapBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":$RESET}""")
+        job.cancel()
+        assertThat(seen).containsExactly(RESET, RESET)
+    }
+
+    @Test fun `a supporter claim lifts the spent day until the next relay answer`() {
+        quota.liftSpent() // nothing spent: nothing to lift
+        quota.onHeaders("500/500", "$RESET")
+        assertThat(quota.isSpent()).isTrue()
+
+        quota.liftSpent()
+        assertThat(quota.isSpent()).isFalse()
+        assertThat(quota.current()).isEqualTo(LosslessAllowance(500, 500, RESET)) // the count is not touched
+
+        // The relays still count this install as free (a revoked token): spent again.
+        quota.onHeaders("500/500", "$RESET")
+        assertThat(quota.isSpent()).isTrue()
+    }
+
+    @Test fun `a lifted day survives a restart`() = runBlocking {
+        val dir: File = Files.createTempDirectory("quota-lift").toFile()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val store = PreferenceDataStoreFactory.create(scope = scope) { File(dir, "q.preferences_pb") }
+            val first = LosslessQuota(store, { now }, scope)
+            first.awaitLoaded()
+            first.onHeaders("500/500", "$RESET")
+            first.liftSpent()
+            withTimeout(5_000) { store.data.first { it.asMap().size >= 6 } }
+
+            val second = LosslessQuota(store, { now }, scope)
+            second.awaitLoaded()
+            assertThat(second.isSpent()).isFalse()
+        } finally {
+            scope.cancel()
+            dir.deleteRecursively()
+        }
     }
 
     @Test fun `a quota body reads numbers, the word unlimited and the supporter flag`() {
@@ -134,7 +193,7 @@ class LosslessQuotaTest {
 
         quota.onHeaders("500/500", "$RESET")
         assertThat(next()).isEqualTo(LosslessQuotaNotice.Spent(RESET * 1000))
-        quota.onCapBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":$RESET}""", null)
+        quota.onCapBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":$RESET}""")
         assertThat(next()).isNull()
 
         // A new day announces again.
@@ -157,6 +216,12 @@ class LosslessQuotaTest {
         quota.onHeaders("500/500", "$RESET")
         quota.onQuotaBody("""{"used":500,"limit":null,"resetsAt":$RESET,"supporter":true}""")
         assertThat(quota.isSpent()).isFalse()
+        assertThat(withTimeoutOrNull(100) { quota.noticeEvents.first() }).isNull()
+    }
+
+    @Test fun `a heads-up raised before a claim lifted the spent day is dropped`() = runTest {
+        quota.onHeaders("500/500", "$RESET")
+        quota.liftSpent()
         assertThat(withTimeoutOrNull(100) { quota.noticeEvents.first() }).isNull()
     }
 

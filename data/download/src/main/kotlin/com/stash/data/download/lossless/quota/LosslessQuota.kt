@@ -10,8 +10,10 @@ import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.stash.data.download.lossless.relay.RelaySigner
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
+import javax.inject.Provider
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -20,8 +22,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
@@ -80,15 +86,23 @@ private val Context.losslessQuotaDataStore: DataStore<Preferences> by preference
  * Within a day the relay's count only grows, so out-of-order answers never move it back; a
  * later day replaces it. Persisted in its own DataStore (no Room migration) so a restart
  * keeps the spent state and the counter line has a value before the first relay answer.
+ *
+ * The day is judged on the relays' clock: the device clock plus the offset [RelaySigner]
+ * learned from a relay's `X-Stash-Server-Time`, so a phone whose clock runs ahead does not
+ * read the allowance as reset (and ask again) before the relays' day has turned over.
  */
 @Singleton
 class LosslessQuota internal constructor(
     private val store: DataStore<Preferences>?,
-    private val nowMs: () -> Long,
+    private val clock: () -> Long,
     private val scope: CoroutineScope,
 ) {
-    @Inject constructor(@ApplicationContext context: Context) :
-        this(context.losslessQuotaDataStore, System::currentTimeMillis, CoroutineScope(SupervisorJob() + Dispatchers.IO))
+    @Inject constructor(@ApplicationContext context: Context, signer: Provider<RelaySigner>) :
+        this(
+            context.losslessQuotaDataStore,
+            { System.currentTimeMillis() + signer.get().clockOffsetSec * 1000L },
+            CoroutineScope(SupervisorJob() + Dispatchers.IO),
+        )
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
     private val _state = MutableStateFlow<LosslessAllowance?>(null)
@@ -106,6 +120,21 @@ class LosslessQuota internal constructor(
     @Volatile private var noticedDay = 0L
     @Volatile private var noticedLevel = 0
 
+    /**
+     * The day ([LosslessAllowance.resetsAtSec]) a supporter claim lifted the spent state on this
+     * device ([liftSpent]); 0 = none. Lasts until the next relay answer, which says for itself.
+     */
+    @Volatile private var liftedDay = 0L
+
+    private val _spentAnswers = MutableSharedFlow<Long>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+
+    /**
+     * Every relay answer that reports the day spent, as its reset (epoch s), repeats included:
+     * [state] stays put when the same spent day is reported again. A reset sweep that ran
+     * before the relays' day turned over is booked again from here.
+     */
+    val spentAnswers: SharedFlow<Long> = _spentAnswers.asSharedFlow()
+
     private val notices = Channel<LosslessQuotaNotice>(Channel.CONFLATED)
 
     /**
@@ -114,7 +143,7 @@ class LosslessQuota internal constructor(
      * has reset by then, or raised before a supporter claim lifted the limit, is dropped.
      */
     val noticeEvents: Flow<LosslessQuotaNotice> = notices.receiveAsFlow()
-        .filter { nowMs() < it.resetsAtMs && current()?.unlimited != true }
+        .filter { nowMs() < it.resetsAtMs && current()?.unlimited != true && liftedDay == 0L }
 
     init {
         if (store == null) loaded.complete(Unit) else scope.launch { load(store) }
@@ -127,13 +156,38 @@ class LosslessQuota internal constructor(
     fun current(): LosslessAllowance? = _state.value?.let { asOf(it, nowMs()) }
 
     /** True while today's allowance is used up (lossless rungs skip until [resetsAtMs]). */
-    fun isSpent(): Boolean = current()?.exhausted == true
+    fun isSpent(): Boolean = current()?.let { it.exhausted && it.resetsAtSec != liftedDay } == true
 
     /** When the current allowance resets, epoch ms; the next UTC midnight when nothing is known. */
     fun resetsAtMs(): Long = current()?.resetsAtMs ?: nextUtcMidnightSec(nowMs()) * 1000L
 
-    /** The clock the allowance is judged by, epoch seconds (one seam for its users' tests). */
+    /** The clock the allowance is judged by (the relays'), epoch ms; one seam for its users' tests. */
+    fun nowMs(): Long = clock()
+
+    /** [nowMs] in epoch seconds. */
     fun nowSec(): Long = nowMs() / 1000
+
+    /**
+     * A supporter claim just stored a token: stop reading today as spent on this device now, so
+     * the lossless rungs ask the relays again (with the token) instead of skipping until the
+     * reset. Their next answer sets the real state, unlimited or not. Kept across a restart, so
+     * a claim made offline still lifts it once the phone is back online.
+     */
+    fun liftSpent() {
+        val a = current()?.takeIf { it.exhausted } ?: return
+        liftedDay = a.resetsAtSec
+        persistLift()
+    }
+
+    /** Writes [liftedDay] as it is when the write runs, so writes landing out of order still end right. */
+    private fun persistLift() {
+        val s = store ?: return
+        scope.launch {
+            ioCatching("lift write") {
+                s.edit { p -> liftedDay.let { d -> if (d != 0L) p[KEY_LIFTED_DAY] = d else p.remove(KEY_LIFTED_DAY) } }
+            }
+        }
+    }
 
     /** True when nothing stored is from today (UTC): the cold-start refresh should ask. */
     fun needsColdRefresh(): Boolean = _state.value.let { it == null || nowMs() >= it.resetsAtMs }
@@ -151,15 +205,18 @@ class LosslessQuota internal constructor(
     /**
      * Reads a `429` body. True when it is `daily_lossless_cap` (the allowance is now recorded as
      * spent); false for any other 429, which the caller handles as before.
-     * [retryAfterSec] stands in for a body without `resetsAt`.
+     *
+     * A body without `resetsAt` (the relays always send it) resets at the next UTC midnight,
+     * where the day really turns over. `Retry-After` is not used: "now + seconds" lands a few
+     * seconds off midnight, and a reset off the relays' own `resetsAt` would read their later
+     * answers for the same day as another day.
      */
-    fun onCapBody(body: String, retryAfterSec: Long?): Boolean {
+    fun onCapBody(body: String): Boolean {
         val o = parseObject(body) ?: return false
         if ((o["error"] as? JsonPrimitive)?.content != CAP_ERROR) return false
         val limit = (readLimit(o) ?: DEFAULT_LIMIT).takeIf { it != UNLIMITED }
         val used = (o["used"] as? JsonPrimitive)?.intOrNull ?: limit ?: DEFAULT_LIMIT
         val resetsAt = (o["resetsAt"] as? JsonPrimitive)?.longOrNull?.takeIf { it > 0 }
-            ?: retryAfterSec?.takeIf { it > 0 }?.let { nowMs() / 1000 + it }
             ?: nextUtcMidnightSec(nowMs())
         record(LosslessAllowance(maxOf(used, limit ?: used), limit, resetsAt))
         return true
@@ -181,6 +238,12 @@ class LosslessQuota internal constructor(
      * land out of order) and takes the newer limit (a supporter claim lifts it mid-day).
      */
     private fun record(next: LosslessAllowance) {
+        // A relay answered: it, not a claim's lift, now says whether today is spent.
+        if (liftedDay != 0L) {
+            liftedDay = 0L
+            persistLift()
+        }
+        if (next.exhausted) _spentAnswers.tryEmit(next.resetsAtSec)
         var saved: LosslessAllowance
         while (true) {
             val prev = _state.value
@@ -222,6 +285,8 @@ class LosslessQuota internal constructor(
             ioCatching("read") { s.data.first() }?.let { p ->
                 noticedDay = p[KEY_NOTICED_DAY] ?: 0L
                 noticedLevel = p[KEY_NOTICED_LEVEL] ?: 0
+                // Unless a relay answer landed during the read (which ends a lift).
+                if (_state.value == null) liftedDay = p[KEY_LIFTED_DAY] ?: 0L
                 val used = p[KEY_USED]
                 val resetsAt = p[KEY_RESETS_AT]
                 val limit = p[KEY_LIMIT]
@@ -288,6 +353,7 @@ class LosslessQuota internal constructor(
         private val KEY_RESETS_AT = longPreferencesKey("resets_at")
         private val KEY_NOTICED_DAY = longPreferencesKey("noticed_day")
         private val KEY_NOTICED_LEVEL = intPreferencesKey("noticed_level")
+        private val KEY_LIFTED_DAY = longPreferencesKey("lifted_day")
 
         /** No DataStore, work run in place: for tests that only need the state. */
         internal fun inMemory(nowMs: () -> Long = System::currentTimeMillis): LosslessQuota =

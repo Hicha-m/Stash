@@ -25,7 +25,7 @@ import kotlinx.coroutines.flow.stateIn
 @HiltViewModel
 class LosslessQuotaViewModel @Inject constructor(
     @ApplicationContext context: Context,
-    quota: LosslessQuota,
+    private val quota: LosslessQuota,
     config: LosslessConfigFetcher,
 ) : ViewModel() {
 
@@ -42,7 +42,8 @@ class LosslessQuotaViewModel @Inject constructor(
         combine(config.relays, config.tidalRelay) { relays, tidal -> relays.isNotEmpty() || tidal != null },
         minuteTicks,
     ) { allowance, relayConfigured, _ ->
-        losslessTodayLine(allowance, relayConfigured, System.currentTimeMillis()) { LosslessQuotaText.resetTime(context, it) }
+        // On the relays' clock, like the rungs: the line turns over when their day does.
+        losslessTodayLine(allowance, relayConfigured, quota.nowMs()) { LosslessQuotaText.resetTime(context, it) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     private companion object {

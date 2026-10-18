@@ -124,6 +124,20 @@ class BitchordClientQuotaTest {
         assertThat(client.lookup(query, allowAac = true)).isInstanceOf(TidalLookup.Found::class.java)
     }
 
+    @Test fun `a user's own server never moves the shared count or the spent day`() = runBlocking {
+        userEndpoint = server.url("/").toString().trimEnd('/')
+        streamReply = { ok(FLAC).setHeader("X-Stash-Lossless", "451/500").setHeader("X-Stash-Lossless-Reset", "$resetsAt") }
+        client.lookup(query)
+        assertThat(quota.current()).isNull()
+
+        streamReply = {
+            MockResponse().setResponseCode(429).setHeader("Retry-After", "60")
+                .setBody("""{"error":"daily_lossless_cap","used":500,"limit":500,"resetsAt":$resetsAt}""")
+        }
+        assertThat(client.lookup(query)).isInstanceOf(TidalLookup.Busy::class.java)
+        assertThat(quota.isSpent()).isFalse()
+    }
+
     @Test fun `any other 429 still opens the busy circuit`() = runBlocking {
         streamReply = { MockResponse().setResponseCode(429).setHeader("Retry-After", "60").setBody("""{"error":"network_daily_cap"}""") }
         assertThat(client.lookup(query)).isInstanceOf(TidalLookup.Busy::class.java)

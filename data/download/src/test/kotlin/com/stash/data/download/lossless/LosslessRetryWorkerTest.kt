@@ -9,7 +9,10 @@ import com.stash.core.data.db.entity.TrackEntity
 import com.stash.core.data.prefs.StreamingPreference
 import com.stash.core.data.sync.SingleTrackDownloadEnqueuer
 import com.stash.core.model.DownloadStatus
+import androidx.work.workDataOf
+import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessDownloadPurpose
+import io.mockk.every
 import kotlinx.coroutines.currentCoroutineContext
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -45,6 +48,8 @@ class LosslessRetryWorkerTest {
     private val registry: LosslessSourceRegistry = mockk()
     private val enqueuer: SingleTrackDownloadEnqueuer = mockk(relaxed = true)
     private val streamingPreference: StreamingPreference = mockk { coEvery { current() } returns false }
+    private var now = 1_792_238_400_000L
+    private val quota = LosslessQuota.inMemory { now }
 
     private fun newWorker(): LosslessRetryWorker = LosslessRetryWorker(
         appContext = appContext,
@@ -54,7 +59,68 @@ class LosslessRetryWorkerTest {
         registry = registry,
         singleTrackDownloadEnqueuer = enqueuer,
         streamingPreference = streamingPreference,
+        quota = quota,
     )
+
+    /** The sweep the scheduler books for the allowance's reset. */
+    private fun atReset() {
+        every { workerParams.inputData } returns workDataOf(LosslessRetryWorker.KEY_AT_RESET to true)
+    }
+
+    // -- The daily allowance's reset sweep ------------------------------------------
+
+    @Test
+    fun `the reset sweep re-queues every waiting song without a lookup, so each download makes the only one`() = runTest {
+        atReset()
+        coEvery { downloadQueueDao.waitingForLosslessTracks(any()) } returns
+            listOf(entry(id = 100L, trackId = 1L), entry(id = 101L, trackId = 2L))
+        coEvery { trackDao.getById(any()) } answers { stubTrackEntity(firstArg()) }
+
+        val result = newWorker().doWork() as androidx.work.ListenableWorker.Result.Success
+
+        coVerify(exactly = 0) { registry.resolve(any()) }
+        coVerify(exactly = 1) { downloadQueueDao.updateStatus(id = 100L, status = DownloadStatus.PENDING) }
+        coVerify(exactly = 1) { downloadQueueDao.updateStatus(id = 101L, status = DownloadStatus.PENDING) }
+        coVerify(exactly = 1) { enqueuer.enqueue(100L) }
+        coVerify(exactly = 1) { enqueuer.enqueue(101L) }
+        assertEquals(2, result.outputData.getInt(LosslessRetryWorker.KEY_RESOLVED, -1))
+    }
+
+    @Test
+    fun `a reset sweep that runs while the day is still spent touches nothing and retries`() = runTest {
+        atReset()
+        quota.onHeaders("500/500", "${now / 1000 + 120}") // the relays' day has two minutes left
+        coEvery { downloadQueueDao.waitingForLosslessTracks(any()) } returns listOf(entry(id = 100L, trackId = 1L))
+
+        val result = newWorker().doWork()
+
+        assertEquals(androidx.work.ListenableWorker.Result.retry(), result)
+        coVerify(exactly = 0) { downloadQueueDao.updateStatus(any(), any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { enqueuer.enqueue(any()) }
+    }
+
+    @Test
+    fun `the reset sweep still leaves a song whose audio the user picked`() = runTest {
+        atReset()
+        coEvery { downloadQueueDao.waitingForLosslessTracks(any()) } returns listOf(entry(id = 100L, trackId = 1L))
+        coEvery { trackDao.getById(1L) } returns stubTrackEntity(1L).copy(matchPickedAt = 1_000L)
+
+        newWorker().doWork()
+
+        coVerify(exactly = 0) { enqueuer.enqueue(any()) }
+    }
+
+    @Test
+    fun `any other sweep still resolves each row once before re-queuing it`() = runTest {
+        coEvery { downloadQueueDao.waitingForLosslessTracks(any()) } returns listOf(entry(id = 100L, trackId = 1L))
+        coEvery { trackDao.getById(1L) } returns stubTrackEntity(1L)
+        coEvery { registry.resolve(any()) } returns stubSourceResult()
+
+        newWorker().doWork()
+
+        coVerify(exactly = 1) { registry.resolve(any()) }
+        coVerify(exactly = 1) { enqueuer.enqueue(100L) }
+    }
 
     @Test
     fun `a re-queued row starts downloading now, not at the next sync`() = runTest {
