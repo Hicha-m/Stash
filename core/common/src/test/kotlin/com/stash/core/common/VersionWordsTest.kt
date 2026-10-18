@@ -103,4 +103,21 @@ class VersionWordsTest {
         assertEquals(setOf("live"), VersionWords.forCatalogMatch("Until Morning - A COLORS SHOW"))
         assertEquals(setOf("mix", "live"), VersionWords.forCatalogMatch("(Live Remix)"))
     }
+
+    @Test fun `the matcher reads a version the catalog names in its own words`() {
+        assertEquals(setOf("australian version"), VersionWords.forCatalogMatch("(Australian Version)"))
+        assertEquals(setOf("1991 version"), VersionWords.forCatalogMatch("[1991 Version]"))
+        assertEquals(setOf("japanese version"), VersionWords.forCatalogMatch("Song - Japanese Version"))
+        assertEquals(setOf("early version"), VersionWords.forCatalogMatch("(Remastered) Early Version"))
+        assertEquals(setOf("rework"), VersionWords.forCatalogMatch("(FISHER Rework)"))
+        // A release label, a reissue year or a version word already listed names no new version.
+        for (text in listOf("(Album Version)", "(LP Version)", "(Mono Version)", "(2009 Remastered Version)", "(Single Version)", "(Version 2)")) {
+            assertEquals(text, emptySet<String>(), VersionWords.forCatalogMatch(text))
+        }
+        assertEquals(setOf("live"), VersionWords.forCatalogMatch("(Live Version)"))
+        assertEquals(setOf("taylor's version"), VersionWords.forCatalogMatch("(Taylor's Version)"))
+        // The library's same-song rule does not move with the matcher.
+        assertEquals(emptySet<String>(), words("(Australian Version)"))
+        assertEquals(emptySet<String>(), words("(FISHER Rework)"))
+    }
 }

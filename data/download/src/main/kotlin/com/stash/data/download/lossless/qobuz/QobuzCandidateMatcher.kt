@@ -97,14 +97,16 @@ object QobuzCandidateMatcher {
             BRACKETED.findAll(candTitle).joinToString(" ") { it.value } + " " +
                 VersionWords.DASH_SUFFIX.find(candTitle)?.value.orEmpty() + " " + candVersion.orEmpty(),
         )
-        val extraVersion = candVersionWords - versionWords(query.title + " " + query.album.orEmpty())
+        val extraVersion = candVersionWords - versionWords(query.title + " " + query.album.orEmpty()) -
+            ownVersions(query.artist, candArtist, candVersionWords)
         // The reverse: the query's title names a version ("Song - Live", "Song (Remix)") the
         // candidate names nowhere, its album included ("Live at Leeds" carries live takes).
         val queryVersionWords = versionWords(
             BRACKETED.findAll(query.title).joinToString(" ") { it.value } + " " +
                 VersionWords.DASH_SUFFIX.find(query.title)?.value.orEmpty(),
         )
-        val missingVersion = queryVersionWords - candVersionWords - versionWords(candAlbum.orEmpty())
+        val missingVersion = queryVersionWords - candVersionWords - versionWords(candAlbum.orEmpty()) -
+            ownVersions(query.artist, candArtist, queryVersionWords)
         // A length within 5% on the query's own album says it's the recording the user has
         // (a live album whose titles don't say "live"), so the version only breaks ties. On
         // another album the same length proves nothing: a live take often runs like the studio cut.
@@ -144,7 +146,9 @@ object QobuzCandidateMatcher {
      * Only a reliable length breaks ties ([TrackQuery.durationReliable]). A music video's length is
      * the video's, and on the labelled set the cut nearest to it was more often an alternate take
      * ("Let Her Cry (1991 Version)", "Dock of the Bay (Take 2)": 6 more wrong picks in v1) than the
-     * master the catalog lists first. Without one, the first listed wins.
+     * master the catalog lists first. Without one, the first listed wins. (Re-measured once named
+     * versions such as "(1991 Version)" took the version penalty: preferring the one tied cut within
+     * 3 s / 2% of the video still fixed 2 songs and broke 2, one more wrong pick in v1.)
      *
      * One helper for every pick site (squid/qbdlx Qobuz, the Tidal relay, kennyy), so they agree.
      *
@@ -172,6 +176,22 @@ object QobuzCandidateMatcher {
         }
         return best
     }
+
+    /**
+     * The named versions ([VersionWords.forCatalogMatch]: "<words> version") that only name the
+     * performer: "Smooth Operator (Meshell Ndegeocello Version)" by Meshell Ndegeocello is her own
+     * recording, filed that way on a compilation of covers. Those name no other version here.
+     */
+    private fun ownVersions(queryArtist: String, candArtist: String, named: Set<String>): Set<String> {
+        val names = "$queryArtist $candArtist".lowercase().split(LABEL_BREAK).filter { it.isNotEmpty() }.toSet()
+        return named.filterTo(mutableSetOf()) { marker ->
+            marker.endsWith(" version") &&
+                marker.removeSuffix(" version").split(' ').let { words -> words.isNotEmpty() && words.all { it in names } }
+        }
+    }
+
+    /** How [VersionWords.forCatalogMatch] splits a named version into words. */
+    private val LABEL_BREAK = Regex("[^\\p{L}\\p{N}]+")
 
     /** Scores this close are a tie: they come from the same factors, so only float rounding separates them. */
     private const val SCORE_TIE = 1e-4f
@@ -276,7 +296,9 @@ object QobuzCandidateMatcher {
      * The version words [text] names. The list (whole words; a year, stereo, mono, single... mix
      * is the same song; "Edit" left out, radio edits are fine) is the library's too, so it lives in
      * core:common: [VersionWords]. The matcher also reads a few words the library rule doesn't
-     * (re-recording, outtake, performance, concert, COLORS show: [VersionWords.forCatalogMatch]).
+     * (re-recording, outtake, performance, concert, COLORS show, rework, and a version the catalog
+     * names in its own words, "(Australian Version)": [VersionWords.forCatalogMatch]). A named
+     * version that only names the performer is set aside by [ownVersions].
      */
     internal fun versionWords(text: String): Set<String> = VersionWords.forCatalogMatch(text)
 

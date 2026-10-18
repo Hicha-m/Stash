@@ -365,4 +365,58 @@ class QobuzCandidateMatcherTest {
         val studio = QobuzCandidateMatcher.confidence(q, "Transmission", "Joy Division", null, 217, true, candAlbum = "Transmission")
         assertThat(studio).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
     }
+
+    @Test fun `a YouTube video row takes the cut of its own song, not a named Australian version`() {
+        // Pixel 6 library row: "The Residents - Man's World", uploaded by "Radial by The Orchard",
+        // no album, 234 s (a music video). The catalog lists the Australian Version before the
+        // Icky Flix cut; both scored 1.0 and catalog order served the 298 s Australian Version.
+        val q = TrackQuery(artist = "Radial by The Orchard", title = "The Residents - Man's World", durationMs = 234_000)
+            .forLibrarySource(MusicSource.YOUTUBE)
+        assertThat(q.artist).isEqualTo("The Residents")
+        assertThat(q.durationReliable).isFalse()
+        data class Cand(val id: String, val title: String, val artist: String, val sec: Int)
+        val candidates = listOf(
+            Cand("a", "This is a Man's Man's Man's World", "The Residents", 222),
+            Cand("b", "This Is A Man's Man's Man's World", "The Residents", 223),
+            Cand("c", "This Is A Man's Man's Man's World (Live)", "The Residents", 354),
+            Cand("d", "Mans World (Fillmore)", "The Residents", 439),
+            Cand("341806471", "Man's World (Australian Version)", "The Residents", 298),
+            Cand("341806474", "Man's World (Icky Flix)", "The Residents", 233),
+            Cand("g", "It's A Man's Man's Man's World", "James Brown", 320),
+        )
+        val scored = candidates.map { it to QobuzCandidateMatcher.confidence(q, it.title, it.artist, null, it.sec, true) }
+        val best = QobuzCandidateMatcher.pickBest(q, scored) { it.sec }
+        assertThat(best?.first?.id).isEqualTo("341806474")
+        assertThat(scored.first { it.first.id == "341806471" }.second).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+    }
+
+    @Test fun `a version the catalog names in its own words is another version`() {
+        // "(1991 Version)", "[Anthology Version]", "- Japanese Version", "Early Version" each name
+        // another recording when the query names none of them.
+        assertThat(score("Let Her Cry", "Let Her Cry (1991 Version)")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(score("Hey Baby", "Hey Baby [Anthology Version]")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(score("Song", "Song", candVersion = "Early Version")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        // The same name on both sides matches.
+        assertThat(score("Man's World (Australian Version)", "Man's World", candVersion = "Australian Version")).isEqualTo(1.0f)
+        // So does the query's album naming it.
+        assertThat(score("Man's World", "Man's World (Australian Version)", album = "Man's World (Australian Version)")).isEqualTo(1.0f)
+    }
+
+    @Test fun `a release label called a version still names the plain recording`() {
+        for (label in listOf("Album Version", "LP Version", "Original Version", "Mono Version", "Stereo Version", "2009 Remastered Version", "Explicit Version", "Video Version")) {
+            assertThat(score("Song", "Song", candVersion = label)).isEqualTo(1.0f)
+        }
+    }
+
+    @Test fun `a version named after the performer is their own recording`() {
+        // Filed that way on a covers compilation: "Smooth Operator (Meshell Ndegeocello Version)".
+        assertThat(byArtist("Meshell Ndegeocello", "Meshell Ndegeocello", candTitle = "Song (Meshell Ndegeocello Version)")).isEqualTo(1.0f)
+        // Another act's version is not.
+        assertThat(byArtist("Meshell Ndegeocello", "Meshell Ndegeocello", candTitle = "Song (Sade Version)")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+    }
+
+    @Test fun `a rework is another version`() {
+        assertThat(score("Jamming", "Jamming", candVersion = "FISHER Rework")).isLessThan(QobuzCandidateMatcher.MIN_CONFIDENCE)
+        assertThat(score("Parola - Rework", "Parola", candVersion = "Rework")).isEqualTo(1.0f)
+    }
 }

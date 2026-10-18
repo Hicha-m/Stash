@@ -139,15 +139,19 @@ class MatcherCorpusTest {
          * candidates came from raw-title searches, so this set cannot credit the parser's search gain
          * (catalog hit rate 61% -> 76% on YouTube rows).
          */
-        const val V1_MAX_WRONG = 10
+        // 2026-10-17: 10 -> 8 (a version the catalog names in its own words, "(Rare Version)", is another version).
+        const val V1_MAX_WRONG = 8
         const val V1_MAX_MISSES = 18
 
         /**
          * Ratchet for corpus v2 (3,682 songs, Deezer + Apple candidates, Fable-checked labels).
          * 2026-10-17: 54 / 108 -> 41 / 105 (YouTube rows keep every version they name; an official
          * audio row keeps the strict length rule; equal scores go to the closest reliable length).
+         * Then 41 -> 33: a version the catalog names in its own words ("(1979 Version)", "(Family
+         * Tree Version)") or a rework is another version, unless it names a release label or the
+         * performer.
          */
-        const val V2_MAX_WRONG = 41
+        const val V2_MAX_WRONG = 33
         const val V2_MAX_MISSES = 105
         const val REPORT_LIMIT = 400
     }
