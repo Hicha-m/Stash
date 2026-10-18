@@ -60,10 +60,14 @@ const ensured = new WeakMap();
 
 export default {
     fetch: (request, env, ctx) => handle(request, env, globalThis.fetch, Math.floor(Date.now() / 1000), ctx),
+    // The two prunes touch different databases and run independently: one failing never skips the other.
+    // A failure is still rethrown once both have run, so the cron run shows as failed in the dashboard.
     scheduled: async (event, env) => {
         const nowSec = Math.floor(Date.now() / 1000);
-        await prune(env.DB, nowSec);
-        await pruneUsage(env, nowSec); // never throws
+        const results = await Promise.allSettled([prune(env.DB, nowSec), pruneUsage(env, nowSec)]);
+        const failed = results.filter((r) => r.status === "rejected").map((r) => r.reason);
+        for (const e of failed) console.error(`scheduled prune failed: ${e?.message || e}`);
+        if (failed.length) throw failed[0];
     },
 };
 

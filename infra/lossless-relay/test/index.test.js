@@ -826,6 +826,27 @@ test("the hourly cron also prunes week-old usage rows", async () => {
     assert.equal(e.QUOTA_DB.raw.prepare("SELECT COUNT(*) AS n FROM usage").get().n, 1);
 });
 
+test("the cron's two prunes are independent: a relay-DB failure still prunes usage (and is rethrown), a QUOTA_DB failure still prunes the relay DB", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const errors = [];
+    const orig = console.error;
+    console.error = (...a) => errors.push(a.join(" "));
+    try {
+        const e = quotaEnv();
+        e.DB.batch = async () => { throw new Error("D1_ERROR: relay DB overloaded"); };
+        e.QUOTA_DB.raw.prepare("INSERT INTO usage (day, subject, n) VALUES ('2000-01-01', 'i:x', 1)").run();
+        await assert.rejects(worker.scheduled({}, e), /relay DB overloaded/);
+        assert.equal(e.QUOTA_DB.raw.prepare("SELECT COUNT(*) AS n FROM usage").get().n, 0, "usage pruned anyway");
+        assert.ok(errors.some((m) => /scheduled prune failed: D1_ERROR: relay DB overloaded/.test(m)));
+
+        const q = env({ QUOTA_DB: { prepare: () => { throw new Error("quota D1 down"); } } });
+        q.DB.raw.prepare("INSERT INTO quota (day, key, n) VALUES ('2000-01-01', 'global', 1), (?, 'global', 1)").run(today);
+        await worker.scheduled({}, q); // pruneUsage logs its own failure and never throws
+        assert.equal(q.DB.raw.prepare("SELECT COUNT(*) AS n FROM quota").get().n, 1, "relay DB pruned anyway");
+        assert.ok(errors.some((m) => /quota prune failed: quota D1 down/.test(m)));
+    } finally { console.error = orig; }
+});
+
 // ---- Supporter tokens (X-Stash-Entitlement) end to end, with a test keypair ----
 
 const KEYS = keypair();
