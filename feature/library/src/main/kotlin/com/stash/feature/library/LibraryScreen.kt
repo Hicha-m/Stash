@@ -265,6 +265,7 @@ fun LibraryScreen(
             onSearchQueryChanged = viewModel::setSearchQuery,
             onSortOrderChanged = viewModel::setSortOrder,
             onSourceFilterChanged = viewModel::setSourceFilter,
+            onLibraryOnlyChanged = viewModel::setLibraryOnly,
             onTrackClick = { track -> viewModel.playTrack(track, state.tracks) },
             onPlayNext = viewModel::playNext,
             onAddToQueue = viewModel::addToQueue,
@@ -577,6 +578,8 @@ private fun LibraryContent(
     onSearchQueryChanged: (String) -> Unit,
     onSortOrderChanged: (SortOrder) -> Unit,
     onSourceFilterChanged: (SourceFilter) -> Unit,
+    /** Artists and Albums' "In your library" choice (Stream only). */
+    onLibraryOnlyChanged: (Boolean) -> Unit = {},
     onTrackClick: (Track) -> Unit,
     onPlayNext: (Track) -> Unit,
     onAddToQueue: (Track) -> Unit,
@@ -775,25 +778,26 @@ private fun LibraryContent(
             clearSearch()
             onSourceFilterChanged(SourceFilter.ALL)
         }
+        // Artists and Albums: "Show everything" also drops "In your library".
+        val clearSearchAndLibraryOnly: () -> Unit = {
+            clearSearch()
+            if (state.libraryOnly) onLibraryOnlyChanged(false)
+        }
+        val artistsOrAlbums = state.activeTab == LibraryTab.ARTISTS || state.activeTab == LibraryTab.ALBUMS
 
         // -- Active source filter, on the tab it narrows. It's persisted and re-applied every
         // launch, and since the chip rows moved into the sheet nothing on screen showed it: a
         // FLAC filter from days ago left Songs at 40 of 5,000 with no hint why. Tap to clear.
         val activeFilterLabel = sourceFilterLabel(state.sourceFilter)
         if (activeFilterLabel != null && state.activeTab == LibraryTab.TRACKS) {
-            androidx.compose.material3.InputChip(
-                selected = true,
-                onClick = { onSourceFilterChanged(SourceFilter.ALL) },
-                label = { Text("Showing $activeFilterLabel only") },
-                trailingIcon = {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Clear filter",
-                        modifier = Modifier.size(18.dp),
-                    )
-                },
-                modifier = Modifier.padding(horizontal = 20.dp),
+            ActiveFilterChip(
+                label = "Showing $activeFilterLabel only",
+                onClear = { onSourceFilterChanged(SourceFilter.ALL) },
             )
+        }
+        // -- "In your library" on Artists and Albums, persisted the same way: shown while it narrows.
+        if (state.libraryOnly && artistsOrAlbums) {
+            ActiveFilterChip(label = "Showing your library only", onClear = { onLibraryOnlyChanged(false) })
         }
 
         // -- Category chips (pinned): Songs / Playlists / Artists / Albums. None is lit while On
@@ -823,6 +827,10 @@ private fun LibraryContent(
                 // The source filter narrows Songs only; offered elsewhere it looked broken.
                 showSourceFilter = state.activeTab == LibraryTab.TRACKS,
                 showAvailabilityFilter = state.streamingMode,
+                // Download lists only downloaded songs, all in the library already.
+                showLibraryOnly = state.streamingMode && artistsOrAlbums,
+                libraryOnly = state.libraryOnly,
+                onLibraryOnlySelected = onLibraryOnlyChanged,
                 // Scanned songs have no play counts.
                 showMostPlayed = state.activeTab != LibraryTab.DEVICE,
                 onSortSelected = onSortOrderChanged,
@@ -951,7 +959,7 @@ private fun LibraryContent(
                         onDeleteArtist = onDeleteArtist,
                         header = {},
                         noMatch = noMatchMessage("artists", state.searchQuery),
-                        onClearFilters = clearSearch,
+                        onClearFilters = clearSearchAndLibraryOnly,
                         alphabetical = alphabetical,
                     )
                     LibraryTab.ALBUMS -> AlbumsGrid(
@@ -963,7 +971,7 @@ private fun LibraryContent(
                         onOpenAlbum = onOpenAlbum,
                         header = {},
                         noMatch = noMatchMessage("albums", state.searchQuery),
-                        onClearFilters = clearSearch,
+                        onClearFilters = clearSearchAndLibraryOnly,
                         alphabetical = alphabetical,
                     )
                     LibraryTab.DEVICE -> Unit // shown above, outside the pager
@@ -974,6 +982,25 @@ private fun LibraryContent(
 }
 
 // ── Recently downloaded rail ─────────────────────────────────────────────────
+
+/** A persisted filter that narrows the open tab, said on screen: tap it (or its close icon) to clear. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ActiveFilterChip(label: String, onClear: () -> Unit) {
+    androidx.compose.material3.InputChip(
+        selected = true,
+        onClick = onClear,
+        label = { Text(label) },
+        trailingIcon = {
+            Icon(
+                imageVector = Icons.Default.Close,
+                contentDescription = "Clear filter",
+                modifier = Modifier.size(18.dp),
+            )
+        },
+        modifier = Modifier.padding(horizontal = 20.dp),
+    )
+}
 
 @Composable
 private fun RecentlyDownloadedRail(

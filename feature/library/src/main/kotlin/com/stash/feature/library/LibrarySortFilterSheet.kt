@@ -30,7 +30,8 @@ import com.stash.core.ui.components.CrispChipRow
  * The single Library "sort & filter" sheet (spec §2) — absorbs the two old
  * permanent chip rows. Sort options apply live; the source/FLAC filter uses the
  * shared [CrispChipRow]. Duration is offered only when the Songs chip is active
- * ([showDuration]).
+ * ([showDuration]). Artists and Albums in Stream only get a SHOW row instead
+ * ([showLibraryOnly]): Everything, or only the songs in your library.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -43,6 +44,10 @@ fun LibrarySortFilterSheet(
     /** Off for lists that have no play counts (All Songs). */
     showMostPlayed: Boolean = true,
     showAvailabilityFilter: Boolean = false,
+    /** The SHOW section: Artists and Albums in Stream only, Everything or In your library. */
+    showLibraryOnly: Boolean = false,
+    libraryOnly: Boolean = false,
+    onLibraryOnlySelected: (Boolean) -> Unit = {},
     onSortSelected: (SortOrder) -> Unit,
     onFilterSelected: (SourceFilter) -> Unit,
     onDismiss: () -> Unit,
@@ -115,9 +120,24 @@ fun LibrarySortFilterSheet(
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
                 )
             }
+
+            if (showLibraryOnly) {
+                SheetLabel("SHOW")
+                CrispChipRow(
+                    chips = listOf(SHOW_EVERYTHING, SHOW_IN_LIBRARY),
+                    selected = if (libraryOnly) SHOW_IN_LIBRARY else SHOW_EVERYTHING,
+                    onSelect = { label -> onLibraryOnlySelected(label == SHOW_IN_LIBRARY) },
+                    modifier = Modifier.padding(top = 4.dp, bottom = 8.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+                )
+            }
         }
     }
 }
+
+/** The SHOW choices on Artists and Albums (Stream only). */
+private const val SHOW_EVERYTHING = "Everything"
+private const val SHOW_IN_LIBRARY = "In your library"
 
 @Composable
 private fun SheetLabel(text: String) {

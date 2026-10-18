@@ -3,6 +3,7 @@ package com.stash.feature.library
 import com.stash.core.auth.TokenManager
 import com.stash.core.auth.model.AuthState
 import com.stash.core.data.db.dao.ArtistImageDao
+import com.stash.core.data.prefs.LibraryScopePreference
 import com.stash.core.data.prefs.StreamingPreference
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.media.PlayerRepository
@@ -367,6 +368,41 @@ class LibraryViewModelTest {
     }
 
     @Test
+    fun in_your_library_shows_in_Stream_only_and_Download_ignores_it() = runTest {
+        // The repository narrows the rows (MusicRepositoryLibraryScopeTest); the state only tells
+        // the sheet and the "Showing your library only" chip, which must stay hidden in Download.
+        for (streamOnly in listOf(false, true)) {
+            val musicRepo = musicRepoMock().stub {
+                on { getRecentlyAdded(any()) } doReturn flowOf(emptyList())
+                on { getLibraryTracksIncludingOnline() } doReturn flowOf(emptyList())
+            }
+            val vm = buildVm(
+                musicRepository = musicRepo,
+                streamingPreference = mock { on { enabled } doReturn flowOf(streamOnly) },
+                libraryScopePreference = mock { on { inLibraryOnly } doReturn flowOf(true) },
+            )
+
+            val state = vm.uiState.first { !it.isLoading }
+
+            assertEquals("streamOnly=$streamOnly", streamOnly, state.libraryOnly)
+        }
+    }
+
+    @Test
+    fun setLibraryOnly_saves_the_choice() = runTest {
+        val pref = mock<LibraryScopePreference> { on { inLibraryOnly } doReturn flowOf(false) }
+        val vm = buildVm(libraryScopePreference = pref)
+
+        vm.setLibraryOnly(true)
+        runCurrent()
+        verify(pref).setInLibraryOnly(true)
+
+        vm.setLibraryOnly(false)
+        runCurrent()
+        verify(pref).setInLibraryOnly(false)
+    }
+
+    @Test
     fun deleteArtist_deletes_only_the_downloaded_songs_on_the_card() = runTest {
         val own = Track(1L, "God's Plan", "Drake", isDownloaded = true, filePath = "/a")
         val ownCollab = Track(2L, "Jimmy Cooks", "Drake, 21 Savage", isDownloaded = true, filePath = "/b")
@@ -480,6 +516,7 @@ class LibraryViewModelTest {
         libraryPreferencesStore: LibraryPreferencesStore = libraryPreferencesStoreMock(),
         artistImageDao: ArtistImageDao = mock { on { observeAll() } doReturn flowOf(emptyList()) },
         connectivityMonitor: ConnectivityMonitor? = null,
+        libraryScopePreference: LibraryScopePreference? = null,
     ): LibraryViewModel = LibraryViewModel(
         musicRepository = musicRepository,
         playerRepository = playerRepository,
@@ -494,5 +531,6 @@ class LibraryViewModelTest {
         artistImageDao = artistImageDao,
         sharedMixRepository = org.mockito.kotlin.mock { on { observeActiveFollowedIds() }.thenReturn(kotlinx.coroutines.flow.flowOf(emptyList())) },
         connectivityMonitor = connectivityMonitor,
+        libraryScopePreference = libraryScopePreference,
     )
 }

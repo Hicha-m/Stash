@@ -123,6 +123,8 @@ class LibraryViewModel @Inject constructor(
     private val mirror: com.stash.core.data.weblink.mirror.MirrorEngine? = null,
     /** Offline, the artist and album cards play only downloaded songs (null in tests = online). */
     private val connectivityMonitor: com.stash.core.media.streaming.ConnectivityMonitor? = null,
+    /** Artists and Albums' "Show" choice in Stream only (null in tests = Everything). */
+    private val libraryScopePreference: com.stash.core.data.prefs.LibraryScopePreference? = null,
 ) : ViewModel() {
 
     /** The playlist mirrors with Stash on the web: deleting it asks Everywhere / Only here (spec §2.4). */
@@ -509,8 +511,15 @@ class LibraryViewModel @Inject constructor(
         libraryState.copy(
             currentlyPlayingTrackId = playerState.currentTrack?.id,
         )
-    }.combine(streamingPreference.enabled) { libraryState, streaming ->
-        libraryState.copy(streamingMode = streaming)
+    }.combine(
+        combine(
+            streamingPreference.enabled,
+            libraryScopePreference?.inLibraryOnly ?: flowOf(false),
+        ) { streaming, inLibraryOnly -> streaming to inLibraryOnly },
+    ) { libraryState, (streaming, inLibraryOnly) ->
+        // The repository applies "In your library" to the artist and album rows in Stream only
+        // (MusicRepositoryImpl.libraryScope); this only tells the sheet and the chip.
+        libraryState.copy(streamingMode = streaming, libraryOnly = streaming && inLibraryOnly)
     }.combine(artistImageDao.observeAll()) { libraryState, images ->
         // Overlay real artist photos (ArtistImageBackfillWorker output) keyed
         // by the SAME primary-artist name the Artists tab groups by. Artists
@@ -667,6 +676,14 @@ class LibraryViewModel @Inject constructor(
         sourceFilterUserSet = true
         _controls.update { it.copy(sourceFilter = filter) }
         viewModelScope.launch { libraryPreferencesStore.setSourceFilter(filter) }
+    }
+
+    /**
+     * Artists and Albums' "Show" choice in Stream only: true = "In your library" (the songs Songs
+     * lists), false = "Everything". Saved for every launch; the artist and album pages follow it.
+     */
+    fun setLibraryOnly(libraryOnly: Boolean) {
+        viewModelScope.launch { libraryScopePreference?.setInLibraryOnly(libraryOnly) }
     }
 
     /**

@@ -41,6 +41,12 @@ data class LibraryUiState(
 
     /** Stream-only mode: Songs shows online rows too, and the Downloaded/Online filter is offered. */
     val streamingMode: Boolean = false,
+
+    /**
+     * Stream only's "In your library" choice for Artists and Albums: they, their counts and the
+     * pages they open list only the songs Songs lists. Always false in Download, which ignores it.
+     */
+    val libraryOnly: Boolean = false,
 )
 
 /** Tabs available in the library browser. LIKED sits between Songs and Playlists. */
