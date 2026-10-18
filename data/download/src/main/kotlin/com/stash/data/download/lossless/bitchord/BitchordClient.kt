@@ -287,12 +287,11 @@ class BitchordClient @Inject constructor(
                         else -> return@withContext TidalLookup.Failed
                     }
                     val tracks = json.decodeFromString<BitchordSearchResponse>(body).tracks
-                    val best = tracks
-                        .asSequence()
-                        .filter { it.id.startsWith("td:") && it.audioQuality in LOSSLESS_TIERS }
-                        .map { it to confidence(query, it) }
-                        .filter { it.second >= QobuzCandidateMatcher.MIN_CONFIDENCE }
-                        .maxByOrNull { it.second }
+                    val best = QobuzCandidateMatcher.pickBest(
+                        query,
+                        tracks.filter { it.id.startsWith("td:") && it.audioQuality in LOSSLESS_TIERS }
+                            .map { it to confidence(query, it) },
+                    ) { it.duration }
                     if (best == null) {
                         Log.d(TAG, "no confident match among ${tracks.size} for '${query.artist} - ${query.title}'")
                         writeCache(TidalMatchEntity(key = key, tidalId = null, searchedAt = nowMs()))
@@ -459,6 +458,7 @@ class BitchordClient @Inject constructor(
             candIsrc = t.isrc,
             candDurationSec = t.duration,
             candStreamable = true,
+            candAlbum = t.album.takeIf { it.isNotBlank() },
         )
 
     /** One relay answer, sorted by what the caller must do about it. */

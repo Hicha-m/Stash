@@ -123,10 +123,7 @@ class QbdlxQobuzSource @Inject constructor(
         try {
             for (answer in answers) {
                 val candidates = answer.await().getOrThrow() ?: continue
-                val match = candidates
-                    .map { it to confidence(query, it) }
-                    .filter { it.second >= QobuzCandidateMatcher.MIN_CONFIDENCE }
-                    .maxByOrNull { it.second }
+                val match = QobuzCandidateMatcher.pickBest(query, candidates.map { it to confidence(query, it) }) { it.duration }
                 if (match != null) return@supervisorScope match
             }
             null
@@ -163,6 +160,7 @@ class QbdlxQobuzSource @Inject constructor(
             candDurationSec = candidate.duration,
             candStreamable = candidate.streamable,
             candVersion = candidate.version,
+            candAlbum = candidate.album?.title,
         )
 
     /**

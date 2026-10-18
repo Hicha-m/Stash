@@ -14,6 +14,7 @@ import com.stash.data.download.BuildConfig
 import com.stash.data.download.files.AlbumArtCache
 import com.stash.data.download.files.FileOrganizer
 import com.stash.data.download.files.MetadataEmbedder
+import com.stash.data.download.lossless.forLibrarySource
 import com.stash.data.download.lyrics.LyricsFetchTrigger
 import com.stash.data.download.jiosaavn.JioSaavnResolver
 import com.stash.data.download.jiosaavn.toJioSaavnKbps
@@ -578,7 +579,10 @@ class DownloadManager @Inject constructor(
             durationMs = track.durationMs.takeIf { it > 0 },
             explicit = track.explicit,
             trackId = track.id,
-        )
+        ).forLibrarySource(track.source, track.musicVideoType)
+        // Unlike Tidal AAC, this rung runs for a YouTube video row too: JioSaavnMatcher ignores
+        // durationReliable and only matches within the same max(8 s, 3%) of the row's length that
+        // [downloadLossyAac] checks, so a match here is never fetched to be thrown away.
 
         val match = try {
             // The Download quality picker sets the JioSaavn variant too.
@@ -603,7 +607,16 @@ class DownloadManager @Inject constructor(
             durationMs = track.durationMs.takeIf { it > 0 },
             explicit = track.explicit,
             trackId = track.id,
-        )
+        ).forLibrarySource(track.source, track.musicVideoType)
+        // A YouTube music-video row: its length is the video's, which the matcher allows 40% off,
+        // but [downloadLossyAac] keeps only a file within max(8 s, 3%) of it. The relay would be
+        // asked, the file fetched and always thrown away (and the 30-day match cache repeats it).
+        // YouTube itself is this row's lossy source; FLAC (no length check past a preview stub)
+        // was already tried above.
+        if (!query.durationReliable) {
+            Log.d(TAG, "Tidal AAC skipped for '${track.artist} - ${track.title}': video length, no way to verify the file")
+            return null
+        }
         val match = try {
             tidalAacResolver.resolve(query)
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -719,7 +732,7 @@ class DownloadManager @Inject constructor(
             explicit = track.explicit,
             spotifyUri = track.spotifyUri,
             trackId = track.id,
-        )
+        ).forLibrarySource(track.source, track.musicVideoType)
 
         // Bounded failover loop: the duration backstop can reject a degraded
         // source's preview-stub and record it degraded, after which the

@@ -12,6 +12,7 @@ import com.stash.data.download.lossless.SourceResult
 import com.stash.data.download.lossless.TrackQuery
 import com.stash.data.download.lossless.searchTerms
 import com.stash.data.download.lossless.qobuz.QobuzApiException
+import com.stash.data.download.lossless.qobuz.QobuzCandidateMatcher
 import com.stash.data.download.lossless.qobuz.QobuzQuality
 import com.stash.data.download.lossless.qobuz.QobuzSource
 import com.stash.data.download.lossless.qobuz.QobuzTrack
@@ -118,7 +119,7 @@ class KennyySource @Inject constructor(
             if (candidates.isEmpty()) continue
 
             val scored = candidates.map { it to confidence(query, it) }
-            val match = scored.filter { it.second >= MIN_CONFIDENCE }.maxByOrNull { it.second }
+            val match = QobuzCandidateMatcher.pickBest(query, scored) { it.duration }
             if (match != null) {
                 found = match
                 break

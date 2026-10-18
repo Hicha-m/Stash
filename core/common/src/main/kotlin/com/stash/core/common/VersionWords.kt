@@ -60,6 +60,75 @@ object VersionWords {
             .map { fold(it.value) }
             .toSet()
 
+    /**
+     * Words only the lossless matcher reads as versions, on top of [of]: "Re-recording", "Outtake",
+     * "Performance", "Concert", "A COLORS SHOW", "Rework". They name another take of a song as surely as
+     * "Live" does, so a catalog lookup must not trade one for the studio cut (or the reverse). They
+     * stay out of [WORDS] because the library's same-song rule ([TrackCanonical]) reads that list,
+     * and the library's identity must not move with the matcher.
+     */
+    private val MATCH_ONLY_WORDS = Regex("\\b(re-?recording|outtakes?|performance|concert|colors show|rework(?:s|ed)?)\\b")
+
+    /**
+     * [of] plus [MATCH_ONLY_WORDS], folded the same way: a performance, a concert or a COLORS show
+     * is a live take ("live"), a re-recording is "re-recorded", a rework is "rework". Plus any
+     * version the catalog names in its own words ("(Australian Version)": [namedVersions]). For the
+     * lossless matcher only.
+     *
+     * @param text the parts of a title that may name a version, in any case.
+     */
+    fun forCatalogMatch(text: String): Set<String> {
+        val extra = MATCH_ONLY_WORDS.findAll(text.lowercase()).map {
+            when {
+                it.value.startsWith("rework") -> "rework"
+                it.value.startsWith("re") -> "re-recorded"
+                it.value.startsWith("outtake") -> "outtake"
+                else -> "live"
+            }
+        }
+        return of(text) + extra + namedVersions(text)
+    }
+
+    /**
+     * A version the catalog names in words of its own: "(Australian Version)", "[1991 Version]",
+     * " - Japanese Version", or Qobuz's version field "Early Version". Each is folded to its words
+     * ("australian version"), so it only matches the same name on the other side. A neutral release
+     * label ([NEUTRAL_VERSION_WORDS]: "Album Version", "2011 Remastered Version", "Mono Version")
+     * and a version already named by [of] ("Live Version", "Taylor's Version") name nothing here.
+     *
+     * Each bracket group, dash suffix and the text outside them is read on its own, so
+     * "(Remastered) Australian Version" still finds "australian".
+     */
+    private fun namedVersions(text: String): Set<String> =
+        text.lowercase().split(SEGMENT_BREAK).mapNotNullTo(mutableSetOf()) { segment ->
+            val before = NAMED_VERSION.find(segment)?.groupValues?.get(1) ?: return@mapNotNullTo null
+            val words = before.replace(NOT_WORD, " ").split(' ').filter { it.isNotEmpty() }
+            val label = words.filterNot { it in NEUTRAL_VERSION_WORDS }
+            when {
+                label.isEmpty() -> null
+                // A year beside a neutral word is a reissue ("2011 Remastered Version").
+                label.size < words.size && label.all { w -> w.all(Char::isDigit) } -> null
+                of(segment).isNotEmpty() || MATCH_ONLY_WORDS.containsMatchIn(segment) -> null
+                else -> words.joinToString(" ") + " version"
+            }
+        }
+
+    /** Where one versioned part of a title ends: a bracket or a spaced dash. */
+    private val SEGMENT_BREAK = Regex("[()\\[\\]]|\\s[-–—]\\s")
+
+    /** The words before "version" in one segment. */
+    private val NAMED_VERSION = Regex("^(.*?)\\bversion\\b")
+
+    private val NOT_WORD = Regex("[^\\p{L}\\p{N}]+")
+
+    /** Release labels that call the plain recording a "version": "Album Version", "LP Version"... */
+    private val NEUTRAL_VERSION_WORDS = setOf(
+        "album", "original", "single", "explicit", "clean", "main", "lp", "stereo", "mono", "radio",
+        "remastered", "remaster", "digital", "digitally", "mastered", "edit", "edited", "short", "45",
+        "7", "uncensored", "censored", "uncut", "banned", "official", "video", "standard", "deluxe", "ep",
+        "the", "studio", "full", "length", "hq", "hd", "best", "chamber",
+    )
+
     /** One spelling per word, so two titles that name it differently still compare equal. */
     private fun fold(word: String): String = when {
         word == "remix" -> "mix"

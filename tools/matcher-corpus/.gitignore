@@ -1,0 +1,18 @@
+# Local working files for building the matcher test sets (see README.md). The corpora
+# themselves are written to data/download/src/test/resources/, never here.
+
+# The library database pulled from a debug install (with its -wal / -shm).
+stash.db*
+*.db
+*.db-wal
+*.db-shm
+
+node_modules/
+
+# Intermediate outputs the scripts write: queries, candidates, labels, trial runs, batch ids.
+*.json
+*.json.gz
+*.jsonl
+*.txt
+!package.json
+!package-lock.json
