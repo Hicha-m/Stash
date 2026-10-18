@@ -79,7 +79,9 @@ Code: `src/quota.js` (an identical copy lives in `tidal-worker/src/quota.js`).
   without the table a supporter's counter read fails and that request is served with the counter off.
 - **Off switch:** no `QUOTA_DB` binding → the counter is skipped (one `QUOTA_DB not bound` warning per isolate). A D1
   error on the counter also skips it for that request: the counter never stops a mint. A race can serve one or two
-  past the limit.
+  past the limit. `QUOTA_DB` bound but a migration never applied: the counter fails open the same way (off; or, with
+  only `revoked_tokens` missing, off for supporter-token requests alone), logged once per isolate rather than on
+  every request; applying the migrations takes effect as isolates recycle (redeploy to apply at once).
 - `INSTALL_DAILY_CAP` (`rate_limited`, also counts 404s, but not cache hits) stays as this relay's own per-install cap and
   abuse telemetry (supporters under their ceiling skip it); the network, /48, global and account caps are unchanged and
   still apply to everyone.

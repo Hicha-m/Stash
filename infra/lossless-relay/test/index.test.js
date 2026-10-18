@@ -817,6 +817,74 @@ test("a QUOTA_DB failure never stops a mint: served without counter headers", as
     assert.equal(r.headers.get("X-Stash-Lossless"), null);
 });
 
+/** Runs `fn` with console.error captured; returns the lines it logged. */
+async function errorsDuring(fn) {
+    const lines = [];
+    const orig = console.error;
+    console.error = (...a) => lines.push(a.map(String).join(" "));
+    try { await fn(); } finally { console.error = orig; }
+    return lines;
+}
+
+test("QUOTA_DB bound but never migrated: mints fail open with the counter off, and it is logged once, not per request", async () => {
+    const e = quotaEnv();
+    e.QUOTA_DB.raw.exec("DROP TABLE usage; DROP TABLE revoked_tokens");
+    const q = qobuzByToken(new Set());
+    const lines = await errorsDuring(async () => {
+        for (let i = 0; i < 5; i++) {
+            const r = await handle(mintReq(100 + i, 27), e, q, NOW + i);
+            assert.equal(r.status, 200);
+            assert.equal(r.headers.get("X-Stash-Lossless"), null);
+        }
+        const s = await handle(quotaReq(), e, q, NOW);
+        assert.equal(s.status, 404);
+        assert.deepEqual(await s.json(), { error: "quota_off" });
+    });
+    assert.equal(lines.filter((l) => /quota read failed/.test(l)).length, 1, lines.join("\n"));
+    assert.equal(lines.filter((l) => /stash-quota has no usage and revoked_tokens table/.test(l)).length, 1, lines.join("\n"));
+    assert.equal(lines.length, 2, lines.join("\n"));
+});
+
+test("only revoked_tokens missing: free requests are still counted; a supporter's read fails open, logged once", async () => {
+    const e = quotaEnv();
+    e.QUOTA_DB.raw.exec("DROP TABLE revoked_tokens");
+    const q = qobuzByToken(new Set());
+    const original = hooks.entitlementOf;
+    let lines;
+    try {
+        lines = await errorsDuring(async () => {
+            assert.equal((await handle(mintReq(100, 27), e, q, NOW)).headers.get("X-Stash-Lossless"), "1/500");
+            hooks.entitlementOf = async () => ({ tid: "0123456789abcdef0123456789abcdef" });
+            for (let i = 1; i <= 3; i++) {
+                const r = await handle(mintReq(100 + i, 27), e, q, NOW + i);
+                assert.equal(r.status, 200);
+                assert.equal(r.headers.get("X-Stash-Lossless"), null, "a supporter read can't run: counter off");
+            }
+            hooks.entitlementOf = async () => null;
+            assert.equal((await handle(mintReq(200, 27), e, q, NOW + 10)).headers.get("X-Stash-Lossless"), "2/500", "free requests still counted");
+        });
+    } finally { hooks.entitlementOf = original; }
+    assert.equal(lines.filter((l) => /quota read failed/.test(l)).length, 1, lines.join("\n"));
+    assert.equal(lines.filter((l) => /stash-quota has no revoked_tokens table/.test(l)).length, 1, lines.join("\n"));
+    assert.equal(lines.length, 2, lines.join("\n"));
+});
+
+test("a transient QUOTA_DB failure with the tables present is not mistaken for missing tables: the next read counts", async () => {
+    const e = quotaEnv();
+    const real = e.QUOTA_DB.prepare.bind(e.QUOTA_DB);
+    let failNext = true;
+    e.QUOTA_DB.prepare = (sql) => {
+        if (failNext && /FROM usage/.test(sql)) { failNext = false; throw new Error("D1_ERROR: overloaded"); }
+        return real(sql);
+    };
+    const q = qobuzByToken(new Set());
+    const lines = await errorsDuring(async () => {
+        assert.equal((await handle(mintReq(100, 27), e, q, NOW)).headers.get("X-Stash-Lossless"), null);
+        assert.equal((await handle(mintReq(101, 27), e, q, NOW + 1)).headers.get("X-Stash-Lossless"), "1/500");
+    });
+    assert.deepEqual(lines.filter((l) => /stash-quota has no/.test(l)), []);
+});
+
 test("the hourly cron also prunes week-old usage rows", async () => {
     const e = quotaEnv();
     const put = e.QUOTA_DB.raw.prepare("INSERT INTO usage (day, subject, n) VALUES (?, 'i:x', 1)");

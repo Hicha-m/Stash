@@ -27,7 +27,7 @@
  */
 import { createHmac } from "node:crypto";
 import { verifyMint, verifyQuota } from "./auth.js";
-import { readStanding, spendLossless, losslessHeaders, capAnswer, quotaBody, pruneUsage } from "./quota.js";
+import { readStanding, spendLossless, losslessHeaders, capAnswer, quotaBody, pruneUsage, hooks } from "./quota.js";
 import { mintFromQobuz } from "./qobuz.js";
 import {
     getCached, putCachedStmt, readQuota, readQuotas, bumpQuotaStmt,
@@ -125,7 +125,7 @@ async function mint(request, url, env, fetchImpl, nowSec, ctx) {
     // The daily lossless counter, shared with the Tidal relay. Checked before any answer, before the
     // cache and the pool are touched: a cache HIT is still a lossless stream for the user, so it counts
     // too. Off (null) without QUOTA_DB. Only the check waits; the bump runs after the answer (spendAfter).
-    const standing = await readStanding(request, env, "i:" + install, nowSec);
+    const standing = await standingOf(request, env, "i:" + install, nowSec);
     if (standing?.over) {
         const cap = capAnswer(standing, nowSec);
         return json(cap.body, cap.status, cap.headers);
@@ -249,9 +249,55 @@ async function quota(request, env, nowSec) {
         const { success } = await env.MINT_RL.limit({ key: networkOf(h("CF-Connecting-IP")) });
         if (!success) return json({ error: "rate_limited" }, 429, { "Retry-After": "60" });
     }
-    const standing = await readStanding(request, env, "i:" + install, nowSec);
+    const standing = await standingOf(request, env, "i:" + install, nowSec);
     if (!standing) return json({ error: "quota_off" }, 404);
     return json(quotaBody(standing), 200, { ...losslessHeaders(standing), "Cache-Control": "no-store" });
+}
+
+/** Per QUOTA_DB binding (one per isolate in production): the stash-quota tables found missing, once a read failed on them. */
+const missingQuotaTables = new WeakMap();
+
+/**
+ * readStanding, but quiet about a stash-quota database whose migrations were never applied. quota.js logs every
+ * failed read, so with QUOTA_DB bound and its tables missing every request logged one. The first failed read
+ * here looks the tables up; when one is missing the relay says so once and from then on skips only the reads
+ * that can only fail, failing open exactly as a failed read does:
+ *   no `usage`          → every read fails: the counter is off for every request;
+ *   no `revoked_tokens` → only a valid supporter token's read joins it: that request is served with the counter
+ *                          off, while free requests are counted as usual.
+ * Any other failure (a transient D1 error) is left to quota.js, logged and failed open per request as before.
+ * Applying the migrations takes effect as isolates recycle; a redeploy applies it at once.
+ */
+async function standingOf(request, env, subject, nowSec) {
+    const db = env.QUOTA_DB;
+    const missing = db ? missingQuotaTables.get(db) : undefined;
+    if (missing) {
+        if (missing.usage) return null;
+        if (missing.revoked && (await hooks.entitlementOf(request, env, nowSec))) return null;
+        return readStanding(request, env, subject, nowSec);
+    }
+    const standing = await readStanding(request, env, subject, nowSec);
+    if (standing || !db || !subject) return standing; // counted, or off by design (no binding, no subject)
+    const found = await quotaTablesMissing(db);
+    if (found) {
+        missingQuotaTables.set(db, found);
+        const names = [found.usage && "usage", found.revoked && "revoked_tokens"].filter(Boolean).join(" and ");
+        console.error(`stash-quota has no ${names} table: the daily lossless counter fails open (${found.usage ? "off" : "off for supporter tokens"}) `
+            + "until infra/lossless-quota/migrations are applied; logged once per isolate");
+    }
+    return null;
+}
+
+/** `{ usage, revoked }` (true = that table is missing), or null when both exist or the lookup itself fails. */
+async function quotaTablesMissing(db) {
+    try {
+        const { results } = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('usage', 'revoked_tokens')").all();
+        const names = new Set((results || []).map((r) => r.name));
+        const missing = { usage: !names.has("usage"), revoked: !names.has("revoked_tokens") };
+        return missing.usage || missing.revoked ? missing : null;
+    } catch {
+        return null; // D1 itself is failing: a transient, not a schema problem
+    }
 }
 
 /**
