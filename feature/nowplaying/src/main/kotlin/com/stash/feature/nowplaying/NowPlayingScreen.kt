@@ -86,8 +86,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.painter.ColorPainter
@@ -104,8 +104,6 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
-import coil3.compose.AsyncImagePainter
-import coil3.toBitmap
 import com.stash.core.model.RepeatMode
 import com.stash.core.model.isFlac
 import com.stash.core.model.isScannedSong
@@ -115,7 +113,8 @@ import com.stash.core.ui.theme.LocalIsAmoledTheme
 import com.stash.feature.nowplaying.ui.AmbientBackground
 import com.stash.feature.nowplaying.ui.GlowingProgressBar
 import com.stash.feature.nowplaying.ui.LiveLyricsBar
-import com.stash.feature.nowplaying.ui.npAccent
+import com.stash.feature.nowplaying.ui.WithAlbumChrome
+import com.stash.core.ui.ambient.LocalAlbumChrome
 import com.stash.feature.nowplaying.ui.npInk
 import com.stash.feature.nowplaying.ui.QueueBottomSheet
 import com.stash.feature.nowplaying.ui.SwipeableArt
@@ -126,7 +125,8 @@ import com.stash.feature.nowplaying.ui.hasPreviousInQueue
  * Full-screen Now Playing screen with premium visual design.
  *
  * Displays album art with ambient background, playback controls, progress bar,
- * and track information. Colors are extracted from album art via Palette API.
+ * and track information. The album colours are the app-wide ones (LocalAlbumChrome), the same
+ * the mini player wears.
  * The ambient ground + inks follow the app theme: near-black with drifting
  * art-derived orbs in dark, the same orbs as a pastel wash over lavender
  * paper in light.
@@ -277,11 +277,11 @@ fun NowPlayingScreen(
     }
 
     // Queue bottom sheet
-    if (showQueue) {
+    if (showQueue) WithAlbumChrome { chrome ->
         QueueBottomSheet(
             queue = uiState.queue,
             currentIndex = uiState.currentIndex,
-            accentColor = npAccent(uiState.vibrantColor),
+            accentColor = chrome.ink,
             source = uiState.source,
             isShuffleEnabled = uiState.shuffleEnabled,
             onDismiss = { showQueue = false },
@@ -338,11 +338,12 @@ fun NowPlayingScreen(
     val reading = lyricsMode && track != null
     androidx.activity.compose.BackHandler(enabled = reading) { viewModel.onDismissLyrics() }
 
-    // The ambient palette's source is the art Coil loads. In lyrics mode the big art isn't
-    // composed, so the compact cover reports instead, but only for a cover not yet sampled.
-    // Both covers share one decode (rememberNpArtRequest), so the colours match either way.
-    var paletteArtModel by remember { mutableStateOf<Any?>(null) }
+    // The album colours come from LocalAlbumChrome (the app-wide palette the mini player wears
+    // too), not from the art this screen loads; both covers share one decode (rememberNpArtRequest).
     val artModel: Any? = track?.albumArtPath ?: track?.albumArtUrl
+    // The holder only (no colour read here): each reader takes its colour where it draws, so the
+    // 800 ms crossfade on a song change never recomposes the whole screen.
+    val chrome = LocalAlbumChrome.current
 
     // -- Actions: where each shows (pinned row or ⋮ menu) and what it does. Everything the top
     // row reads is remembered on what it depends on, so the 250ms position tick that recomposes
@@ -715,16 +716,12 @@ fun NowPlayingScreen(
         // system navigation bar (the scaffold hides the tab bar on this route).
         if (ambientAnimationEnabled) when (ambientStyle) {
             com.stash.core.data.prefs.AmbientStyle.SOFT_GLOW -> AmbientBackground(
-                palette = uiState.ambientPalette,
                 lightMode = MaterialTheme.colorScheme.background.luminance() >= 0.5f,
                 amoledMode = LocalIsAmoledTheme.current,
                 modifier = Modifier.fillMaxSize(),
             )
-            // Settings > Appearance > Ambient style: the original ambient, unchanged.
+            // Settings > Appearance > Ambient style: the original orbs, in the same album colours.
             com.stash.core.data.prefs.AmbientStyle.CLASSIC -> com.stash.feature.nowplaying.ui.ClassicAmbientBackground(
-                dominantColor = uiState.dominantColor,
-                vibrantColor = uiState.vibrantColor,
-                mutedColor = uiState.mutedColor,
                 lightMode = MaterialTheme.colorScheme.background.luminance() >= 0.5f,
                 amoledMode = LocalIsAmoledTheme.current,
                 modifier = Modifier.fillMaxSize(),
@@ -743,7 +740,7 @@ fun NowPlayingScreen(
                 // -- Progress bar --
                 GlowingProgressBar(
                     progress = { progressFraction(playerPosition.value, uiState.durationMs) },
-                    accentColor = npAccent(uiState.vibrantColor),
+                    accentColor = { chrome.accent },
                     elapsedMs = { playerPosition.value },
                     totalMs = uiState.durationMs,
                     onSeek = viewModel::onSeekTo,
@@ -753,7 +750,7 @@ fun NowPlayingScreen(
                         if (isListener) {
                             com.stash.feature.nowplaying.listen.LivePill(
                                 pausedLocally = room.pausedLocally,
-                                accent = npAccent(uiState.vibrantColor),
+                                accent = chrome.accent,
                                 ink = npInk(),
                                 onRejoin = together::rejoin,
                             )
@@ -772,7 +769,6 @@ fun NowPlayingScreen(
                     isBuffering = uiState.isBuffering && (uiState.playWhenReady || uiState.isPlaying),
                     shuffleEnabled = uiState.shuffleEnabled,
                     repeatMode = uiState.repeatMode,
-                    accentColor = npAccent(uiState.vibrantColor),
                     onPlayPauseClick = viewModel::onPlayPauseClick,
                     onSkipNext = viewModel::onSkipNext,
                     onSkipPrevious = viewModel::onSkipPrevious,
@@ -795,28 +791,30 @@ fun NowPlayingScreen(
                     .padding(horizontal = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                NowPlayingTopBar(
-                    fit = rowFit,
-                    visualState = visualState,
-                    hasTrack = uiState.hasTrack,
-                    isDownloading = isDownloadingCurrent,
-                    radioLock = radioLock,
-                    ink = npInk(),
-                    accent = npAccent(uiState.vibrantColor),
-                    // In lyrics mode Dismiss goes back to the art, like back and the cover.
-                    dismissDescription = if (reading) "Back to the cover" else "Dismiss",
-                    onDismiss = if (reading) viewModel::onDismissLyrics else onDismiss,
-                    onMoreClick = { showOptionsSheet = true },
-                    onAction = onPinnedAction,
-                    castButton = {
-                        com.stash.feature.nowplaying.cast.CastButton(
-                            connection = castConnection,
-                            tint = npInk(),
-                            accentColor = npAccent(uiState.vibrantColor),
-                            onClick = { showCastSheet = true },
-                        )
-                    },
-                )
+                WithAlbumChrome { topChrome ->
+                    NowPlayingTopBar(
+                        fit = rowFit,
+                        visualState = visualState,
+                        hasTrack = uiState.hasTrack,
+                        isDownloading = isDownloadingCurrent,
+                        radioLock = radioLock,
+                        ink = npInk(),
+                        accent = topChrome.accent,
+                        // In lyrics mode Dismiss goes back to the art, like back and the cover.
+                        dismissDescription = if (reading) "Back to the cover" else "Dismiss",
+                        onDismiss = if (reading) viewModel::onDismissLyrics else onDismiss,
+                        onMoreClick = { showOptionsSheet = true },
+                        onAction = onPinnedAction,
+                        castButton = {
+                            com.stash.feature.nowplaying.cast.CastButton(
+                                connection = castConnection,
+                                tint = npInk(),
+                                accentColor = topChrome.accent,
+                                onClick = { showCastSheet = true },
+                            )
+                        },
+                    )
+                }
                 if (room != null) {
                     com.stash.feature.nowplaying.listen.SessionBar(
                         room = room,
@@ -888,11 +886,6 @@ fun NowPlayingScreen(
                                         AlbumArtSection(
                                             albumArtUrl = track?.albumArtUrl,
                                             albumArtPath = track?.albumArtPath,
-                                            accentColor = npAccent(uiState.vibrantColor),
-                                            onBitmapLoaded = { bitmap ->
-                                                paletteArtModel = artModel
-                                                viewModel.onAlbumArtLoaded(bitmap)
-                                            },
                                             modifier = swipeModifier,
                                         )
                                     }
@@ -915,7 +908,6 @@ fun NowPlayingScreen(
                                     onTrackInfoTapped = viewModel::onTrackInfoTapped,
                                     sleepTimerState = sleepTimerState,
                                     onSleepTimerClick = { showSleepTimerSheet = true },
-                                    accent = npAccent(uiState.vibrantColor),
                                     isLiked = uiState.currentTrack?.stashLikedAt != null,
                                     onLikeTap = viewModel::onLikeTap,
                                 )
@@ -967,15 +959,17 @@ fun NowPlayingScreen(
                             // screens (the scaffold hides MiniPlayer on this route), directly
                             // above the nav bar. Zero-height when Hidden, so the content
                             // column keeps the full screen for lyric-less tracks.
-                            LiveLyricsBar(
-                                state = lyricsState,
-                                currentPositionMs = { lyricsPosition.value },
-                                accentColor = npAccent(uiState.vibrantColor),
-                                liveEnabled = liveLyricsEnabled,
-                                onTap = viewModel::onShowLyrics,
-                                isPlaying = uiState.isPlaying && !uiState.isBuffering,
-                                playbackSpeed = playbackSpeed,
-                            )
+                            WithAlbumChrome { barChrome ->
+                                LiveLyricsBar(
+                                    state = lyricsState,
+                                    currentPositionMs = { lyricsPosition.value },
+                                    accentColor = barChrome.ink,
+                                    liveEnabled = liveLyricsEnabled,
+                                    onTap = viewModel::onShowLyrics,
+                                    isPlaying = uiState.isPlaying && !uiState.isBuffering,
+                                    playbackSpeed = playbackSpeed,
+                                )
+                            }
                         }
                     } else {
                         // -- Lyrics mode: the web's phone layout. A compact header, the lyrics
@@ -986,7 +980,6 @@ fun NowPlayingScreen(
                             // its enter/exit modifiers are remembered, so the 250ms position tick
                             // that recomposes this screen skips the header and its marquees.
                             val headerInk = npInk()
-                            val headerAccent = npAccent(uiState.vibrantColor)
                             val headerLiked = uiState.currentTrack?.stashLikedAt != null
                             val lyricsMenuItems = lyricsMenuItemsFor(
                                     lyricsState,
@@ -1010,12 +1003,6 @@ fun NowPlayingScreen(
                                 cover = {
                                     CompactCover(
                                         artModel = artModel,
-                                        onBitmapLoaded = { bitmap ->
-                                            if (artModel != paletteArtModel) {
-                                                paletteArtModel = artModel
-                                                viewModel.onAlbumArtLoaded(bitmap)
-                                            }
-                                        },
                                         onClick = { viewModel.onDismissLyrics() },
                                         modifier = artShared,
                                     )
@@ -1032,7 +1019,7 @@ fun NowPlayingScreen(
                                 SleepTimerButton(
                                     state = sleepTimerState,
                                     onClick = { showSleepTimerSheet = true },
-                                    activeTint = headerAccent,
+                                    activeTint = chrome.accent,
                                     idleTint = headerInk.copy(alpha = 0.7f),
                                     buttonSize = 48.dp,
                                     iconSize = 22.dp,
@@ -1069,7 +1056,7 @@ fun NowPlayingScreen(
                                 onSeek = { if (!isListener) viewModel.onLyricsLineSeek(it) }, // a listener follows the room
                                 onRetry = viewModel::onLyricsRetry,
                                 ink = npInk(),
-                                accent = npAccent(uiState.vibrantColor),
+                                accent = { chrome.ink },
                                 light = npIsLight(),
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1087,7 +1074,7 @@ fun NowPlayingScreen(
         if (room != null) com.stash.feature.nowplaying.listen.FloatingReactions(together.reactions, animate = ambientAnimationEnabled, modifier = Modifier.fillMaxSize())
     }
 
-    if (showOptionsSheet && track != null) {
+    if (showOptionsSheet && track != null) WithAlbumChrome { sheetChrome ->
         NowPlayingOptionsSheet(
             // Pins with no room in the row this frame come back here as ordinary rows.
             menu = menuActions(pins, actionCtx, rowFit.overflow),
@@ -1097,7 +1084,7 @@ fun NowPlayingScreen(
             hiddenReason = { action ->
                 hiddenReason(action, actionCtx) ?: OVERFLOW_NOTE.takeIf { action in rowFit.overflow }
             },
-            accent = npAccent(uiState.vibrantColor),
+            accent = sheetChrome.ink,
             onAction = { action -> onAction(action); showOptionsSheet = false },
             onTogglePin = viewModel::onTogglePin,
             onResetPins = viewModel::onResetPins,
@@ -1266,7 +1253,6 @@ private fun TrackInfoBlock(
     onTrackInfoTapped: () -> Unit,
     sleepTimerState: SleepTimerController.State,
     onSleepTimerClick: () -> Unit,
-    accent: Color,
     isLiked: Boolean,
     onLikeTap: () -> Unit,
 ) {
@@ -1356,11 +1342,12 @@ private fun TrackInfoBlock(
         // while a timer is armed, with the time left under the moon
         // ("23m", "0:45", "End"), so the state is visible at a
         // glance without opening the sheet.
-        if (track != null) {
+        // The album accent is read in its own scope: the crossfade recomposes the button, not the title.
+        if (track != null) WithAlbumChrome { chrome ->
             SleepTimerButton(
                 state = sleepTimerState,
                 onClick = onSleepTimerClick,
-                activeTint = accent,
+                activeTint = chrome.accent,
                 idleTint = npInk().copy(alpha = 0.7f),
                 buttonSize = 26.dp,
                 iconSize = 20.dp,
@@ -1384,20 +1371,17 @@ private fun TrackInfoBlock(
 }
 
 /**
- * Album art with a colored glow shadow behind it.
- *
- * Uses Coil 3 [AsyncImage] to load the art. When the image is loaded
- * successfully, the bitmap is forwarded to [onBitmapLoaded] for palette
- * extraction.
+ * Album art with a glow in the album accent behind it (Coil 3 [AsyncImage]). The glow's colour is
+ * read in the layer's draw block, so the album colour's crossfade redraws the shadow and never
+ * recomposes the art.
  */
 @Composable
 private fun AlbumArtSection(
     albumArtUrl: String?,
     albumArtPath: String?,
-    accentColor: Color,
-    onBitmapLoaded: (android.graphics.Bitmap?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val chrome = LocalAlbumChrome.current
     val artModel = albumArtPath ?: albumArtUrl
     // An image that cannot load (deleted upstream, a 404, a network failure) must
     // read as "no art" — a quiet tile in the surface tone, same shape as the art —
@@ -1405,8 +1389,7 @@ private fun AlbumArtSection(
     // for an error unless told otherwise, and never retries a failed URL.
     val missingArtColor = MaterialTheme.colorScheme.surfaceVariant
     val missingArt = remember(missingArtColor) { ColorPainter(missingArtColor) }
-    // Shared with lyrics mode's compact cover: one fixed decode, so both covers
-    // hand the palette the same Bitmap (see rememberNpArtRequest).
+    // Shared with lyrics mode's compact cover: one fixed decode (see rememberNpArtRequest).
     val artRequest = com.stash.feature.nowplaying.ui.rememberNpArtRequest(artModel)
 
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1415,12 +1398,16 @@ private fun AlbumArtSection(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(10.dp)
-                .shadow(
-                    elevation = 40.dp,
-                    shape = RoundedCornerShape(20.dp),
-                    ambientColor = accentColor.copy(alpha = 0.25f),
-                    spotColor = accentColor.copy(alpha = 0.25f),
-                ),
+                // Modifier.shadow(40.dp, RoundedCornerShape(20.dp), ...) spelled out, so the
+                // shadow colours are read at draw time.
+                .graphicsLayer {
+                    shadowElevation = 40.dp.toPx()
+                    shape = ArtGlowShape
+                    clip = false
+                    val glow = chrome.accent.copy(alpha = 0.25f)
+                    ambientShadowColor = glow
+                    spotShadowColor = glow
+                },
         )
 
         AsyncImage(
@@ -1429,15 +1416,6 @@ private fun AlbumArtSection(
             contentScale = ContentScale.Crop,
             error = missingArt,
             fallback = missingArt,
-            onSuccess = { state: AsyncImagePainter.State.Success ->
-                try {
-                    val bitmap = state.result.image.toBitmap()
-                    onBitmapLoaded(bitmap)
-                } catch (_: Exception) {
-                    // Bitmap extraction failed; palette will use defaults.
-                    onBitmapLoaded(null)
-                }
-            },
             modifier = Modifier
                 .fillMaxSize()
                 .clip(RoundedCornerShape(20.dp)),
@@ -1445,8 +1423,13 @@ private fun AlbumArtSection(
     }
 }
 
+/** The album art glow's shape (the art's own corners). */
+private val ArtGlowShape = RoundedCornerShape(20.dp)
+
 /**
- * Playback controls row: shuffle, previous, play/pause, next, repeat.
+ * Playback controls row: shuffle, previous, play/pause, next, repeat. Wears the album colours
+ * from [LocalAlbumChrome], the same accent and ink the mini player's play button wears, so the
+ * button keeps its shade when the player opens.
  */
 @Composable
 private fun PlaybackControls(
@@ -1454,7 +1437,6 @@ private fun PlaybackControls(
     isBuffering: Boolean,
     shuffleEnabled: Boolean,
     repeatMode: RepeatMode,
-    accentColor: Color,
     onPlayPauseClick: () -> Unit,
     onSkipNext: () -> Unit,
     onSkipPrevious: () -> Unit,
@@ -1464,6 +1446,9 @@ private fun PlaybackControls(
     /** False for a Listen Together listener: the room skips, so the slots stay empty rather than dead. */
     canSkip: Boolean = true,
 ) {
+    val chrome = LocalAlbumChrome.current
+    // Read here, so a crossfade recomposes this row only. The play button's fill is read at draw.
+    val accentColor = chrome.accent
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -1491,7 +1476,7 @@ private fun PlaybackControls(
             )
         }
 
-        // Play / Pause — large gradient circle. While the track is still
+        // Play / Pause — large accent circle. While the track is still
         // resolving/buffering, show a spinner in place of the icon so it
         // doesn't look frozen — but the button STAYS enabled: a slow or hung
         // stream resolve must never lock the user out of pausing (Media3's
@@ -1500,18 +1485,16 @@ private fun PlaybackControls(
             onClick = onPlayPauseClick,
             modifier = Modifier
                 .size(64.dp)
-                .background(
-                    brush = Brush.linearGradient(
-                        colors = listOf(accentColor, accentColor.copy(alpha = 0.7f)),
-                    ),
-                    shape = CircleShape,
-                ),
+                .clip(CircleShape)
+                // A solid accent, exactly the mini player's play button (it used to fade to 70 %
+                // over the ambient, which read as a darker shade when the player opened).
+                .drawBehind { drawRect(chrome.accent) },
         ) {
-            // On the accent-gradient circle, not the ambient ground — stays
-            // white in both themes (the accent is contrast-adjusted instead).
+            // On the accent circle, not the ambient ground: the accent's own ink (white,
+            // or near-black on a pale accent), the mini player's play button's ink too.
             if (isBuffering) {
                 CircularProgressIndicator(
-                    color = Color.White,
+                    color = chrome.onAccent,
                     strokeWidth = 3.dp,
                     modifier = Modifier.size(28.dp),
                 )
@@ -1519,7 +1502,7 @@ private fun PlaybackControls(
                 Icon(
                     imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                     contentDescription = if (isPlaying) "Pause" else "Play",
-                    tint = Color.White,
+                    tint = chrome.onAccent,
                     modifier = Modifier.size(32.dp),
                 )
             }
