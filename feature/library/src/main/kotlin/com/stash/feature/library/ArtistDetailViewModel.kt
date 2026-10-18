@@ -8,6 +8,7 @@ import com.stash.core.data.db.dao.ArtistImageDao
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.media.BulkPlayAction
 import com.stash.core.media.PlayerRepository
+import com.stash.core.media.streaming.ConnectivityMonitor
 import com.stash.core.model.Track
 import com.stash.core.ui.util.withSearchFilter
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -27,8 +28,10 @@ import javax.inject.Inject
  * UI state for the Artist Detail screen.
  *
  * @property artistName             The artist whose tracks are displayed.
- * @property tracks                 All tracks by this artist in the library,
- *                                  filtered by [searchQuery] when non-empty.
+ * @property tracks                 The artist's songs (every one in Stream only, the
+ *                                  downloaded ones in Download; see
+ *                                  [MusicRepository.getTracksByArtist]), filtered by
+ *                                  [searchQuery] when non-empty.
  * @property isLoading              True while the initial data load is in progress.
  * @property currentlyPlayingTrackId The ID of the currently-playing track, used
  *                                   to highlight the active row.
@@ -64,6 +67,7 @@ class ArtistDetailViewModel @Inject constructor(
     private val musicRepository: MusicRepository,
     private val playerRepository: PlayerRepository,
     private val artistImageDao: ArtistImageDao,
+    private val connectivityMonitor: ConnectivityMonitor,
 ) : ViewModel() {
 
     /** The artist name extracted from the navigation route arguments. */
@@ -131,17 +135,29 @@ class ArtistDetailViewModel @Inject constructor(
     // ── Playback actions ────────────────────────────────────────────────
 
     /**
-     * Sets the playback queue to all downloaded tracks by this artist
-     * and begins playback from the track matching [trackId].
+     * Plays [trackId] with the artist's other songs queued around it, the way a playlist does:
+     * songs that aren't downloaded stream. It used to queue only the downloaded ones, so tapping
+     * any other song (most of an artist's page) silently played the first downloaded one instead.
+     *
+     * Offline, a song that isn't downloaded can't play, so the tap says why instead. A downloaded
+     * song then gets only the downloaded ones around it: a queue mixing in songs that can't be
+     * reached stops after a few failures.
      */
     fun playTrack(trackId: Long) {
         viewModelScope.launch {
+            val tracks = uiState.value.tracks
+            val tapped = tracks.firstOrNull { it.id == trackId } ?: return@launch
+            val online = connectivityMonitor.isConnected()
+            if (!tapped.isOnPhone() && !online) {
+                _userMessages.tryEmit(SONG_NEEDS_CONNECTION)
+                return@launch
+            }
             _tappedTrackId.value = trackId
             try {
-                val downloaded = uiState.value.tracks.filter { it.filePath != null }
-                if (downloaded.isEmpty()) return@launch
-                val index = downloaded.indexOfFirst { it.id == trackId }.coerceAtLeast(0)
-                playerRepository.setQueue(downloaded, index)
+                val queue = playableNow(tracks, online)
+                val index = queue.indexOfFirst { it.id == trackId }
+                if (index < 0) return@launch
+                playerRepository.setQueue(queue, index)
             } finally {
                 _tappedTrackId.value = null
             }
@@ -149,14 +165,20 @@ class ArtistDetailViewModel @Inject constructor(
     }
 
     /**
-     * Shuffles all downloaded tracks by this artist and begins playback.
-     * Shuffles the list itself (not just the start index).
+     * Shuffles the artist's songs and begins playback: every song when online, the downloaded
+     * ones when offline (the same rule as [playTrack]). Shuffles the list itself, not just the
+     * start index.
      */
     fun shuffleAll() {
         viewModelScope.launch {
-            val downloaded = uiState.value.tracks.filter { it.filePath != null }
-            if (downloaded.isEmpty()) return@launch
-            val shuffled = downloaded.shuffled()
+            val listed = uiState.value.tracks
+            val playable = playableNow(listed, connectivityMonitor.isConnected())
+            if (playable.isEmpty()) {
+                // Songs listed, none playable: offline with nothing downloaded.
+                if (listed.isNotEmpty()) _userMessages.tryEmit(ARTIST_NEEDS_CONNECTION)
+                return@launch
+            }
+            val shuffled = playable.shuffled()
             _tappedTrackId.value = shuffled[0].id
             _bulkPlayInFlight.value = BulkPlayAction.SHUFFLE_ALL
             try {

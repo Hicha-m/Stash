@@ -3,9 +3,11 @@ package com.stash.feature.library
 import com.stash.core.auth.TokenManager
 import com.stash.core.auth.model.AuthState
 import com.stash.core.data.db.dao.ArtistImageDao
+import com.stash.core.data.prefs.LibraryScopePreference
 import com.stash.core.data.prefs.StreamingPreference
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.media.PlayerRepository
+import com.stash.core.media.streaming.ConnectivityMonitor
 import com.stash.core.model.PlayerState
 import com.stash.core.model.Track
 import com.stash.data.download.files.LocalImportCoordinator
@@ -13,6 +15,7 @@ import com.stash.data.download.files.LocalImportState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -194,62 +197,209 @@ class LibraryViewModelTest {
         assertEquals(listOf("Queued 2 songs for download."), messages)
     }
 
+    // ------------------------------------------------------------------
+    // Artist and album cards: what they play follows the page and the connection
+    // ------------------------------------------------------------------
+
+    /**
+     * What an artist or album page lists in Stream only: songs 1 and 3 downloaded, 2 and 4 not.
+     * (In Download the repository lists only 1 and 3; see [downloadModeSongs].)
+     */
+    private val streamOnlySongs = listOf(
+        Track(1L, "One", "Drake", album = "Views", isDownloaded = true, filePath = "/a"),
+        Track(2L, "Two", "Drake", album = "Views"),
+        Track(3L, "Three", "Drake", album = "Views", isDownloaded = true, filePath = "/c"),
+        Track(4L, "Four", "Drake", album = "Views"),
+    )
+    private val downloadModeSongs = streamOnlySongs.filter { it.isDownloaded }
+
+    private fun pageRepo(songs: List<Track>): MusicRepository = musicRepoMock().stub {
+        on { getTracksByArtist("Drake") } doReturn flowOf(songs)
+        on { getTracksByAlbum("Views", "Drake") } doReturn flowOf(songs)
+    }
+
+    private fun connectivity(online: Boolean): ConnectivityMonitor = mock { on { isConnected() } doReturn online }
+
     @Test
-    fun playAlbum_queues_every_downloaded_track_with_matching_artist_credits() = runTest {
-        val album = "HEROES & VILLAINS"
-        val onAlbum = listOf(
-            Track(1L, "Superhero", "Metro Boomin, Future", album = album, filePath = "/a"),
-            Track(2L, "Trance", "Metro Boomin, Travis Scott", album = album, filePath = "/b"),
-            // Same album but not downloaded — must NOT be queued.
-            Track(3L, "Creepin'", "Metro Boomin, The Weeknd, 21 Savage", album = album, filePath = null),
-            // Same album but credited without the primary act — dropped by matchesArtistCredits.
-            Track(4L, "Private Dancer", "Don Toliver", album = album, filePath = "/e"),
-        )
-        // Different album by a different artist — must NOT leak in.
-        val offAlbum = Track(5L, "Highest in the Room", "Travis Scott", album = "JACKBOYS", filePath = "/d")
-        val musicRepo = mock<MusicRepository> {
-            on { getAllTracks() } doReturn flowOf(onAlbum + offAlbum)
-        }
-
+    fun stream_only_online_playArtist_plays_every_song_the_page_lists() = runTest {
         val playerRepo = playerRepoMock()
-        val vm = buildVm(musicRepository = musicRepo, playerRepository = playerRepo)
+        val vm = buildVm(musicRepository = pageRepo(streamOnlySongs), playerRepository = playerRepo, connectivityMonitor = connectivity(true))
 
-        vm.playAlbum(album, "Metro Boomin")
+        vm.playArtist("Drake")
         runCurrent()
 
-        // Credited rows all include the primary act, so every downloaded one is queued.
-        verify(playerRepo).setQueue(
-            listOf(onAlbum[0], onAlbum[1]),
-            0,
-            source = com.stash.core.model.PlaybackSource.Album(album, "Metro Boomin"),
-        )
+        verify(playerRepo).setQueue(streamOnlySongs, 0, source = com.stash.core.model.PlaybackSource.Artist("Drake"))
     }
 
     @Test
-    fun addAlbumToQueue_appends_every_downloaded_track_with_matching_artist_credits() = runTest {
-        val album = "HEROES & VILLAINS"
-        val onAlbum = listOf(
-            Track(1L, "Superhero", "Metro Boomin, Future", album = album, filePath = "/a"),
-            Track(2L, "Trance", "Metro Boomin, Travis Scott", album = album, filePath = "/b"),
-            Track(3L, "Creepin'", "Metro Boomin, The Weeknd, 21 Savage", album = album, filePath = null),
-            Track(4L, "Private Dancer", "Don Toliver", album = album, filePath = "/e"),
-        )
-        val offAlbum = Track(5L, "Highest in the Room", "Travis Scott", album = "JACKBOYS", filePath = "/d")
-        val musicRepo = mock<MusicRepository> {
-            on { getAllTracks() } doReturn flowOf(onAlbum + offAlbum)
-        }
-
+    fun stream_only_offline_playArtist_plays_only_the_downloaded_songs() = runTest {
         val playerRepo = playerRepoMock()
-        val vm = buildVm(musicRepository = musicRepo, playerRepository = playerRepo)
+        val vm = buildVm(musicRepository = pageRepo(streamOnlySongs), playerRepository = playerRepo, connectivityMonitor = connectivity(false))
 
-        vm.addAlbumToQueue(album, "Metro Boomin")
+        vm.playArtist("Drake")
         runCurrent()
 
-        verify(playerRepo).addToQueue(onAlbum[0])
-        verify(playerRepo).addToQueue(onAlbum[1])
-        verify(playerRepo, org.mockito.kotlin.never()).addToQueue(onAlbum[2])
-        verify(playerRepo, org.mockito.kotlin.never()).addToQueue(onAlbum[3])
-        verify(playerRepo, org.mockito.kotlin.never()).addToQueue(offAlbum)
+        verify(playerRepo).setQueue(downloadModeSongs, 0, source = com.stash.core.model.PlaybackSource.Artist("Drake"))
+    }
+
+    @Test
+    fun download_mode_playArtist_plays_the_downloaded_songs_online_and_offline() = runTest {
+        for (online in listOf(true, false)) {
+            val playerRepo = playerRepoMock()
+            val vm = buildVm(musicRepository = pageRepo(downloadModeSongs), playerRepository = playerRepo, connectivityMonitor = connectivity(online))
+
+            vm.playArtist("Drake")
+            runCurrent()
+
+            verify(playerRepo).setQueue(downloadModeSongs, 0, source = com.stash.core.model.PlaybackSource.Artist("Drake"))
+        }
+    }
+
+    @Test
+    fun offline_playArtist_with_nothing_downloaded_says_why() = runTest {
+        val playerRepo = playerRepoMock()
+        val notDownloaded = streamOnlySongs.filterNot { it.isDownloaded }
+        val vm = buildVm(musicRepository = pageRepo(notDownloaded), playerRepository = playerRepo, connectivityMonitor = connectivity(false))
+        val messages = collectMessages(vm)
+
+        vm.playArtist("Drake")
+        runCurrent()
+
+        verify(playerRepo, org.mockito.kotlin.never()).setQueue(any(), any(), any())
+        assertEquals(listOf("None of this artist's songs are downloaded. Connect to play them."), messages)
+    }
+
+    @Test
+    fun addArtistToQueue_appends_what_play_would_play_in_one_batch() = runTest {
+        for ((online, expected) in listOf(true to streamOnlySongs, false to downloadModeSongs)) {
+            val playerRepo = playerRepoMock()
+            val vm = buildVm(musicRepository = pageRepo(streamOnlySongs), playerRepository = playerRepo, connectivityMonitor = connectivity(online))
+
+            vm.addArtistToQueue("Drake")
+            runCurrent()
+
+            verify(playerRepo).addToQueue(expected)
+        }
+    }
+
+    @Test
+    fun playAlbum_plays_what_the_album_page_lists_under_the_same_rule() = runTest {
+        for ((online, expected) in listOf(true to streamOnlySongs, false to downloadModeSongs)) {
+            val playerRepo = playerRepoMock()
+            val vm = buildVm(musicRepository = pageRepo(streamOnlySongs), playerRepository = playerRepo, connectivityMonitor = connectivity(online))
+
+            vm.playAlbum("Views", "Drake")
+            runCurrent()
+
+            verify(playerRepo).setQueue(expected, 0, source = com.stash.core.model.PlaybackSource.Album("Views", "Drake"))
+        }
+    }
+
+    @Test
+    fun addAlbumToQueue_appends_what_play_would_play_in_one_batch() = runTest {
+        for ((online, expected) in listOf(true to streamOnlySongs, false to downloadModeSongs)) {
+            val playerRepo = playerRepoMock()
+            val vm = buildVm(musicRepository = pageRepo(streamOnlySongs), playerRepository = playerRepo, connectivityMonitor = connectivity(online))
+
+            vm.addAlbumToQueue("Views", "Drake")
+            runCurrent()
+
+            verify(playerRepo).addToQueue(expected)
+        }
+    }
+
+    @Test
+    fun offline_playAlbum_with_nothing_downloaded_says_why() = runTest {
+        val playerRepo = playerRepoMock()
+        val notDownloaded = streamOnlySongs.filterNot { it.isDownloaded }
+        val vm = buildVm(musicRepository = pageRepo(notDownloaded), playerRepository = playerRepo, connectivityMonitor = connectivity(false))
+        val messages = collectMessages(vm)
+
+        vm.playAlbum("Views", "Drake")
+        runCurrent()
+
+        verify(playerRepo, org.mockito.kotlin.never()).setQueue(any(), any(), any())
+        assertEquals(listOf("None of this album's songs are downloaded. Connect to play them."), messages)
+    }
+
+    // ------------------------------------------------------------------
+    // The Artists grid counts what the artist page lists
+    // ------------------------------------------------------------------
+
+    @Test
+    fun artist_card_count_matches_the_artist_page_in_both_modes() = runTest {
+        // Drake: two own songs (one downloaded), a downloaded collab, a feature on Future's song
+        // that isn't downloaded, and a compilation credited to him as album artist.
+        val songs = listOf(
+            Track(1L, "One", "Drake", isDownloaded = true, filePath = "/a"),
+            Track(2L, "Two", "Drake"),
+            Track(3L, "Three", "Drake, 21 Savage", isDownloaded = true, filePath = "/c"),
+            Track(4L, "Four", "Future, Drake"),
+            Track(5L, "Five", "Someone Else", albumArtist = "Drake", isDownloaded = true, filePath = "/e"),
+        )
+        for (streamOnly in listOf(false, true)) {
+            val listed = songs.filter { streamOnly || it.isDownloaded }
+            // What TrackDao.getAllArtists returns for those rows: one per credit pair.
+            val pairs = listed.groupBy { it.artist to it.albumArtist }.map { (key, group) ->
+                com.stash.core.data.db.dao.ArtistSummary(
+                    artist = key.first,
+                    trackCount = group.size,
+                    totalDurationMs = 0,
+                    artUrl = null,
+                    albumArtist = key.second,
+                    downloadedCount = group.count { it.isDownloaded },
+                )
+            }
+            // What the artist page lists (MusicRepository.getTracksByArtist).
+            val page = listed.filter { com.stash.core.common.matchesArtistCredits(it.artist, it.albumArtist, "Drake") }
+            val musicRepo = musicRepoMock().stub {
+                on { getAllArtists() } doReturn flowOf(pairs)
+                on { getRecentlyAdded(any()) } doReturn flowOf(emptyList())
+            }
+            val vm = buildVm(musicRepository = musicRepo)
+
+            val state = vm.uiState.first { !it.isLoading && (it.artists + it.singleTrackArtists).isNotEmpty() }
+            val drake = (state.artists + state.singleTrackArtists).single { it.name == "Drake" }
+
+            assertEquals("streamOnly=$streamOnly", page.size, drake.trackCount)
+            // Its delete names only the downloaded songs he leads: 1 and 3.
+            assertEquals("streamOnly=$streamOnly", 2, drake.downloadedCount)
+        }
+    }
+
+    @Test
+    fun in_your_library_shows_in_Stream_only_and_Download_ignores_it() = runTest {
+        // The repository narrows the rows (MusicRepositoryLibraryScopeTest); the state only tells
+        // the sheet and the "Showing your library only" chip, which must stay hidden in Download.
+        for (streamOnly in listOf(false, true)) {
+            val musicRepo = musicRepoMock().stub {
+                on { getRecentlyAdded(any()) } doReturn flowOf(emptyList())
+                on { getLibraryTracksIncludingOnline() } doReturn flowOf(emptyList())
+            }
+            val vm = buildVm(
+                musicRepository = musicRepo,
+                streamingPreference = mock { on { enabled } doReturn flowOf(streamOnly) },
+                libraryScopePreference = mock { on { inLibraryOnly } doReturn flowOf(true) },
+            )
+
+            val state = vm.uiState.first { !it.isLoading }
+
+            assertEquals("streamOnly=$streamOnly", streamOnly, state.libraryOnly)
+        }
+    }
+
+    @Test
+    fun setLibraryOnly_saves_the_choice() = runTest {
+        val pref = mock<LibraryScopePreference> { on { inLibraryOnly } doReturn flowOf(false) }
+        val vm = buildVm(libraryScopePreference = pref)
+
+        vm.setLibraryOnly(true)
+        runCurrent()
+        verify(pref).setInLibraryOnly(true)
+
+        vm.setLibraryOnly(false)
+        runCurrent()
+        verify(pref).setInLibraryOnly(false)
     }
 
     @Test
@@ -365,6 +515,8 @@ class LibraryViewModelTest {
         streamingPreference: StreamingPreference = mock { on { enabled } doReturn flowOf(false) },
         libraryPreferencesStore: LibraryPreferencesStore = libraryPreferencesStoreMock(),
         artistImageDao: ArtistImageDao = mock { on { observeAll() } doReturn flowOf(emptyList()) },
+        connectivityMonitor: ConnectivityMonitor? = null,
+        libraryScopePreference: LibraryScopePreference? = null,
     ): LibraryViewModel = LibraryViewModel(
         musicRepository = musicRepository,
         playerRepository = playerRepository,
@@ -378,5 +530,7 @@ class LibraryViewModelTest {
         libraryDeepLinkController = com.stash.core.data.navigation.LibraryDeepLinkController(),
         artistImageDao = artistImageDao,
         sharedMixRepository = org.mockito.kotlin.mock { on { observeActiveFollowedIds() }.thenReturn(kotlinx.coroutines.flow.flowOf(emptyList())) },
+        connectivityMonitor = connectivityMonitor,
+        libraryScopePreference = libraryScopePreference,
     )
 }

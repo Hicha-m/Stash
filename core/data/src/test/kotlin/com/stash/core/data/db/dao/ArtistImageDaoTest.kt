@@ -9,10 +9,10 @@ import com.stash.core.data.db.entity.TrackEntity
 import com.stash.core.model.MusicSource
 import com.stash.core.model.PlaylistType
 import java.time.Instant
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -21,12 +21,11 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * Verifies `ArtistImageDao.distinctArtistNames()` — the candidate set the
- * [com.stash.core.data.sync.workers.ArtistImageBackfillWorker] walks. It must
- * equal what the Library Artists tab lists (`getAllArtists(includeStreamable =
- * false)`): downloaded tracks only. Every name costs an InnerTube search, so
- * stream-only rows and not-downloaded playlist members — which the tab does
- * not show — must stay out until the tab itself is widened.
+ * Verifies `ArtistImageDao.distinctArtistNames(includeNotDownloaded)` — the candidate set the
+ * [com.stash.core.data.sync.workers.ArtistImageBackfillWorker] walks. It must equal the credits
+ * the Library Artists tab builds its cards from (`TrackDao.getAllArtists(includeNotDownloaded)`)
+ * in both states of the Download switch: downloaded tracks only in Download, every track in
+ * Stream only. Every name costs an InnerTube search, so nothing the tab doesn't show may get in.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [33])
@@ -51,45 +50,86 @@ class ArtistImageDaoTest {
 
     @After fun tearDown() = db.close()
 
-    @Test fun `includes downloaded artists`() = runTest {
+    // ── Download (includeNotDownloaded = false) ─────────────────────────
+
+    @Test fun `download - includes downloaded artists`() = runTest {
         insertDownloaded(id = 1L, artist = "Drake")
 
-        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames())
+        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = false, libraryOnly = false))
     }
 
-    @Test fun `excludes stream-only artists the tab does not list`() = runTest {
+    @Test fun `download - excludes artists with nothing downloaded, as the tab does`() = runTest {
         insertStreamableOnly(id = 1L, artist = "Future")
-
-        assertTrue(artistImageDao.distinctArtistNames().isEmpty())
-    }
-
-    @Test fun `excludes not-downloaded members of a live playlist`() = runTest {
-        // Liked songs and synced playlists list these rows; the Artists tab
-        // does not, so a search for them would buy a photo nobody sees.
-        val unchecked = insertUnchecked(id = 1L, artist = "Aarne")
+        insertUnavailable(id = 2L, artist = "Travis")
+        // A not-downloaded member of a live playlist: listed by the playlist, not by the tab.
+        val unchecked = insertUnchecked(id = 3L, artist = "Aarne")
         val playlistId = playlistDao.insert(activePlaylist())
         playlistDao.insertCrossRef(crossRef(playlistId, unchecked, position = 0))
 
-        assertTrue(artistImageDao.distinctArtistNames().isEmpty())
+        assertTrue(artistImageDao.distinctArtistNames(includeNotDownloaded = false, libraryOnly = false).isEmpty())
     }
 
-    @Test fun `excludes unavailable artists`() = runTest {
-        insertUnavailable(id = 1L, artist = "Travis")
+    // ── Stream only (includeNotDownloaded = true) ───────────────────────
 
-        assertTrue(artistImageDao.distinctArtistNames().isEmpty())
+    @Test fun `stream only - includes every artist the tab lists, downloaded or not`() = runTest {
+        insertDownloaded(id = 1L, artist = "Drake")
+        insertStreamableOnly(id = 2L, artist = "Future")
+        insertUnavailable(id = 3L, artist = "Travis")
+        insertUnchecked(id = 4L, artist = "Aarne")
+
+        assertEquals(
+            setOf("Drake", "Future", "Travis", "Aarne"),
+            artistImageDao.distinctArtistNames(includeNotDownloaded = true, libraryOnly = false).toSet(),
+        )
     }
+
+    @Test fun `stream only - matches the credits the Artists tab is built from`() = runTest {
+        insertDownloaded(id = 1L, artist = "Drake")
+        insertUnchecked(id = 2L, artist = "Aarne, Toxi$")
+        insertUnchecked(id = 3L, artist = "Future")
+
+        for (includeNotDownloaded in listOf(false, true)) {
+            assertEquals(
+                "includeNotDownloaded=$includeNotDownloaded",
+                trackDao.getAllArtists(includeNotDownloaded, libraryOnly = false).first().map { it.artist }.toSet(),
+                artistImageDao.distinctArtistNames(includeNotDownloaded, libraryOnly = false).toSet(),
+            )
+        }
+    }
+
+    @Test fun `stream only, in your library - only the artists the narrowed tab lists`() = runTest {
+        insertDownloaded(id = 1L, artist = "Drake")
+        val synced = insertUnchecked(id = 2L, artist = "Aarne")
+        insertUnchecked(id = 3L, artist = "Future") // in no playlist
+        val mixOnly = insertUnchecked(id = 4L, artist = "Travis")
+        playlistDao.insertCrossRef(crossRef(playlistDao.insert(activePlaylist()), synced, position = 0))
+        playlistDao.insertCrossRef(
+            crossRef(playlistDao.insert(activePlaylist().copy(type = PlaylistType.DAILY_MIX)), mixOnly, position = 0),
+        )
+
+        val names = artistImageDao.distinctArtistNames(includeNotDownloaded = true, libraryOnly = true).toSet()
+
+        assertEquals(setOf("Drake", "Aarne"), names)
+        assertEquals(trackDao.getAllArtists(includeNotDownloaded = true, libraryOnly = true).first().map { it.artist }.toSet(), names)
+    }
+
+    // ── Both ────────────────────────────────────────────────────────────
 
     @Test fun `dedupes repeated credits`() = runTest {
         insertDownloaded(id = 1L, artist = "Drake")
         insertDownloaded(id = 2L, artist = "Drake")
+        insertUnchecked(id = 3L, artist = "Drake")
 
-        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames())
+        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = false, libraryOnly = false))
+        assertEquals(listOf("Drake"), artistImageDao.distinctArtistNames(includeNotDownloaded = true, libraryOnly = false))
     }
 
     @Test fun `excludes empty artist credits`() = runTest {
         insertDownloaded(id = 1L, artist = "")
+        insertUnchecked(id = 2L, artist = "")
 
-        assertFalse("blank credit must not be resolved", artistImageDao.distinctArtistNames().isNotEmpty())
+        assertTrue("blank credit must not be resolved", artistImageDao.distinctArtistNames(false, false).isEmpty())
+        assertTrue("blank credit must not be resolved", artistImageDao.distinctArtistNames(true, false).isEmpty())
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
