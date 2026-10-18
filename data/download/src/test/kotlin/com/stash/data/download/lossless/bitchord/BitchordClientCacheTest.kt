@@ -132,6 +132,25 @@ class BitchordClientCacheTest {
         assertThat(searches.get() to streams.get()).isEqualTo(1 to 2)
     }
 
+    @Test fun `an AAC lookup's short miss keeps a longer lossless miss already cached`() = runBlocking {
+        streamReply = { r ->
+            if (r.path!!.contains("aac=1")) MockResponse().setResponseCode(404).setBody("""{"error":"not_available"}""")
+            else MockResponse().setResponseCode(404).setBody("""{"error":"lossless_unavailable"}""")
+        }
+        assertThat(client.lookup(query)).isEqualTo(TidalLookup.NoMatch) // definitive: 14 days
+        assertThat(client.lookup(query, allowAac = true)).isEqualTo(TidalLookup.NoMatch) // short: 6 h
+        assertThat(streams.get()).isEqualTo(2)
+
+        // Past the short miss, the lossless one still holds: no lossless request.
+        now += BitchordClient.SHORT_MISS_TTL_MS
+        assertThat(client.lookup(query)).isEqualTo(TidalLookup.NoMatch)
+        assertThat(streams.get()).isEqualTo(2)
+        // The AAC miss has expired: AAC asks again.
+        streamReply = { ok(AAC) }
+        assertThat(client.lookup(query, allowAac = true)).isInstanceOf(TidalLookup.Found::class.java)
+        assertThat(streams.get()).isEqualTo(3)
+    }
+
     @Test fun `a 404 with an unknown or unreadable body is a short miss in both modes`() = runBlocking {
         streamReply = { MockResponse().setResponseCode(404).setBody("<html>Not Found</html>") }
         assertThat(client.lookup(query, allowAac = true)).isEqualTo(TidalLookup.NoMatch)
