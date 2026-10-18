@@ -11,7 +11,7 @@ Separate Cloudflare Worker implementing the Tidal subset of BitChord's relay con
 - Signed `GET /dash/td/<id>.mpd` and `GET /dash/td/<id>/init.mp4` URLs need no header; their HMAC signatures (keyed by the `DASH_SIGNING_KEY` secret, see Deployment) expire after one hour.
 - Admin-only `POST /admin/device/start`, then `POST /admin/device/poll` with `{ "user_code": "..." }` starts and completes the Tidal OAuth device flow. These require `X-Access-Token: <ADMIN_TOKEN>`.
 
-Tidal accounts are linked through the device flow; passwords and OAuth tokens are never printed. The pool rotates least-recently-used live accounts, with a 100 requests/hour cap during ramp, a later target of 250/hour, and 1,600/day per account. It applies cooldowns for transient failures and retires an account only when Tidal rejects its refresh token (see the 401 rule below). A lower-than-lossless answer is final (no cross-check on another account), and Tidal's `subStatus=4005` is a track/rights refusal (`not_available`) that never kills an account. When no account is available, search and stream return `503 busy`: `Retry-After: 300` when seats are capped or cooling, `Retry-After: 15` when seats are only waiting out their pacing gap.
+Tidal accounts are linked through the device flow; passwords and OAuth tokens are never printed. The pool rotates least-recently-used live accounts, with per-account caps of 200 upstream calls/hour and 3,200/day (`TIDAL_ACCOUNT_HOURLY_CAP` / `TIDAL_ACCOUNT_DAILY_CAP` in `wrangler.toml`; the code falls back to 250 and 1,600 when they are unset). It applies cooldowns for transient failures and retires an account only when Tidal rejects its refresh token (see the 401 rule below). A lower-than-lossless answer is final (no cross-check on another account), and Tidal's `subStatus=4005` is a track/rights refusal (`not_available`) that never kills an account. When no account is available, search and stream return `503 busy`: `Retry-After: 300` when seats are capped or cooling, `Retry-After: 15` when seats are only waiting out their pacing gap.
 
 Protective limits mirror the Qobuz relay: 34,667 upstream-answered `/stream` requests/day shared across the pool, 2,000 answered streams/day per network, 2,000 uncached searches/day per network, 40 requests/60 seconds per network for provider/admin routes, and a 6/60 seconds per-network fair share of the seats. The network key is the IPv4 address or IPv6 `/56`, hashed with the private `IP_SALT`; raw IP addresses are not written to D1. `IP_SALT` is required for the daily network cap; without it only the shared global cap and request limiter apply. `/health` is exempt from the request limiter. Apart from the shared daily lossless counter below (which needs the signed install headers), there is no per-install cap: older Tidal app clients send only `X-Access-Token`. Daily quotas (table `tidal_daily_quotas`, key per day):
 
@@ -87,6 +87,11 @@ in `infra/lossless-quota/`, copied for the tests to `test/fixtures/quota_*.sql`:
 
   Un-revoke: `DELETE FROM revoked_tokens WHERE tid = '<tid>'`. Apply migration 0002 before deploying this relay:
   without the table a supporter's counter read fails and that request is served with the counter off.
+- **Migrations dir:** the `QUOTA_DB` binding's `migrations_dir` in `wrangler.toml` points at
+  `../../lossless-quota/migrations`, which arrives with the Qobuz counter branch (`feat/lossless-quota-qobuz`). It
+  only matters to `wrangler d1 migrations` run with this config (`wrangler deploy` does not read it), and it keeps
+  such a command from applying this relay's own `migrations/` to `stash-quota`. Migrate `stash-quota` with
+  `--config infra/lossless-quota/wrangler.toml` as above; until that branch is merged, run it from a checkout of it.
 - **Safety:** no `QUOTA_DB` binding skips the counter (`QUOTA_DB not bound`, once per isolate); a D1 error on the
   counter skips it for that request. The network, global and fair-share limits are unchanged and still apply. A race
   can serve one or two past the limit. The hourly job prunes `usage` rows older than 7 days.
@@ -145,8 +150,10 @@ Apply with `wrangler d1 migrations apply` before deploying.
 
 ## Cautious pool ramp
 
-The restart cap is configured to 100 requests/hour per account with a 1,600/day ceiling.
-Only raise the hourly cap to 250 after 3–4 hours without 429s. With the relay unpaused,
+Each account is capped at 200 upstream calls/hour and 3,200/day (`TIDAL_ACCOUNT_HOURLY_CAP` /
+`TIDAL_ACCOUNT_DAILY_CAP` in `wrangler.toml`). The 20 s seat gap already holds a seat to at most 180 calls/hour,
+so the gap, not the hourly cap, is what paces a busy seat. Raise the caps only after several hours without 429s
+(`tidal_upstream_429_events` below). With the relay unpaused,
 the first cache miss starts a shared 10-minute soft-open window; 50% of uncached search
 and stream requests get `503 busy` with a five-minute retry. Cache hits continue to be
 served. After a later paused interval, reset the one-shot window with
