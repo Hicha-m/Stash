@@ -23,7 +23,8 @@ actives thanks to the shared mint cache; see spec §6.
   - `429` a cap: `rate_limited` (install, network or /48 daily cap, or the per-minute limiter) or
     `paced` (a download ahead of the day's pace); both carry `Retry-After`.
   - `503` busy, with `Retry-After`: the global cap is spent, no account is free, or a refusal could not
-    be cross-checked because no second account was free (it used to be a 404 the app kept for good).
+    be cross-checked because every other live account was cooling or capped (it used to be a 404 the app
+    kept for good). With no other live account (one account, or the rest dead) that refusal stays a 404.
   - `401` a bad signature or a timestamp outside ±300 s, with `X-Stash-Server-Time: <epoch seconds>`
     so the app can correct a skewed clock and retry.
 - `GET /v1/status`: reachability probe.
