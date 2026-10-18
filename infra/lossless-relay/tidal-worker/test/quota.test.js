@@ -355,6 +355,46 @@ test("a QUOTA_DB failure never stops a stream: FLAC served without counter heade
   assert.equal(res.headers.get("X-Stash-Lossless"), null);
 });
 
+test("a D1 error bumping the stream counters after Tidal answered still returns the answer (and counts the lossless unit)", async () => {
+  const r = relay(tidal(), { env: { IP_SALT: "salt" } });
+  const db = r.env.DB;
+  r.env.DB = { ...db, batch: async () => { throw new Error("D1 write failed"); } };
+  const ip = { "CF-Connecting-IP": "203.0.113.9" };
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => errors.push(args.join(" "));
+  try {
+    const res = await r.call("/stream/td:1", { ...ip, ...signed("td:1") });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).codec, "flac");
+    assert.equal(res.headers.get("X-Stash-Lossless"), "1/500");
+  } finally { console.error = original; }
+  assert.equal(r.calls.length, 1);
+  assert.ok(errors.some((l) => l.startsWith("stream quota bump failed")), errors.join("\n"));
+  assert.equal(r.db.prepare("SELECT COUNT(*) AS n FROM tidal_daily_quotas").get().n, 0, "the bump was lost, not the answer");
+});
+
+test("a D1 error reading the stream counters admits the stream instead of a 503", async () => {
+  const r = relay(tidal(), { env: { IP_SALT: "salt" } });
+  const db = r.env.DB;
+  r.env.DB = {
+    ...db,
+    prepare(sql) {
+      const s = db.prepare(sql);
+      if (sql.includes("FROM tidal_daily_quotas WHERE day = ?1")) s.all = async () => { throw new Error("D1 read failed"); };
+      return s;
+    },
+  };
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const res = await r.call("/stream/td:1", { "CF-Connecting-IP": "203.0.113.9", ...signed("td:1") });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).codec, "flac");
+  } finally { console.error = original; }
+  assert.equal(r.used(), 1);
+});
+
 test("the hourly job also prunes week-old usage rows", async () => {
   const r = relay(tidal());
   r.qdb.prepare("INSERT INTO usage(day,subject,n) VALUES('2000-01-01','i:x',1)").run();

@@ -744,13 +744,21 @@ async function bumpSeat(env, id) {
  * Per-network cap for every answered stream (cache hit or not). The global cap protects Tidal,
  * so it only gates cache misses (stream() checks quota.globalFull): cheap cached answers from
  * many networks must not be able to exhaust it and switch Tidal off for everyone.
+ * A D1 error reading the counters admits the request (logged): the seats' own hourly/daily caps, checked in
+ * the same database by takeAccount, still bound what reaches Tidal, and a cache hit should not become a 503.
  */
 async function admitStream(request, env) {
   const day = new Date().toISOString().slice(0, 10);
   const network = networkOf(request.headers.get("CF-Connecting-IP"));
   const tag = networkTag(env, network);
   const keys = ["global", ...(tag ? [`n:${tag}`] : [])];
-  const used = await dailyUsed(env, day, keys);
+  let used;
+  try {
+    used = await dailyUsed(env, day, keys);
+  } catch (e) {
+    console.error(`stream quota read failed: ${e?.name || "Error"}`);
+    used = {};
+  }
   const globalCap = positive(env.GLOBAL_DAILY_CAP, 34667);
   const networkCap = positive(env.NETWORK_DAILY_CAP, 2000);
   if (tag && (used[`n:${tag}`] || 0) >= networkCap) {
@@ -838,12 +846,20 @@ async function quotaRoute(request, env) {
 
 function globalCapped() { return json({ error: "global_daily_cap" }, 503, { "Retry-After": "600" }); }
 
-/** Network key for every answered stream; `global` only when the answer came from Tidal. */
+/**
+ * Network key for every answered stream; `global` only when the answer came from Tidal.
+ * Runs after the answer exists, so a D1 error is logged and swallowed: the caller still gets its answer
+ * (the counters run one short), never a 503 for a stream Tidal already answered. Never throws.
+ */
 async function spendStream(request, env, quota, upstream) {
-  const tag = quota.tag || networkTag(env, networkOf(request.headers.get("CF-Connecting-IP")));
-  const statements = upstream ? [bumpDailyQuotaStmt(env.DB, quota.day, "global")] : [];
-  if (tag) statements.push(bumpDailyQuotaStmt(env.DB, quota.day, `n:${tag}`));
-  if (statements.length) await env.DB.batch(statements);
+  try {
+    const tag = quota.tag || networkTag(env, networkOf(request.headers.get("CF-Connecting-IP")));
+    const statements = upstream ? [bumpDailyQuotaStmt(env.DB, quota.day, "global")] : [];
+    if (tag) statements.push(bumpDailyQuotaStmt(env.DB, quota.day, `n:${tag}`));
+    if (statements.length) await env.DB.batch(statements);
+  } catch (e) {
+    console.error(`stream quota bump failed: ${e?.name || "Error"}`);
+  }
 }
 
 /** Today's counters for `keys` in tidal_daily_quotas, as { key: n } (absent = 0). */
