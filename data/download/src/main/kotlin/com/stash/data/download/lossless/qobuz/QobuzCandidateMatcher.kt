@@ -217,7 +217,7 @@ object QobuzCandidateMatcher {
     }
 
     private fun artistWords(s: String): String =
-        normalize(s).ifEmpty { normalize(s.replace(Regex("[\\[\\]()]"), " ")) }
+        normalize(s).ifEmpty { normalize(s.replace(BRACKET_CHARS, " ")) }
 
     /** The first credited artist: "Sia, Spencer Brown" and "Sia & Chaka Khan" lead with "sia". */
     private fun leadArtist(s: String): String =
@@ -251,25 +251,34 @@ object QobuzCandidateMatcher {
         // both sides also lets "Capuçon"/"Capucon" and "Rodríguez"/"Rodriguez" agree.
         Normalizer.normalize(s, Normalizer.Form.NFD).replace(COMBINING_MARKS, "")
             .lowercase()
-            .replace(Regex("\\([^)]*\\)"), " ")
-            .replace(Regex("\\[[^]]*\\]"), " ")
-            .replace(Regex("(?i)\\b(feat\\.?|ft\\.?|featuring)\\b.*"), " ")
+            .replace(PAREN_GROUP, " ")
+            .replace(SQUARE_GROUP, " ")
+            .replace(FEAT_TAIL, " ")
             // Elide within-word marks (straight + curly apostrophes)
             // BEFORE the punctuation-to-space pass, otherwise
             // contractions like "don't" tokenize as "don t" instead
             // of "dont" and pollute the Jaccard set.
-            .replace(Regex("[''`]"), "")
+            .replace(APOSTROPHES, "")
             // v0.9.x: include \p{S} (Symbols, incl. Currency) so stylized artist
             // names like "¥$" (Kanye+Ty Dolla $ign), "$NOT", "+44", "!!!" survive
             // normalization. Without this they stripped to empty string and
             // artistSimilarity returned 0 for every catalog match, even when the
             // title was an exact hit. Punctuation (\p{P}) still gets stripped, so
             // commas/dashes/parens still tokenize correctly.
-            .replace(Regex("[^\\p{L}\\p{N}\\p{S}\\s]"), " ")
-            .replace(Regex("\\s+"), " ")
+            .replace(NON_WORD, " ")
+            .replace(WHITESPACE, " ")
             .trim()
 
+    // normalize() runs ~15 times per candidate (titles, artists, albums, version parts), so its
+    // patterns are compiled once here rather than on every call.
     private val COMBINING_MARKS = Regex("\\p{Mn}+")
+    private val PAREN_GROUP = Regex("\\([^)]*\\)")
+    private val SQUARE_GROUP = Regex("\\[[^]]*\\]")
+    private val FEAT_TAIL = Regex("(?i)\\b(feat\\.?|ft\\.?|featuring)\\b.*")
+    private val APOSTROPHES = Regex("[''`]")
+    private val NON_WORD = Regex("[^\\p{L}\\p{N}\\p{S}\\s]")
+    private val WHITESPACE = Regex("\\s+")
+    private val BRACKET_CHARS = Regex("[\\[\\]()]")
 
     /** Jaccard similarity on whitespace-tokenized strings. */
     fun jaccard(a: String, b: String): Float {
