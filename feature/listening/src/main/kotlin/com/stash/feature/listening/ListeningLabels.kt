@@ -35,18 +35,60 @@ internal object ListeningLabels {
     fun plays(count: Int): String = if (count == 1) "1 play" else "$count plays"
 
     /**
-     * Listening time, rounded to the minute: "47 min", "2 h", "2 h 5 min". Under a minute reads
-     * "1 min" (a day with a listen is never "0 min").
+     * Listening time, rounded to the minute, the one format every listening screen uses: "47 min",
+     * "2 h", "2 h 5 min", "1,234 h 5 min". Under a minute reads "1 min" (a day with a listen is
+     * never "0 min"); nothing at all reads "0 min".
      */
     fun listenTime(ms: Long): String {
+        if (ms <= 0) return "0 min"
         val minutes = ((ms + 30_000) / 60_000).coerceAtLeast(1)
         val h = minutes / 60
         val m = minutes % 60
         return when {
             h == 0L -> "$m min"
-            m == 0L -> "$h h"
-            else -> "$h h $m min"
+            m == 0L -> "%,d h".format(Locale.US, h)
+            else -> "%,d h %d min".format(Locale.US, h, m)
         }
+    }
+
+    /** A top row's numbers: "23 plays · 1 h 12 min" ("1 play" when the time is unknown). */
+    fun playsAndTime(plays: Int, listenedMs: Long): String =
+        if (listenedMs <= 0) plays(plays) else "${plays(plays)} · ${listenTime(listenedMs)}"
+
+    /**
+     * The dates a range covers: "Sep 19 – Oct 18", one date for a single day, and the years
+     * when the range isn't within the current year ("Dec 2, 2025 – Oct 18, 2026").
+     */
+    fun rangeCaption(fromDay: Long, toDay: Long, today: Long, locale: Locale = Locale.getDefault()): String {
+        val from = LocalDate.ofEpochDay(fromDay)
+        val to = LocalDate.ofEpochDay(toDay)
+        val thisYear = LocalDate.ofEpochDay(today).year
+        val pattern = if (from.year == thisYear && to.year == thisYear) "MMM d" else "MMM d, yyyy"
+        val f = DateTimeFormatter.ofPattern(pattern, locale)
+        return if (fromDay == toDay) to.format(f) else "${from.format(f)} – ${to.format(f)}"
+    }
+
+    /** An hour of the day for the listening clock: "9 PM", "12 AM", or "21:00". */
+    fun hour(hour: Int, use24Hour: Boolean, locale: Locale = Locale.getDefault()): String =
+        LocalTime.of(hour.coerceIn(0, 23), 0).format(DateTimeFormatter.ofPattern(if (use24Hour) "HH:mm" else "h a", locale))
+
+    /** "5-day streak", "1-day streak". */
+    fun streak(days: Int): String = "$days-day streak"
+
+    /** The Streak tile's word under its number: "1" + "day streak", "5" + "days streak" (owner wording). */
+    fun streakUnit(days: Int): String = if (days == 1) "day streak" else "days streak"
+
+    /** "1 day", "12 days". */
+    fun days(count: Int): String = if (count == 1) "1 day" else "$count days"
+
+    /** "1 time", "9 times". */
+    fun times(count: Int): String = if (count == 1) "1 time" else "$count times"
+
+    /** A short date for highlights: "Oct 11" (+ year outside the current one). */
+    fun shortDay(day: Long, today: Long, locale: Locale = Locale.getDefault()): String {
+        val date = LocalDate.ofEpochDay(day)
+        val pattern = if (date.year == LocalDate.ofEpochDay(today).year) "MMM d" else "MMM d, yyyy"
+        return date.format(DateTimeFormatter.ofPattern(pattern, locale))
     }
 
     /** A day header's line after the title: "12 plays · 47 min"; null when the counts aren't known. */
