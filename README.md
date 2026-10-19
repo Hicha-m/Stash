@@ -19,7 +19,7 @@
   <img src="docs/screenshots/hero-dark.webp" alt="Stash on three phones: Home with Daily Discover, Now Playing with a lossless FLAC track, and word-synced lyrics">
 </p>
 
-Stash grabs your Spotify and YouTube Music playlists and puts them on your Android phone. Download them, stream them, mix and match. FLAC when it exists.
+Stash grabs your Spotify and YouTube Music playlists and mirrors them on your Android phone. Download them, stream them, mix and match. Hi-res when it exists.
 
 No Stash account, no analytics, your logins stay on your phone. Free and open source, forever.
 
