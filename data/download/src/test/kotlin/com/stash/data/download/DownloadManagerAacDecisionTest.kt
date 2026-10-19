@@ -146,7 +146,14 @@ class DownloadManagerAacDecisionTest {
         clearMocks(tidalAacResolver, jioSaavnResolver, downloadExecutor, losslessUrlDownloader, losslessRegistry, answers = false)
         coEvery { losslessPrefs.downloadModeNow() } returns mode
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns fallbackOn
-        coEvery { tidalAacResolver.resolve(any(), any(), any()) } returns if (tidalHasAac) com.stash.data.download.lossless.tidal.TidalAac.Found(tidalAac) else com.stash.data.download.lossless.tidal.TidalAac.NoAac
+        // As the real stack answers: a spent day gets nothing from Tidal (AAC counts toward it).
+        coEvery { tidalAacResolver.resolve(any(), any(), any()) } answers {
+            when {
+                losslessQuota.isSpent() -> com.stash.data.download.lossless.tidal.TidalAac.Unavailable(com.stash.data.download.lossless.tidal.TidalAac.Reason.SPENT, 0L)
+                tidalHasAac -> com.stash.data.download.lossless.tidal.TidalAac.Found(tidalAac)
+                else -> com.stash.data.download.lossless.tidal.TidalAac.NoAac
+            }
+        }
         losslessQuota.onHeaders(if (allowanceSpent) "500/500" else "10/500", "${now / 1000 + 3600}")
     }
 
@@ -211,16 +218,30 @@ class DownloadManagerAacDecisionTest {
     }
 
     @Test
-    fun `fallback on + Tidal has AAC takes it before JioSaavn and YouTube, allowance spent or not`() = runTest {
+    fun `fallback on + Tidal has AAC takes it before JioSaavn and YouTube`() = runTest {
         for (row in Row.values()) {
-            for (spent in listOf(false, true)) {
-                arrange(fallbackOn = true, tidalHasAac = true, allowanceSpent = spent)
+            arrange(fallbackOn = true, tidalHasAac = true, allowanceSpent = false)
 
-                val result = download(row)
+            val result = download(row)
 
-                assertEquals("$row, spent=$spent", TrackDownloadResult.Success(SAVED_AAC), result)
-                coVerify(exactly = 0) { jioSaavnResolver.resolve(any(), any()) }
-                coVerify(exactly = 0) { downloadExecutor.download(any(), any(), any(), any(), any()) }
+            assertEquals("$row", TrackDownloadResult.Success(SAVED_AAC), result)
+            coVerify(exactly = 0) { jioSaavnResolver.resolve(any(), any()) }
+            coVerify(exactly = 0) { downloadExecutor.download(any(), any(), any(), any(), any()) }
+        }
+    }
+
+    @Test
+    fun `fallback on + allowance spent gets no Tidal AAC and goes to JioSaavn, then YouTube`() = runTest {
+        // AAC counts toward the day's allowance: past it, neither Tidal nor Qobuz answers.
+        for (row in Row.values()) {
+            arrange(fallbackOn = true, tidalHasAac = true, allowanceSpent = true)
+
+            val result = download(row)
+
+            assertTrue("$row: expected the YouTube rung, got $result", result is TrackDownloadResult.Failed)
+            coVerifyOrder {
+                jioSaavnResolver.resolve(any(), any())
+                downloadExecutor.download(any(), any(), any(), any(), any())
             }
         }
     }
@@ -264,24 +285,37 @@ class DownloadManagerAacDecisionTest {
     // | any      | has it    | Tidal AAC (?aac=only), even for a song with FLAC         |
     // | off      | none      | waits ("Not available as AAC yet")                      |
     // | on       | none      | JioSaavn, then YouTube                                   |
-    // Never a lossless lookup, so the daily allowance doesn't enter into it.
+    // Never a lossless lookup. Each AAC answer uses the daily allowance, so a spent day stops
+    // it like FLAC: fallback on → JioSaavn, then YouTube; off → waits for the reset.
 
     @Test
     fun `AAC mode saves Tidal AAC for every row type, and never asks for FLAC`() = runTest {
         for (row in Row.values()) {
             for (fallbackOn in listOf(false, true)) {
-                for (spent in listOf(false, true)) {
-                    arrange(fallbackOn = fallbackOn, tidalHasAac = true, allowanceSpent = spent, mode = DownloadMode.AAC)
+                arrange(fallbackOn = fallbackOn, tidalHasAac = true, allowanceSpent = false, mode = DownloadMode.AAC)
 
-                    val result = download(row)
+                val result = download(row)
 
-                    assertEquals("$row, fallback=$fallbackOn, spent=$spent", TrackDownloadResult.Success(SAVED_AAC), result)
-                    coVerify(exactly = 1) { tidalAacResolver.resolve(any(), aacOnly = true, foreground = any()) }
-                    coVerify(exactly = 0) { losslessRegistry.resolve(any()) }
-                    coVerify(exactly = 0) { jioSaavnResolver.resolve(any(), any()) }
-                    coVerify(exactly = 0) { downloadExecutor.download(any(), any(), any(), any(), any()) }
-                }
+                assertEquals("$row, fallback=$fallbackOn", TrackDownloadResult.Success(SAVED_AAC), result)
+                coVerify(exactly = 1) { tidalAacResolver.resolve(any(), aacOnly = true, foreground = any()) }
+                coVerify(exactly = 0) { losslessRegistry.resolve(any()) }
+                coVerify(exactly = 0) { jioSaavnResolver.resolve(any(), any()) }
+                coVerify(exactly = 0) { downloadExecutor.download(any(), any(), any(), any(), any()) }
             }
+        }
+    }
+
+    @Test
+    fun `AAC mode with the allowance spent - fallback off waits for the reset, on goes lossy`() = runTest {
+        for (row in Row.values()) {
+            arrange(fallbackOn = false, tidalHasAac = true, allowanceSpent = true, mode = DownloadMode.AAC)
+            assertEquals("$row", TrackDownloadResult.Deferred(DownloadWaitReason.RESET), download(row))
+            coVerify(exactly = 0) { downloadExecutor.download(any(), any(), any(), any(), any()) }
+
+            arrange(fallbackOn = true, tidalHasAac = true, allowanceSpent = true, mode = DownloadMode.AAC)
+            val lossy = download(row)
+            assertTrue("$row: expected the YouTube rung, got $lossy", lossy is TrackDownloadResult.Failed)
+            coVerify(exactly = 0) { losslessRegistry.resolve(any()) }
         }
     }
 

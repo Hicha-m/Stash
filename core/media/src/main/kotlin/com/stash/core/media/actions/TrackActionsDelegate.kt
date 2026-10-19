@@ -527,7 +527,7 @@ class TrackActionsDelegate @Inject constructor(
                             // Today's Tidal & Qobuz allowance is used up; it goes out after the reset.
                             _downloadingIds.update { it - key }
                             _waitingForLosslessIds.update { it + key }
-                            _userMessages.tryEmit("Daily limit reached. It downloads after the reset.")
+                            _userMessages.tryEmit("Daily Tidal & Qobuz limit reached. It downloads after the reset.")
                         }
                         is SearchDownloadStatus.WaitingForTidal -> {
                             // Tidal had no answer yet (busy); the retry sweep tries again shortly.

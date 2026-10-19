@@ -55,19 +55,16 @@ export default {
         if (caller.denial) return caller.denial;
         const quota = await admitStream(request, env);
         if (quota.denial) return quota.denial;
-        // The daily lossless counter, shared with the Qobuz relay. ?aac=only is never lossless: never capped or counted.
-        let aac = aacMode(url);
-        const standing = caller.subject && aac !== "only" ? await readStanding(request, env, caller.subject, now()) : null;
-        if (standing?.over) {
-          // Over the cap, ?aac=1 (the app's streaming path) still plays: Tidal's AAC, uncounted. Anything else is the 429.
-          if (aac !== "1") { const cap = capAnswer(standing, now()); return json(cap.body, cap.status, cap.headers); }
-          aac = "cap";
-        }
+        // The daily counter, shared with the Qobuz relay. Tidal's AAC (?aac=1, ?aac=only) counts like FLAC, and past
+        // the cap every mode gets the 429: no uncounted AAC after it.
+        const aac = aacMode(url);
+        const standing = caller.subject ? await readStanding(request, env, caller.subject, now()) : null;
+        if (standing?.over) { const cap = capAnswer(standing, now()); return json(cap.body, cap.status, cap.headers); }
         const { response, upstream } = await stream(streamMatch[1], request, env, quota, aac);
         // Like Qobuz's answered-mint quota: successful streams and definitive
         // track misses count once per caller request; upstream/account failures do not.
         if (response.status === 200 || response.status === 404) await spendStream(request, env, quota, upstream);
-        if (standing) await meterLossless(response, standing, aac === "cap");
+        if (standing) await meterLossless(response, standing);
         return response;
       }
       const dashMatch = path.match(/^\/dash\/td\/(\d+)(?:\.mpd|\/init\.mp4)$/);
@@ -250,15 +247,11 @@ async function stream(trackId, request, env, quota = {}, aac = aacMode(new URL(r
   const url = new URL(request.url);
   const web = url.searchParams.get("web") === "1" ? "web" : "app";
   const keyFor = (mode) => `stream:${env.TIDAL_COUNTRY_CODE || "US"}:${trackId}:aac=${mode}:web=${web}`;
-  const key = keyFor(aac);
-  if (aac === "cap") {
-    // Past the daily cap, ?aac=1's own warm entry is the answer when it is already Tidal's AAC (a CD-only track)
-    // or a track-level miss: no Tidal call for an answer the relay already holds. A warm FLAC entry is not
-    // servable here, so only then is the cap's own entry (or Tidal, asked for HIGH) consulted.
-    const warm = await cachedJson(env, keyFor("1"));
-    if (warm && await capServable(warm)) return { response: warm, upstream: false };
-  }
-  const cached = await cachedJson(env, key);
+  const noHires = skipsHires(url, aac);
+  const key = keyFor(noHires ? "only-nohires" : aac);
+  // ?aac=only&hires=0 (the app's AAC downloads) is served by the full ?aac=only entry when that is
+  // warm: the same AAC, with a hires field the app ignores.
+  const cached = await cachedJson(env, key) || (noHires ? await cachedJson(env, keyFor("only")) : null);
   if (cached) return { response: cached, upstream: false };
   if (quota.globalFull) return { response: globalCapped(), upstream: false };
   if (await softOpenBlocks(env)) return { response: busy(), upstream: false };
@@ -267,9 +260,7 @@ async function stream(trackId, request, env, quota = {}, aac = aacMode(new URL(r
   let body;
   try { body = await response.clone().json(); } catch { return { response, upstream: true }; }
   if (response.status === 404 && body.error === "lossless_unavailable") {
-    // In cap mode this only means Tidal's HIGH answer was not a progressive AAC file: no lasting verdict on the
-    // track, so it is kept hours, not days.
-    await cacheJson(env, key, response, aac === "cap" ? NOT_AVAILABLE_TTL : RESPONSE_CACHE_TTL);
+    await cacheJson(env, key, response, RESPONSE_CACHE_TTL);
   } else if (response.status === 404 && body.error === "not_available") {
     await cacheJson(env, key, response, NOT_AVAILABLE_TTL);
   } else if (response.status === 200) {
@@ -280,16 +271,15 @@ async function stream(trackId, request, env, quota = {}, aac = aacMode(new URL(r
   return { response, upstream: true };
 }
 
-/** A cached ?aac=1 answer that is right past the cap too: Tidal's AAC, or a track-level not_available. */
-async function capServable(cached) {
-  const body = await cached.clone().json().catch(() => ({}));
-  return (cached.status === 200 && body.codec === "aac") || (cached.status === 404 && body.error === "not_available");
+/**
+ * ?aac=only&hires=0: Tidal's AAC without the Hi-Res metadata lookup (one Tidal call fewer). The app's AAC
+ * downloads ask this way; the web player keeps ?aac=only, which reports `hires`. Counted the same.
+ */
+function skipsHires(url, aac) {
+  return aac === "only" && url.searchParams.get("hires") === "0";
 }
 
-/**
- * ?aac as one of "", "1", "only": anything else is "", so callers cannot mint unbounded cache namespaces.
- * The relay itself adds a fourth mode, "cap": ?aac=1 past the daily lossless cap (AAC like "only", without hires).
- */
+/** ?aac as one of "", "1", "only": anything else is "", so callers cannot mint unbounded cache namespaces. */
 function aacMode(url) {
   const aac = url.searchParams.get("aac");
   return aac === "1" || aac === "only" ? aac : "";
@@ -301,8 +291,7 @@ async function streamUncached(trackId, request, env, aac = aacMode(new URL(reque
   // download path, which must never save AAC as FLAC, keeps the lossless-only answer.
   // ?aac=only (the web player): ask Tidal for its 320 kbps AAC straight away, for any
   // track. A browser can only play Tidal's progressive file; Hi-Res comes as DASH.
-  // "cap" (?aac=1 past the daily lossless cap) asks for AAC straight away too, but skips the web player's hires lookup.
-  const aacOnly = aac === "only" || aac === "cap";
+  const aacOnly = aac === "only";
   const allowAac = aac === "1" || aacOnly;
   // Upstream budget: one playbackinfo call per seat taken. A second seat is only tried
   // after a seat-level failure (failed refresh, Tidal 5xx), never for a
@@ -335,7 +324,7 @@ async function streamUncached(trackId, request, env, aac = aacMode(new URL(reque
       continue;
     }
     const info = await data.json();
-    if (aacOnly) return aacInfo(info, aac === "only" ? await trackHires(trackId, env, request) : undefined);
+    if (aacOnly) return aacInfo(info, skipsHires(new URL(request.url), aac) ? undefined : await trackHires(trackId, env, request));
     if (!["LOSSLESS", "HI_RES_LOSSLESS"].includes(info.audioQuality)) {
       // The normal answer for a CD-only track with this client, not a seat problem.
       return allowAac ? aacInfo(info) : json({ error: "lossless_unavailable" }, 404);
@@ -813,20 +802,14 @@ let warnedNoRelayKey = false;
 function installUnauthorized() { return json({ error: "unauthorized" }, 401, { "X-Stash-Server-Time": String(now()) }); }
 
 /**
- * After a /stream answer: a 200 with codec "flac" (progressive, DASH or edge, a relay cache hit included) costs
- * one unit and carries the counter headers. AAC, 404s and errors are free. `fallback` (?aac=1 past the cap):
- * the AAC answer and a 404 (no AAC either, or not on Tidal) carry the headers, uncounted, so the app sees the
- * day is spent and does not file the 404 as a lasting lossless miss.
+ * After a /stream answer: a 200 that is FLAC (progressive, DASH or edge) or Tidal's AAC (?aac=1 on a CD-only track,
+ * ?aac=only), a relay cache hit included, costs one unit and carries the counter headers. 404s and errors are free.
  */
-async function meterLossless(response, standing, fallback) {
-  if (fallback) {
-    if (response.status !== 200 && response.status !== 404) return;
-  } else {
-    if (response.status !== 200) return;
-    const body = await response.clone().json().catch(() => ({}));
-    if (body.codec !== "flac") return;
-    await spendLossless(standing);
-  }
+async function meterLossless(response, standing) {
+  if (response.status !== 200) return;
+  const body = await response.clone().json().catch(() => ({}));
+  if (body.codec !== "flac" && body.codec !== "aac") return;
+  await spendLossless(standing);
   for (const [k, v] of Object.entries(losslessHeaders(standing))) response.headers.set(k, v);
 }
 
