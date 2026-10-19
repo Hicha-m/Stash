@@ -49,7 +49,7 @@ No Stash account, no analytics, your logins stay on your phone. Free and open so
   <tr>
     <td width="50%" valign="top">
 
-#### 🎚️ Sound
+####  Sound
 - Real FLAC, up to Hi-Res
 - 5-band EQ, bass boost, crossfade, normalizer
 - Cast to Chromecast and Nest speakers
