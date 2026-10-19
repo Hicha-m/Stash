@@ -13,6 +13,11 @@ import com.stash.core.data.db.dao.TopAlbumRow
 import com.stash.core.data.db.dao.TopArtistRow
 import com.stash.core.data.db.dao.TopTrackRow
 import com.stash.core.data.db.entity.ArtistImageEntity
+import com.stash.core.data.genre.ArtistGenreIndex
+import com.stash.core.data.genre.ArtistGenreRepository
+import com.stash.core.data.genre.ArtistWeight
+import com.stash.core.data.genre.TopGenres
+import com.stash.core.data.genre.TopGenresCalculator
 import com.stash.core.data.listening.DayRange
 import com.stash.core.data.listening.ListeningHistoryRepository
 import com.stash.core.data.listening.ListeningRange
@@ -45,6 +50,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.transformLatest
@@ -92,6 +98,13 @@ data class ListeningStatsState(
     /** The range's top songs, one row per song (up to 100): the screen lists five, Play plays them all. */
     val topSongs: List<TopTrackRow> = emptyList(),
     val topAlbums: List<TopAlbumRow> = emptyList(),
+    /**
+     * The range's top genres, weighted by each main act's listening time (Last.fm artist tags).
+     * Shown only when [TopGenres.isShowable] (enough of the listening has a genre).
+     */
+    val topGenres: TopGenres = TopGenres.EMPTY,
+    /** What [topGenres] is computed from (raw credits' listening time); not shown. */
+    internal val genreWeights: List<ArtistWeight> = emptyList(),
     /** Listens per hour 0..23. */
     val hourly: List<Int> = List(24) { 0 },
     val peakHour: Int? = null,
@@ -138,6 +151,10 @@ class ListeningStatsViewModel @VisibleForTesting internal constructor(
     private val connectivityMonitor: ConnectivityMonitor,
     private val firstDayOfWeek: DayOfWeek,
     computeDispatcher: CoroutineDispatcher,
+    /** Cached artist genres ([ArtistGenreRepository.genreIndex]); none in tests that don't care. */
+    private val genreIndex: Flow<ArtistGenreIndex> = flowOf(ArtistGenreIndex.EMPTY),
+    /** Asks for genres of newly listened artists ([ArtistGenreRepository.requestRefresh]). */
+    requestGenreRefresh: () -> Unit = {},
 ) : ViewModel() {
 
     @Inject
@@ -147,10 +164,18 @@ class ListeningStatsViewModel @VisibleForTesting internal constructor(
         artistImages: ArtistImageDao,
         playerRepository: PlayerRepository,
         connectivityMonitor: ConnectivityMonitor,
+        genres: ArtistGenreRepository,
     ) : this(
         savedStateHandle, history, artistImages, playerRepository, connectivityMonitor,
         ListeningStatsCalculator.firstDayOfWeek(), Dispatchers.Default,
+        genres.genreIndex, genres::requestRefresh,
     )
+
+    init {
+        // Opening Your listening fetches genres for artists heard since the last run (a unique,
+        // KEEP one-off job: cheap to ask for again).
+        runCatching(requestGenreRefresh).onFailure { Log.w(TAG, "genre refresh request failed", it) }
+    }
 
     private val _range = MutableStateFlow(ListeningInsights.rangeOf(savedStateHandle.get<String>(ARG_RANGE)))
 
@@ -240,6 +265,8 @@ class ListeningStatsViewModel @VisibleForTesting internal constructor(
                 artists = artistsWithPhotos(acts.take(ARTISTS_SHOWN), photos),
                 artistCount = acts.size,
                 albums = ListeningInsights.byMainAlbum(albums).take(ALBUMS_SHOWN),
+                // Every credit of the range (not just the shown ten) weighs in, by listening time.
+                genreWeights = ListeningInsights.artistWeights(artists),
             )
         }
 
@@ -262,6 +289,7 @@ class ListeningStatsViewModel @VisibleForTesting internal constructor(
                 topArtists = t.artists,
                 topSongs = t.songs,
                 topAlbums = t.albums,
+                genreWeights = t.genreWeights,
                 hourly = hourly.toList(),
                 peakHour = ListeningInsights.peakHour(hourly),
                 daySplit = ListeningInsights.daySplit(hourly),
@@ -274,11 +302,23 @@ class ListeningStatsViewModel @VisibleForTesting internal constructor(
             )
         }
 
+        // Genres join last, in their own small step: a genre-cache change (the worker filling
+        // in artists) recomputes only this, not the songs/artists grouping above, and a failing
+        // genre read leaves the rest of the screen standing (no genres instead).
+        val safeIndex = genreIndex.catch { e ->
+            if (e is CancellationException) throw e
+            Log.w(TAG, "genre index failed", e)
+            emit(ArtistGenreIndex.EMPTY)
+        }
+        val withGenres = combine(base, safeIndex) { s, index ->
+            s.copy(topGenres = TopGenresCalculator.compute(s.genreWeights, index, GENRES_SHOWN))
+        }
+
         // The highlights are one-off reads: kept while the range's play count stays the same,
         // read again when it changes (the screen shows the last ones meanwhile).
         var highlightsFor = -1
         var highlights = Highlights.NONE
-        return base.transformLatest { s ->
+        return withGenres.transformLatest { s ->
             emit(s.with(highlights))
             if (s.totals.plays != highlightsFor) {
                 highlights = readHighlights(days, first)
@@ -314,6 +354,7 @@ class ListeningStatsViewModel @VisibleForTesting internal constructor(
         val artists: List<TopArtistUi>,
         val artistCount: Int,
         val albums: List<TopAlbumRow>,
+        val genreWeights: List<ArtistWeight>,
     )
 
     private data class Highlights(val obsession: ObsessionRow?, val newSongs: Int, val bestNewFind: TopTrackRow?) {
@@ -333,6 +374,9 @@ class ListeningStatsViewModel @VisibleForTesting internal constructor(
 
         /** Albums on the screen's cover row. */
         const val ALBUMS_SHOWN = 10
+
+        /** Genre bars on the screen. */
+        const val GENRES_SHOWN = 5
 
         /** "On repeat" needs a song played at least this often in one day. */
         const val OBSESSION_MIN_PLAYS = 3
