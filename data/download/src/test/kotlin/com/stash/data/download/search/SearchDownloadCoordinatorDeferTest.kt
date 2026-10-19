@@ -86,7 +86,7 @@ class SearchDownloadCoordinatorDeferTest {
         context = context,
         losslessPrefs = losslessPrefs,
         jioSaavnResolver = jioSaavnResolver,
-        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any()) } returns null },
+        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any(), any(), any()) } returns com.stash.data.download.lossless.tidal.TidalAac.NoAac },
         losslessUrlDownloader = losslessUrlDownloader,
         audioDurationExtractor = audioDurationExtractor,
         downloadQueueDao = downloadQueueDao,
@@ -108,7 +108,7 @@ class SearchDownloadCoordinatorDeferTest {
     @Test
     fun `registry-null + fallback-off emits WaitingForLossless and writes DB row`() = runTest {
         // Defer only makes sense with lossless ON (master switch) + fallback OFF.
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
         coEvery { registry.resolve(any()) } returns null
         // Search-tab defer path looks up the Track row by youtubeId first,
@@ -141,7 +141,7 @@ class SearchDownloadCoordinatorDeferTest {
         )
         // WAITING_FOR_LOSSLESS, and marked as the user's ask in the same write, so the
         // leftover cleanup keeps it and the lossless retry takes it (#532).
-        coVerify { downloadQueueDao.deferForTap(99L) }
+        coVerify { downloadQueueDao.deferForTap(99L, "wait:lossless") }
     }
 
     @Test
@@ -152,7 +152,7 @@ class SearchDownloadCoordinatorDeferTest {
         // search path previously ignored enabledNow(), so with lossless off +
         // fallback off + sources down, every artist-page download hung on
         // "waiting for lossless".)
-        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.OPUS
         // yt-dlp path builds File(context.cacheDir, ...); give it a real dir.
         every { context.cacheDir } returns
             java.io.File(System.getProperty("java.io.tmpdir"), "stashtest").apply { mkdirs() }
@@ -174,7 +174,7 @@ class SearchDownloadCoordinatorDeferTest {
         // Bug: the search-tab yt-dlp fallback passed qualityArgs = emptyList(),
         // so yt-dlp used its default `bv*+ba/b` (best video + audio) and ignored
         // the user's tier. LOW (not the MAX default) proves the pref is read.
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns true
         coEvery { registry.resolve(any()) } returns null
         every { qualityPrefs.qualityTier } returns flowOf(QualityTier.LOW)

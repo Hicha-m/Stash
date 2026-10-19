@@ -52,7 +52,13 @@ class LosslessUpgraderImpl @Inject constructor(
     private val availability: LosslessAvailability,
 ) : LosslessUpgrader {
 
-    override suspend fun isLosslessEnabled(): Boolean = losslessPrefs.enabledNow()
+    /**
+     * Whether downloads are in Lossless mode (Download quality). In AAC 320 or Opus mode no
+     * FLAC upgrade sweep runs: the user chose a smaller format, and the files they have stay.
+     * Not the Lossless switch, which is streaming only.
+     */
+    override suspend fun isLosslessEnabled(): Boolean =
+        losslessPrefs.downloadModeNow() == com.stash.core.model.DownloadMode.LOSSLESS
 
     override suspend fun upgradeToLossless(track: Track, sweep: Boolean): UpgradeResult = runCatching {
         // Capture old path BEFORE the download — the row's current file_path
@@ -79,7 +85,7 @@ class LosslessUpgraderImpl @Inject constructor(
             }
             is TrackDownloadResult.Unmatched,
             is TrackDownloadResult.Failed,
-            TrackDownloadResult.Deferred -> UpgradeResult.NoMatch
+            is TrackDownloadResult.Deferred -> UpgradeResult.NoMatch
         }
     }.getOrElse { e ->
         // A stop is not a failed lookup: the caller (the FLAC upgrade worker's cancel

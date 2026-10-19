@@ -83,7 +83,7 @@ class DownloadManagerDeferTest {
         mockk(relaxed = true)
     private val losslessHealthGate: com.stash.data.download.lossless.LosslessSourceHealthGate =
         mockk(relaxed = true)
-    private val tidalAacResolver: TidalAacResolver = mockk { coEvery { resolve(any()) } returns null }
+    private val tidalAacResolver: TidalAacResolver = mockk { coEvery { resolve(any(), any(), any()) } returns com.stash.data.download.lossless.tidal.TidalAac.NoAac }
     private val now = 1_792_238_400_000L
     private val losslessQuota = LosslessQuota.inMemory { now }
 
@@ -126,7 +126,7 @@ class DownloadManagerDeferTest {
     @Test
     fun `registry-null + fallback-off returns Deferred`() = runTest {
         // Lossless on, fallback off, registry returns null, NOT a Stash Mix track.
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
@@ -140,7 +140,7 @@ class DownloadManagerDeferTest {
     fun `a deferred download ends its live progress with DEFERRED`() = runTest {
         // It used to end on the lossless attempt's DOWNLOADING, so Downloads showed
         // the track "Downloading" for as long as it waited for lossless.
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
@@ -157,7 +157,7 @@ class DownloadManagerDeferTest {
     fun `registry-null + fallback-on falls through to yt-dlp path`() = runTest {
         // Fallback on — even when registry returns null, the pipeline should
         // proceed past the deferral check into the yt-dlp branch.
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns true
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
@@ -182,7 +182,7 @@ class DownloadManagerDeferTest {
         // track downloaded as lossy mp4 even with fallback OFF (671 such
         // tracks observed on-device). A SPOTIFY-source track's youtube_id is
         // a match, NOT a user opt-in to YouTube, so it must defer.
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
@@ -211,7 +211,7 @@ class DownloadManagerDeferTest {
         // through to yt-dlp here via the youtubeOptIn carve-out; that carve-out
         // is removed so it defers like every other track,
         // matching SearchDownloadCoordinator's unconditional gate.
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
@@ -232,7 +232,7 @@ class DownloadManagerDeferTest {
         // #521: "Lossy fallback" off means FLAC only, mix included. A Stash Mix
         // track used to skip this gate and download lossy anyway. The search
         // stubs keep a regression failing on the assertion, not inside yt-dlp.
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns true
@@ -250,7 +250,7 @@ class DownloadManagerDeferTest {
         // #521: Lossless off, yet mix songs arrived as FLAC. The switch governs
         // the mix too: no registry call, no mix lookup, straight to the lossy
         // rungs (JioSaavn, then YouTube, whose empty search ends in Unmatched).
-        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.OPUS
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns true
         coEvery { albumMatchExecutor.findTrackInAlbum(any(), any(), any(), any()) } returns null
@@ -270,17 +270,17 @@ class DownloadManagerDeferTest {
     private fun allowanceSpent() = losslessQuota.onHeaders("500/500", "${now / 1000 + 3600}")
 
     private fun tidalAacHasIt() {
-        coEvery { tidalAacResolver.resolve(any()) } returns SourceResult(
+        coEvery { tidalAacResolver.resolve(any(), any(), any()) } returns com.stash.data.download.lossless.tidal.TidalAac.Found(SourceResult(
             sourceId = TidalAacResolver.SOURCE_ID,
             downloadUrl = "https://cdn.example/a.mp4",
             format = AudioFormat(codec = "aac", bitrateKbps = 320),
             confidence = 0.99f,
-        )
+        ))
     }
 
     @Test
     fun `spent allowance + fallback off waits for the reset and saves no Tidal AAC, switch on or not`() = runTest {
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
         coEvery { losslessRegistry.resolve(any()) } returns null // the relay rungs skip while spent
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
@@ -290,13 +290,13 @@ class DownloadManagerDeferTest {
         val result = newSubject().downloadTrack(track = stubTrack(), preResolvedUrl = null)
 
         assertTrue("expected Deferred, got $result", result is TrackDownloadResult.Deferred)
-        coVerify(exactly = 0) { tidalAacResolver.resolve(any()) }
+        coVerify(exactly = 0) { tidalAacResolver.resolve(any(), any(), any()) }
         coVerify(exactly = 0) { losslessUrlDownloader.download(any(), any(), any()) }
     }
 
     @Test
     fun `spent allowance + fallback on keeps going lossy`() = runTest {
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns true
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
@@ -309,12 +309,12 @@ class DownloadManagerDeferTest {
 
         // The lossy rungs ran: Tidal AAC first, then JioSaavn, then YouTube (whose empty search is Unmatched).
         assertTrue("expected the YouTube rung's Unmatched, got $result", result is TrackDownloadResult.Unmatched)
-        coVerify(exactly = 1) { tidalAacResolver.resolve(any()) }
+        coVerify(exactly = 1) { tidalAacResolver.resolve(any(), any(), any()) }
     }
 
     @Test
     fun `allowance not spent + fallback off still tries Tidal AAC as before`() = runTest {
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
         coEvery { losslessRegistry.resolve(any()) } returns null
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
@@ -322,7 +322,7 @@ class DownloadManagerDeferTest {
 
         val result = newSubject().downloadTrack(track = stubTrack(), preResolvedUrl = null)
 
-        coVerify(exactly = 1) { tidalAacResolver.resolve(any()) }
+        coVerify(exactly = 1) { tidalAacResolver.resolve(any(), any(), any()) }
         // The resolver had nothing, so the strict-FLAC download waits as before.
         assertTrue("expected Deferred, got $result", result is TrackDownloadResult.Deferred)
     }
@@ -337,7 +337,7 @@ class DownloadManagerDeferTest {
 
     @Test
     fun `a paced download waits for FLAC even with the YouTube fallback on`() = runTest {
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns true
         coEvery { playlistDao.isTrackInStashMix(any()) } returns false
         registryPacesDownloads()
@@ -349,7 +349,7 @@ class DownloadManagerDeferTest {
 
     @Test
     fun `a paced Stash Mix track keeps its exemption and does not defer`() = runTest {
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns true
         coEvery { playlistDao.isTrackInStashMix(any()) } returns true
         registryPacesDownloads()

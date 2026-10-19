@@ -83,7 +83,7 @@ class SearchDownloadCoordinatorVideoIdTest {
         context = context,
         losslessPrefs = losslessPrefs,
         jioSaavnResolver = jioSaavnResolver,
-        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any()) } returns null },
+        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any(), any(), any()) } returns com.stash.data.download.lossless.tidal.TidalAac.NoAac },
         losslessUrlDownloader = losslessUrlDownloader,
         audioDurationExtractor = audioDurationExtractor,
         downloadQueueDao = downloadQueueDao,
@@ -125,7 +125,7 @@ class SearchDownloadCoordinatorVideoIdTest {
 
     @Test
     fun `a malformed id never reaches yt-dlp`() = runTest {
-        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.OPUS
 
         malformedIds.forEach { id ->
             assertFailed(newSubject().download(item(id)).toList(), id)
@@ -137,7 +137,7 @@ class SearchDownloadCoordinatorVideoIdTest {
 
     @Test
     fun `a malformed id never reaches the lossless or JioSaavn temp files`() = runTest {
-        coEvery { losslessPrefs.enabledNow() } returns true
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
         coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns true
 
         malformedIds.forEach { id ->
@@ -152,7 +152,7 @@ class SearchDownloadCoordinatorVideoIdTest {
 
     @Test
     fun `a real video id still downloads through yt-dlp`() = runTest {
-        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.OPUS
         val tempFile = File.createTempFile("search_yt", ".opus").apply { deleteOnExit() }
         coEvery { downloadExecutor.download(any(), any(), any(), any(), any()) } returns
             DownloadResult.Success(tempFile)

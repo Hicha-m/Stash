@@ -32,8 +32,12 @@ import com.stash.data.download.lossless.TrackQuery
 import com.stash.data.download.lossless.forLibrarySource
 import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossyAacLengthMatches
+import com.stash.core.model.DownloadMode
+import com.stash.core.model.DownloadWaitReason
+import com.stash.data.download.lossless.tidal.TidalAac
 import com.stash.core.model.MusicSource
 import com.stash.data.download.lyrics.LyricsFetchTrigger
+import com.stash.data.download.prefs.toOpusYtDlpArgs
 import com.stash.data.download.prefs.toYtDlpArgs
 import com.stash.data.download.shared.TrackFinalizer
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -224,7 +228,14 @@ class SearchDownloadCoordinator @Inject constructor(
                 )
             }
             is DownloadJobResult.Deferred -> {
-                emit(SearchDownloadStatus.WaitingForLossless)
+                emit(
+                    when (job.reason) {
+                        DownloadWaitReason.AAC -> SearchDownloadStatus.WaitingForAac
+                        DownloadWaitReason.RESET -> SearchDownloadStatus.WaitingForAllowance
+                        DownloadWaitReason.TIDAL_BUSY -> SearchDownloadStatus.WaitingForTidal
+                        DownloadWaitReason.LOSSLESS, DownloadWaitReason.FALLBACK -> SearchDownloadStatus.WaitingForLossless
+                    },
+                )
             }
         }
     }
@@ -233,17 +244,44 @@ class SearchDownloadCoordinator @Inject constructor(
     // Internal: resolve + route
     // -------------------------------------------------------------------------
 
-    private suspend fun performDownload(track: TrackItem): DownloadJobResult {
-        // Master lossless switch OFF → skip the registry (and the strict-FLAC
-        // defer) entirely and go straight to yt-dlp, mirroring
-        // DownloadManager.executeDownload. Without this, "lossless off" still
-        // resolved the registry, missed (sources down / no captcha cookie),
-        // and — with fallback also off — deferred to WAITING_FOR_LOSSLESS, so
-        // artist-page / search downloads hung on "waiting for lossless" forever.
-        if (!losslessPrefs.enabledNow()) {
-            return finalizeFromLossyFallback(track)
+    /**
+     * Routes by the user's Download quality, as DownloadManager does: Lossless (FLAC first),
+     * AAC 320 (Tidal's AAC only, no lossless lookup) or Opus (YouTube only).
+     */
+    private suspend fun performDownload(track: TrackItem): DownloadJobResult =
+        when (losslessPrefs.downloadModeNow()) {
+            DownloadMode.LOSSLESS -> performLosslessDownload(track)
+            DownloadMode.AAC -> performAacDownload(track)
+            // Opus (smallest): YouTube only, always Opus. No registry, Tidal or JioSaavn lookup,
+            // and so no "waiting for lossless" either: with lossless off this path used to hang there.
+            DownloadMode.OPUS -> DownloadJobResult.Resolved(
+                source = SearchDownloadStatus.Source.YOUTUBE,
+                outcome = finalizeFromYtDlp(track, opusOnly = true),
+            )
         }
 
+    /**
+     * AAC 320: Tidal's AAC whatever Tidal has (`?aac=only`), never FLAC. With none: JioSaavn and
+     * then YouTube when the lossy fallback is on, otherwise [SearchDownloadStatus.WaitingForAac].
+     */
+    private suspend fun performAacDownload(track: TrackItem): DownloadJobResult {
+        val fallbackOn = losslessPrefs.youtubeFallbackEnabledNow()
+        when (val aac = tryTidalAac(track, aacOnly = true)) {
+            is AacStep.Saved -> return aac.result
+            // Busy, paced or failed waits whatever the fallback; a spent day follows it.
+            is AacStep.Wait -> if (!(fallbackOn && aac.reason == TidalAac.Reason.SPENT)) {
+                return deferUntilAvailable(track, waitFor(aac.reason))
+            }
+            AacStep.NoAac -> if (!fallbackOn) {
+                Log.i(TAG, "deferring search download '${track.artist} - ${track.title}': not available as AAC yet, fallback off")
+                return deferUntilAvailable(track, DownloadWaitReason.AAC)
+            }
+        }
+        return finalizeFromLossyFallback(track)
+    }
+
+    /** Lossless: FLAC first, then Tidal's AAC, then (fallback on) JioSaavn and YouTube. */
+    private suspend fun performLosslessDownload(track: TrackItem): DownloadJobResult {
         val match = runCatching { registry.resolve(track.toQuery()) }
             .onFailure { e ->
                 if (e is CancellationException) throw e
@@ -268,14 +306,18 @@ class SearchDownloadCoordinator @Inject constructor(
             // DownloadManager, rather than being saved as Tidal AAC for good.
             if (losslessQuota.isSpent()) {
                 Log.i(TAG, "deferring search download '${track.artist} - ${track.title}': daily lossless allowance spent, fallback off")
-                return deferForLossless(track)
+                return deferUntilAvailable(track, DownloadWaitReason.RESET)
             }
-            tryTidalAac(track)?.let { return it }
+            when (val aac = tryTidalAac(track)) {
+                is AacStep.Saved -> return aac.result
+                is AacStep.Wait -> return deferUntilAvailable(track, waitFor(aac.reason))
+                AacStep.NoAac -> Unit
+            }
             Log.i(
                 TAG,
                 "deferring search download '${track.artist} - ${track.title}': no FLAC or Tidal AAC, fallback off",
             )
-            return deferForLossless(track)
+            return deferUntilAvailable(track, DownloadWaitReason.LOSSLESS)
         }
 
         return finalizeFromLossyFallback(track, losslessAttempted = true)
@@ -290,19 +332,50 @@ class SearchDownloadCoordinator @Inject constructor(
      * deferred. It also marks the row as the user's ask, a sync's too: otherwise the leftover
      * cleanup would drop it, and the lossless retry skip it (#532).
      */
-    private suspend fun deferForLossless(track: TrackItem): DownloadJobResult.Deferred {
+    private suspend fun deferUntilAvailable(track: TrackItem, reason: DownloadWaitReason): DownloadJobResult.Deferred {
         runCatching {
+            // A search result usually has no library row yet: one is made (a stream-only row,
+            // as a Now Playing download tap makes), so the wait is a real queue row the retry
+            // sweep picks up. Otherwise "downloads after the reset" would be a promise nothing kept.
             val trackId = trackDao.findByYoutubeId(track.videoId)?.id
-            if (trackId != null) {
-                downloadQueueDao.getByTrackId(trackId)?.let { row ->
-                    downloadQueueDao.deferForTap(row.id)
-                }
+                ?: musicRepository.ensureTrackPersisted(
+                    track.toDomainStub(null).copy(source = com.stash.core.model.MusicSource.YOUTUBE),
+                )
+            val row = downloadQueueDao.getByTrackId(trackId)
+            if (row != null) {
+                downloadQueueDao.deferForTap(row.id, reason.code)
+            } else {
+                downloadQueueDao.insert(
+                    com.stash.core.data.db.entity.DownloadQueueEntity(
+                        trackId = trackId,
+                        status = com.stash.core.model.DownloadStatus.WAITING_FOR_LOSSLESS,
+                        searchQuery = "${track.artist} - ${track.title}",
+                        youtubeUrl = "https://music.youtube.com/watch?v=${track.videoId}",
+                        errorMessage = reason.code,
+                        userRequested = true,
+                    ),
+                )
             }
         }.onFailure { e ->
             if (e is CancellationException) throw e
             Log.w(TAG, "WAITING_FOR_LOSSLESS DAO write failed for ${track.videoId}: ${e.message}")
         }
-        return DownloadJobResult.Deferred
+        return DownloadJobResult.Deferred(reason)
+    }
+
+    /** The wait for a Tidal AAC step that got no answer: the reset for a spent day, else Tidal busy. */
+    private fun waitFor(reason: TidalAac.Reason): DownloadWaitReason =
+        if (reason == TidalAac.Reason.SPENT) DownloadWaitReason.RESET else DownloadWaitReason.TIDAL_BUSY
+
+    /** What the Tidal AAC step came to. */
+    private sealed interface AacStep {
+        data class Saved(val result: DownloadJobResult.Resolved) : AacStep
+
+        /** No AAC of it (or its file failed the checks): the next rung, if allowed. */
+        data object NoAac : AacStep
+
+        /** No answer from Tidal yet: the download waits, never the lossy fallback. */
+        data class Wait(val reason: TidalAac.Reason) : AacStep
     }
 
     /**
@@ -314,46 +387,61 @@ class SearchDownloadCoordinator @Inject constructor(
      * the download takes the Tidal track the stream played, and its file is held to that
      * row's length the way the matcher held the match ([lossyAacLengthMatches]).
      */
-    private suspend fun tryTidalAac(track: TrackItem): DownloadJobResult.Resolved? {
+    private suspend fun tryTidalAac(track: TrackItem, aacOnly: Boolean = false): AacStep {
         val query = tidalAacQuery(track)
-        val tidalMatch = runCatching { tidalAacResolver.resolve(query) }
+        // A tap: not paced behind a sync's lookups (foreground).
+        val found = runCatching { tidalAacResolver.resolve(query, aacOnly = aacOnly, foreground = true) }
             .onFailure { error ->
                 if (error is CancellationException) throw error
                 Log.w(TAG, "Tidal AAC resolve threw for ${track.videoId}: ${error.message}")
-            }.getOrNull()
-        if (tidalMatch != null) {
-            // The row's length, or the search result's when the row has none (a stub synced
-            // without one). The query keeps the row's own, so it shares streaming's cache key.
-            val length = AacLength(
-                expectedMs = query.durationMs ?: (track.durationSeconds * 1_000).toLong(),
-                reliable = query.durationReliable,
-            )
-            when (val attempt = finalizeFromSource(track, tidalMatch, length)) {
-                is SourceFinalizeAttempt.BeforeCommitFailure -> Log.w(
-                    TAG,
-                    "Tidal AAC failed before commit for ${track.videoId}; moving on: " +
-                        attempt.message,
-                )
-                is SourceFinalizeAttempt.AfterCommit -> {
-                    Log.i(TAG, "Tidal AAC search download committed for ${track.videoId}")
-                    return DownloadJobResult.Resolved(
+            }.getOrElse { TidalAac.Unavailable(TidalAac.Reason.FAILED, 0L) }
+        val tidalMatch = when (found) {
+            is TidalAac.Found -> found.source
+            TidalAac.NoAac -> return AacStep.NoAac
+            is TidalAac.Unavailable -> return AacStep.Wait(found.reason)
+        }
+        // The row's length, or the search result's when the row has none (a stub synced
+        // without one). The query keeps the row's own, so it shares streaming's cache key.
+        val length = AacLength(
+            expectedMs = query.durationMs ?: (track.durationSeconds * 1_000).toLong(),
+            reliable = query.durationReliable,
+        )
+        return when (val attempt = finalizeFromSource(track, tidalMatch, length)) {
+            is SourceFinalizeAttempt.BeforeCommitFailure -> {
+                Log.w(TAG, "Tidal AAC failed before commit for ${track.videoId}: ${attempt.message}")
+                // The CDN didn't deliver: no verdict, try again later. A file that failed the
+                // checks is not this song's AAC: the next rung.
+                if (attempt.transient) AacStep.Wait(TidalAac.Reason.FAILED) else AacStep.NoAac
+            }
+            is SourceFinalizeAttempt.AfterCommit -> {
+                Log.i(TAG, "Tidal AAC search download committed for ${track.videoId}")
+                AacStep.Saved(
+                    DownloadJobResult.Resolved(
                         source = SearchDownloadStatus.Source.TIDAL_AAC,
                         outcome = attempt.outcome,
-                    )
-                }
+                    ),
+                )
             }
         }
-        return null
     }
 
     /** Resolves the preferred lossy fallback, then preserves YouTube as the last resort. */
     private suspend fun finalizeFromLossyFallback(
         track: TrackItem,
         losslessAttempted: Boolean = false,
-    ): DownloadJobResult.Resolved {
+    ): DownloadJobResult {
         // Tidal's 320 kbps AAC first, only after the lossless rung ran and missed
-        // (JioSaavn misses many of these tracks). Lossless off = unchanged chain.
-        if (losslessAttempted) tryTidalAac(track)?.let { return it }
+        // (JioSaavn misses many of these tracks). Lossless off = unchanged chain. Only a definite
+        // "no AAC" (or a spent day) goes on to JioSaavn and YouTube: Tidal busy waits.
+        if (losslessAttempted) {
+            when (val aac = tryTidalAac(track)) {
+                is AacStep.Saved -> return aac.result
+                is AacStep.Wait -> if (aac.reason != TidalAac.Reason.SPENT) {
+                    return deferUntilAvailable(track, DownloadWaitReason.TIDAL_BUSY)
+                }
+                AacStep.NoAac -> Unit
+            }
+        }
         // The Download quality picker sets the JioSaavn variant too.
         val match = runCatching {
             jioSaavnResolver.resolve(track.toQuery(), qualityPrefs.qualityTier.first().toJioSaavnKbps())
@@ -443,6 +531,7 @@ class SearchDownloadCoordinator @Inject constructor(
                 runCatching { tempFile.delete() }
                 return SourceFinalizeAttempt.BeforeCommitFailure(
                     "${match.sourceId} fetch failed: ${error.message}",
+                    transient = true,
                 )
             }
         } else {
@@ -636,7 +725,7 @@ class SearchDownloadCoordinator @Inject constructor(
         )
     }
 
-    private suspend fun finalizeFromYtDlp(track: TrackItem): TrackFinalizer.FinalizeResult {
+    private suspend fun finalizeFromYtDlp(track: TrackItem, opusOnly: Boolean = false): TrackFinalizer.FinalizeResult {
         // download() already refused a malformed id; built from the checked id all the same.
         val url = YouTubeVideoId.watchUrl(track.videoId)
             ?: return TrackFinalizer.FinalizeResult.Failed("Not a valid YouTube video")
@@ -648,7 +737,7 @@ class SearchDownloadCoordinator @Inject constructor(
                 url = url,
                 outputDir = tempDir,
                 filename = filename,
-                qualityArgs = qualityPrefs.qualityTier.first().toYtDlpArgs(),
+                qualityArgs = qualityPrefs.qualityTier.first().let { if (opusOnly) it.toOpusYtDlpArgs() else it.toYtDlpArgs() },
             )
         }.getOrElse { e ->
             if (e is CancellationException) throw e
@@ -1007,13 +1096,14 @@ class SearchDownloadCoordinator @Inject constructor(
             val outcome: TrackFinalizer.FinalizeResult,
         ) : DownloadJobResult
 
-        /** v0.9.17: lossless unavailable + fallback off → WaitingForLossless. */
-        data object Deferred : DownloadJobResult
+        /** Waits in the queue (its row keeps [reason]); the flow emits the matching Waiting status. */
+        data class Deferred(val reason: DownloadWaitReason) : DownloadJobResult
     }
 
     /** Distinguishes fallback-safe temp failures from terminal post-commit outcomes. */
     private sealed interface SourceFinalizeAttempt {
-        data class BeforeCommitFailure(val message: String) : SourceFinalizeAttempt
+        /** [transient]: the file could not be fetched (no verdict), not a file that failed its checks. */
+        data class BeforeCommitFailure(val message: String, val transient: Boolean = false) : SourceFinalizeAttempt
         data class AfterCommit(
             val outcome: TrackFinalizer.FinalizeResult,
         ) : SourceFinalizeAttempt

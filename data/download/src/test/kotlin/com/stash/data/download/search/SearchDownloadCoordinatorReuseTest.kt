@@ -74,7 +74,7 @@ class SearchDownloadCoordinatorReuseTest {
         context = context,
         losslessPrefs = losslessPrefs,
         jioSaavnResolver = mockk<JioSaavnResolver> { coEvery { resolve(any(), any()) } returns null },
-        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any()) } returns null },
+        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any(), any(), any()) } returns com.stash.data.download.lossless.tidal.TidalAac.NoAac },
         losslessUrlDownloader = mockk<LosslessUrlDownloader>(),
         audioDurationExtractor = mockk(),
         downloadQueueDao = mockk<DownloadQueueDao>(relaxed = true),
@@ -89,7 +89,7 @@ class SearchDownloadCoordinatorReuseTest {
     fun setUp() {
         every { context.cacheDir } returns tmpCacheDir
         every { localFileOps.acceptDownloadOrDelete(any()) } returns true
-        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.OPUS
         val tempFile = File.createTempFile("search_reuse", ".opus").apply { deleteOnExit() }
         coEvery { downloadExecutor.download(any(), any(), any(), any(), any()) } returns DownloadResult.Success(tempFile)
         coEvery { trackFinalizer.finalizeFile(any(), any(), any(), any()) } returns

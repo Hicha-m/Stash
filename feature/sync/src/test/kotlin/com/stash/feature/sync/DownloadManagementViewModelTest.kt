@@ -58,6 +58,42 @@ class DownloadManagementViewModelTest {
         assertEquals(null, state.downloading.single().progress)
     }
 
+    @Test fun `each waiting row says why it waits, from its own row`() = runTest {
+        every { dao.observeActiveDownloadRows() } returns flowOf(
+            listOf(
+                row(3, DownloadStatus.WAITING_FOR_LOSSLESS).copy(errorMessage = "wait:aac"),
+                row(4, DownloadStatus.WAITING_FOR_LOSSLESS).copy(errorMessage = "wait:tidal_busy"),
+                row(5, DownloadStatus.WAITING_FOR_LOSSLESS).copy(errorMessage = "wait:reset"),
+                row(6, DownloadStatus.WAITING_FOR_LOSSLESS).copy(errorMessage = "wait:fallback"),
+                row(7, DownloadStatus.WAITING_FOR_LOSSLESS), // from before reasons were kept
+            ),
+        )
+        val state = DownloadManagementViewModel(dao, manager, enqueuer, cancellation).uiState.first { !it.isLoading }
+
+        assertEquals(
+            listOf(
+                "Not available as AAC yet",
+                "Tidal is busy. Trying again shortly.",
+                "Waiting for the daily reset",
+                "Waiting for Lossy fallback to be on",
+                "Waiting for a lossless source",
+            ),
+            state.waiting.map { it.phaseLabel },
+        )
+        assertEquals("Waiting", state.waitingLabel)
+        // The reason code is not shown as an error.
+        assertEquals(null, state.waiting.first().errorMessage)
+    }
+
+    @Test fun `waiting rows that share a reason head their section with it`() = runTest {
+        every { dao.observeActiveDownloadRows() } returns flowOf(
+            listOf(row(3, DownloadStatus.WAITING_FOR_LOSSLESS).copy(errorMessage = "wait:reset")),
+        )
+        val state = DownloadManagementViewModel(dao, manager, enqueuer, cancellation).uiState.first { !it.isLoading }
+
+        assertEquals("Waiting for the daily reset", state.waitingLabel)
+    }
+
     @Test fun `every actionable status offers a way out`() = runTest {
         every { dao.observeActiveDownloadRows() } returns flowOf(
             listOf(

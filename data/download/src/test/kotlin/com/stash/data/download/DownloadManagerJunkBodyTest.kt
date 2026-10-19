@@ -69,7 +69,7 @@ class DownloadManagerJunkBodyTest {
     @Before
     fun setUp() {
         every { qualityPrefs.qualityTier } returns flowOf(QualityTier.MAX)
-        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.OPUS
         coEvery { trackDao.getById(any()) } returns null
         coEvery { fileOrganizer.getTempDir() } returns tmp.root
         coEvery { fileOrganizer.commitDownload(any(), any(), any(), any(), any(), any(), any(), any()) } returns
@@ -93,7 +93,7 @@ class DownloadManagerJunkBodyTest {
         losslessUrlDownloader = losslessUrlDownloader,
         losslessPrefs = losslessPrefs,
         jioSaavnResolver = mockk<JioSaavnResolver> { coEvery { resolve(any(), any()) } returns null },
-        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any()) } returns null },
+        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any(), any(), any()) } returns com.stash.data.download.lossless.tidal.TidalAac.NoAac },
         trackFinalizer = trackFinalizer,
         loudnessMeasurer = mockk(relaxed = true),
         metadataEmbedder = mockk<MetadataEmbedder>(relaxed = true),

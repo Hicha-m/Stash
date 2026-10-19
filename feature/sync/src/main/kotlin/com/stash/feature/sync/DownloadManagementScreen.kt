@@ -169,7 +169,7 @@ private fun QueueContent(
             }
         }
         if (state.waiting.isNotEmpty()) {
-            item(key = "waiting_label") { SectionLabel("Waiting for lossless") }
+            item(key = "waiting_label") { SectionLabel(state.waitingLabel) }
             items(state.waiting, key = { "waiting_${it.queueId}" }) { item ->
                 DownloadRowCard(item, onCancel = onCancel, onRetry = onRetry)
             }

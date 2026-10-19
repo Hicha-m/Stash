@@ -59,7 +59,7 @@ class DownloadManagerTempFileTest {
     @Before
     fun setUp() {
         every { qualityPrefs.qualityTier } returns flowOf(QualityTier.MAX)
-        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.OPUS
         coEvery { trackDao.getById(any()) } returns null
         coEvery { fileOrganizer.getTempDir() } returns tmp.root
         downloaded = tmp.newFile("dl_7_abcd1234.opus").apply { writeText("audio") }
@@ -84,7 +84,7 @@ class DownloadManagerTempFileTest {
         losslessUrlDownloader = mockk<LosslessUrlDownloader>(relaxed = true),
         losslessPrefs = losslessPrefs,
         jioSaavnResolver = mockk<JioSaavnResolver> { coEvery { resolve(any(), any()) } returns null },
-        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any()) } returns null },
+        tidalAacResolver = mockk<com.stash.data.download.lossless.tidal.TidalAacResolver> { coEvery { resolve(any(), any(), any()) } returns com.stash.data.download.lossless.tidal.TidalAac.NoAac },
         trackFinalizer = mockk<TrackFinalizer>(relaxed = true),
         loudnessMeasurer = mockk(relaxed = true),
         metadataEmbedder = metadataEmbedder,

@@ -1176,7 +1176,15 @@ class NowPlayingViewModel @Inject constructor(
                         ).first()
                     }
                     _downloadingKeys.update { it - key }
-                    outcome?.let { downloadWatchMessage(it, track.title) }?.let { _userMessages.tryEmit(it) }
+                    // A waiting download says why, from its own queue row.
+                    val reason = if (outcome == DownloadWatch.WAITING_FOR_LOSSLESS) {
+                        runCatching { musicRepository.downloadWaitReason(realId) }
+                            .onFailure { if (it is CancellationException) throw it }
+                            .getOrNull()
+                    } else {
+                        null
+                    }
+                    outcome?.let { downloadWatchMessage(it, track.title, reason) }?.let { _userMessages.tryEmit(it) }
                 }
             }
         }
