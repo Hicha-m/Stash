@@ -51,6 +51,7 @@ import coil3.compose.AsyncImage
 import com.stash.core.common.ArtUrlUpgrader
 import com.stash.core.model.Track
 import com.stash.core.data.listening.ListeningRange
+import com.stash.feature.listening.recap.RecapDoorCard
 import com.stash.feature.listening.ui.charts.ListeningBars
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
@@ -73,6 +74,7 @@ fun YourListeningSection(
     onOpenHistory: () -> Unit,
     onOpenStats: (range: String?) -> Unit,
     onOpenTop: (kind: String, range: String) -> Unit,
+    onOpenRecap: (kind: String, year: Int, month: Int) -> Unit = { _, _, _ -> },
     viewModel: YourListeningViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -98,13 +100,22 @@ fun YourListeningSection(
             onClick = { onOpenStats(ListeningRange.Days7.key) },
             modifier = Modifier.padding(horizontal = SidePadding),
         )
+        s.recap?.let { recap ->
+            Spacer(Modifier.height(12.dp))
+            RecapDoorCard(
+                offer = recap,
+                onClick = { onOpenRecap(recap.period.kind, recap.period.year, recap.period.monthArg) },
+                modifier = Modifier.padding(horizontal = SidePadding),
+            )
+        }
         Spacer(Modifier.height(12.dp))
         ListeningDoors(
             doors = listOf(
                 ListeningDoor(
                     icon = Icons.Rounded.Leaderboard,
                     title = "Top songs",
-                    subtitle = s.topSongTitle?.let { "#1 $it" } ?: "Last 30 days",
+                    // Its range said out loud: the Recap card above counts a calendar month.
+                    subtitle = s.topSongTitle?.let { "#1 $it · 30 days" } ?: "Last 30 days",
                     onClick = { onOpenTop("songs", ListeningRange.Days30.key) },
                 ),
                 ListeningDoor(

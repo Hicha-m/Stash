@@ -65,6 +65,9 @@ import com.stash.core.data.listening.ListeningStatsCalculator.Granularity
 import com.stash.core.ui.components.bottomChromePadding
 import com.stash.core.ui.theme.StashTheme
 import com.stash.feature.listening.ListeningLabels
+import com.stash.feature.listening.recap.PastRecap
+import com.stash.feature.listening.recap.RecapDoorCard
+import com.stash.feature.listening.recap.RecapPeriod
 import com.stash.feature.listening.ui.ArtImage
 import com.stash.feature.listening.ui.ArtistGlyph
 import com.stash.feature.listening.ui.CircleArt
@@ -102,9 +105,12 @@ fun ListeningStatsScreen(
     onOpenTop: (kind: String, range: String) -> Unit,
     onOpenArtist: (name: String) -> Unit,
     onOpenAlbum: (album: String, artist: String) -> Unit,
+    onOpenRecap: (kind: String, year: Int, month: Int) -> Unit = { _, _, _ -> },
     viewModel: ListeningStatsViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val recap by viewModel.recapOffer.collectAsStateWithLifecycle()
+    val pastRecaps by viewModel.pastRecaps.collectAsStateWithLifecycle()
     val selected by viewModel.range.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val use24Hour = remember(context) { DateFormat.is24HourFormat(context) }
@@ -137,6 +143,16 @@ fun ListeningStatsScreen(
                     color = StashTheme.extendedColors.textTertiary,
                     modifier = Modifier.padding(start = Gutter, end = Gutter, top = 8.dp),
                 )
+            }
+            recap?.let { offer ->
+                item(key = "recap") {
+                    RecapDoorCard(
+                        offer = offer,
+                        eyebrow = "Watch your recap",
+                        onClick = { onOpenRecap(offer.period.kind, offer.period.year, offer.period.monthArg) },
+                        modifier = Modifier.padding(start = Gutter, end = Gutter, top = 16.dp),
+                    )
+                }
             }
             item(key = "hero") {
                 HeroCard(s, onOpenDay = { onOpenHistory(it) })
@@ -181,6 +197,12 @@ fun ListeningStatsScreen(
             if (s.obsession != null || s.newSongs > 0) {
                 item(key = "highlights_title") { StatsSectionTitle("Highlights") }
                 item(key = "highlights") { HighlightsCard(s, onOpenDay = { onOpenHistory(it) }) }
+            }
+            if (pastRecaps.isNotEmpty()) {
+                item(key = "past_recaps_title") { StatsSectionTitle("Past recaps") }
+                item(key = "past_recaps") {
+                    PastRecapsRow(pastRecaps, s.today, onOpen = { p -> onOpenRecap(p.kind, p.year, p.monthArg) })
+                }
             }
             if (s.estimated) item(key = "footnote") { EstimatedFootnote() }
         }
@@ -530,6 +552,42 @@ private fun RankBadge(rank: Int, modifier: Modifier = Modifier) {
 }
 
 private val AlbumSize = 132.dp
+
+// ── Past recaps ─────────────────────────────────────────────────────────────
+
+/** Every recap the history holds, as small glass tiles: "October" / "so far · 82 plays". */
+@Composable
+private fun PastRecapsRow(recaps: List<PastRecap>, today: Long, onOpen: (RecapPeriod) -> Unit) {
+    val colors = StashTheme.extendedColors
+    val thisYear = java.time.LocalDate.ofEpochDay(today).year
+    LazyRow(
+        contentPadding = PaddingValues(horizontal = Gutter),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        itemsIndexed(recaps, key = { _, r -> r.period.kind + r.period.year + "-" + r.period.monthArg }) { _, r ->
+            val name = when (val p = r.period) {
+                is RecapPeriod.YearOf -> "${p.year}"
+                is RecapPeriod.MonthOf -> if (p.year == thisYear) p.name() else p.longName()
+            }
+            val line = buildString {
+                if (r.period.inProgress(today)) append("so far · ")
+                append(ListeningLabels.plays(r.plays))
+            }
+            Surface(
+                onClick = { onOpen(r.period) },
+                shape = MaterialTheme.shapes.medium,
+                color = colors.glassBackground,
+                border = androidx.compose.foundation.BorderStroke(1.dp, colors.glassBorder),
+                modifier = Modifier.semantics(mergeDescendants = true) { contentDescription = "Your $name recap, $line" },
+            ) {
+                Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                    Text(name, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface, maxLines = 1)
+                    Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                }
+            }
+        }
+    }
+}
 
 // ── Top genres ──────────────────────────────────────────────────────────────
 
