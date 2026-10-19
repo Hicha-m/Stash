@@ -19,7 +19,7 @@
   <img src="docs/screenshots/hero-dark.webp" alt="Stash on three phones: Home with Daily Discover, Now Playing with a lossless FLAC track, and word-synced lyrics">
 </p>
 
-hey. Stash grabs your Spotify and YouTube Music playlists and puts them on your Android phone. Download them, stream them, mix and match. FLAC when it exists.
+Stash grabs your Spotify and YouTube Music playlists and puts them on your Android phone. Download them, stream them, mix and match. FLAC when it exists.
 
 No Stash account, no analytics, your logins stay on your phone. Free and open source, forever.
 
@@ -31,7 +31,7 @@ No Stash account, no analytics, your logins stay on your phone. Free and open so
   <tr>
     <td width="50%" valign="top">
 
-#### 🎵 Your library, one place
+####  Your library, one place
 - Spotify + YouTube Music together: liked songs, playlists, daily mixes
 - Finds the right version of a song. Almost always. If it doesn't, flag it and pick the right one
 - Your listening: top songs, stats, and a recap of your month
@@ -39,7 +39,7 @@ No Stash account, no analytics, your logins stay on your phone. Free and open so
 </td>
     <td width="50%" valign="top">
 
-#### 💾 Download or stream
+####  Download or stream
 - Download your playlists or just stream them. Your call
 - Pick your quality: Lossless, AAC 320 or Opus
 - Downloaded songs play offline, the rest stream
@@ -57,7 +57,7 @@ No Stash account, no analytics, your logins stay on your phone. Free and open so
 </td>
     <td width="50%" valign="top">
 
-#### 🎤 Lyrics
+####  Lyrics
 - Synced lyrics that light up word by word
 - Pulled automatically, no setup
 
@@ -66,7 +66,7 @@ No Stash account, no analytics, your logins stay on your phone. Free and open so
   <tr>
     <td width="50%" valign="top">
 
-#### ✨ Finding new stuff
+####  Finding new stuff
 - Daily Discover, Stash Mixes and radios
 - Last.fm recommendations
 - Share songs and mixes as links, follow your friends' mixes
@@ -74,7 +74,7 @@ No Stash account, no analytics, your logins stay on your phone. Free and open so
 </td>
     <td width="50%" valign="top">
 
-#### 👯 Social
+####  Social
 - Listen Together, in sync with friends
 - Last.fm and ListenBrainz scrobbling
 - Discord status (what you're playing, with the art)
