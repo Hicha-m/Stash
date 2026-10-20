@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 
 # Caps (spec §5.4, §6.2, §7). Strings: TOML vars reach the Worker as strings.
 [vars]
-GLOBAL_DAILY_CAP = "34667"     # 13×2000 was 26000; raised ~33% on 2026-10-03 after 6 seats were added on 09-22
+GLOBAL_DAILY_CAP = "36000"
 INSTALL_DAILY_CAP = "500"      # doubled 300→600 on 09-11; raised to 800 (~33%) on 10-03; lowered to 500 on 10-08
 ACCOUNT_HOURLY_CAP = "1800"
 ACCOUNT_DAILY_CAP = "36000"
