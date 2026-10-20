@@ -16,7 +16,8 @@ import java.io.IOException
  * [link]. Google Drive has no folder feed under `drive.file`: its [scanPage] walks the files the
  * user picked, and [browse] is empty ([pickedFiles] true).
  *
- * Read-only: no implementation ever writes to the user's storage.
+ * Read-only: no implementation ever writes to the user's storage. (Saving downloads to Google
+ * Drive is separate: [com.stash.data.cloud.upload.DriveUploader], files Stash creates only.)
  */
 interface CloudStorageProvider {
     val provider: CloudProvider
@@ -81,6 +82,7 @@ sealed interface ScanEntry {
      *   known (OneDrive delta omits paths): the scanner resolves it.
      * @property remotePath Lower-cased full path, for providers that report deletions by path.
      * @property downloadUrl A ready link when the page carried one (saves a request).
+     * @property songKey The song's Save to Drive track key, on files Stash itself uploaded.
      */
     data class File(
         val id: String,
@@ -93,6 +95,7 @@ sealed interface ScanEntry {
         val folders: List<String>?,
         val remotePath: String?,
         val downloadUrl: String? = null,
+        val songKey: String? = null,
     ) : ScanEntry
 
     /** A folder under (or equal to) the root; feeds the scanner's id → path map. */
