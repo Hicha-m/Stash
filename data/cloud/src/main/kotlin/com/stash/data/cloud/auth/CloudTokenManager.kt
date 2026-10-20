@@ -35,9 +35,15 @@ class EncryptedCloudTokenStore @Inject constructor(private val store: EncryptedT
  * the token it used as `rejected`; the refresh only runs if the stored token is still that one
  * (someone else may have refreshed meanwhile).
  *
- * Both providers rotate refresh tokens on some refreshes, so every refresh saves the whole
- * result. A refresh the provider refuses ([RefreshRejectedException]) surfaces as
- * [CloudAuthRequiredException]: the account shows "Reconnect" and nothing retries in a loop.
+ * Google Drive has no refresh token on Android: its [ServiceToken.refreshToken] slot holds the
+ * Google account name, and "refresh" is a silent re-authorization through Play services
+ * ([com.stash.data.cloud.provider.gdrive.GoogleDriveAuth]).
+ *
+ * Dropbox and OneDrive rotate refresh tokens on some refreshes, so every refresh saves the whole
+ * result. A refresh the provider refuses ([RefreshRejectedException]) forgets the dead sign-in
+ * and surfaces as [CloudAuthRequiredException]: the account shows "Reconnect" (Settings reads
+ * [hasToken]) and nothing retries in a loop. A refresh that merely failed (no network, provider
+ * busy) throws its IOException and keeps the sign-in.
  */
 @Singleton
 class CloudTokenManager @Inject constructor(
@@ -68,10 +74,14 @@ class CloudTokenManager @Inject constructor(
             }
             val auth = auths[provider] ?: throw CloudAuthRequiredException(accountId, "provider unavailable")
             val result = try {
-                auth.refresh(current.refreshToken)
+                auth.refresh(current.refreshToken, current.accessToken)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: RefreshRejectedException) {
+                // Dead for good (revoked, expired, Google wants the user): forget it so the account
+                // card offers "Reconnect" instead of looking signed in while every request fails.
+                store.clear(key)
+                _changes.value++
                 throw CloudAuthRequiredException(accountId, e.message ?: "sign-in expired")
             }
             val token = ServiceToken(
@@ -96,16 +106,30 @@ class CloudTokenManager @Inject constructor(
         _changes.value++
     }
 
+    /**
+     * When [accessToken] stops being handed out (its expiry minus [EXPIRY_MARGIN_SECONDS]), in
+     * epoch milliseconds, for a link that carries it. Null when it is no longer the stored token
+     * (refreshed or forgotten meanwhile): the caller must not cache it.
+     */
+    suspend fun usableUntilMs(provider: CloudProvider, accountId: Long, accessToken: String): Long? =
+        store.get(keyFor(provider, accountId))
+            ?.takeIf { it.accessToken == accessToken }
+            ?.let { (it.expiresAtEpoch - EXPIRY_MARGIN_SECONDS) * 1000 }
+
     suspend fun hasToken(provider: CloudProvider, accountId: Long): Boolean = store.get(keyFor(provider, accountId)) != null
 
     /**
      * Disconnect: the token is forgotten on this phone. Under the account's lock, so a refresh
-     * already in flight finishes first and can't save a token back after this.
+     * already in flight finishes first and can't save a token back after this. Returns the access
+     * token it forgot (null when there was none), for a provider that caches it elsewhere too.
      */
-    suspend fun forget(provider: CloudProvider, accountId: Long) {
+    suspend fun forget(provider: CloudProvider, accountId: Long): String? {
         val key = keyFor(provider, accountId)
-        locks.getOrPut(key) { Mutex() }.withLock { store.clear(key) }
+        val forgotten = locks.getOrPut(key) { Mutex() }.withLock {
+            store.get(key)?.accessToken.also { store.clear(key) }
+        }
         _changes.value++
+        return forgotten
     }
 
     companion object {
