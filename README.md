@@ -2,7 +2,7 @@
 
 <img src="app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" alt="Stash app icon" width="120" />
 
-# Stash (stashfm.app)
+# Stash (https://www.stashfm.app)
 
 ### your Spotify + YouTube Music library, on your phone or browser
 
