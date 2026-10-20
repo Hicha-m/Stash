@@ -2,9 +2,9 @@
 
 <img src="app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" alt="Stash app icon" width="120" />
 
-# Stash
+# Stash (stashfm.app)
 
-### your Spotify + YouTube Music library, on your phone
+### your Spotify + YouTube Music library, on your phone or browser
 
 [![Latest release](https://img.shields.io/github/v/release/rawnaldclark/Stash?style=for-the-badge&labelColor=0d1117&color=8b5cf6&include_prereleases)](https://github.com/rawnaldclark/Stash/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/rawnaldclark/Stash/total?style=for-the-badge&labelColor=0d1117&color=8b5cf6)](https://github.com/rawnaldclark/Stash/releases)
