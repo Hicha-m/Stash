@@ -6,6 +6,9 @@ import com.stash.core.common.SystemClock
 import com.stash.data.lyrics.source.AppleTtmlLyricsSource
 import com.stash.data.lyrics.source.InnerTubeLyricsGateway
 import com.stash.data.lyrics.source.InnerTubeLyricsGatewayImpl
+import com.stash.data.lyrics.source.IsrcLyricsHostBreaker
+import com.stash.data.lyrics.source.IsrcResolver
+import com.stash.data.lyrics.source.IsrcTtmlLyricsSource
 import com.stash.data.lyrics.source.KugouLyricsSource
 import com.stash.data.lyrics.source.LrclibLyricsSource
 import com.stash.data.lyrics.source.LyricsSource
@@ -65,8 +68,14 @@ abstract class LyricsModule {
 
         /**
          * Ordered source chain consumed by `LyricsRepository`. The order
-         * defines fallback priority: LRCLIB first (can return synced LRC),
-         * InnerTube second (plain text only).
+         * defines fallback priority: Apple TTML (word-synced), LRCLIB (synced
+         * LRC), KuGou, InnerTube (plain text), then lrc.red and Binimum.
+         *
+         * lrc.red and Binimum come LAST on purpose: they are on-demand-only
+         * extras (see `LyricsSource.onDemandOnly`) and must never delay lyrics
+         * an existing source would return. When an earlier source answers
+         * without word timing, the repository gives them one background
+         * follow-up try instead.
          */
         @Provides
         @Singleton
@@ -75,7 +84,39 @@ abstract class LyricsModule {
             lrclib: LrclibLyricsSource,
             kugou: KugouLyricsSource,
             ytmusic: YtMusicLyricsSource,
-        ): List<@JvmSuppressWildcards LyricsSource> = listOf(appleTtml, lrclib, kugou, ytmusic)
+            okHttpClient: OkHttpClient,
+            @ApplicationContext context: Context,
+            isrcResolver: IsrcResolver,
+            breaker: IsrcLyricsHostBreaker,
+        ): List<@JvmSuppressWildcards LyricsSource> {
+            val versionName = versionName(context)
+            return listOf(
+                appleTtml,
+                lrclib,
+                kugou,
+                ytmusic,
+                IsrcTtmlLyricsSource(
+                    okHttpClient, versionName, IsrcTtmlLyricsSource.LRC_RED_ID,
+                    "lrc.red (word-synced)", IsrcTtmlLyricsSource.LRC_RED_URL, isrcResolver, breaker,
+                ),
+                IsrcTtmlLyricsSource(
+                    okHttpClient, versionName, IsrcTtmlLyricsSource.BINIMUM_ID,
+                    "Binimum (word-synced)", IsrcTtmlLyricsSource.BINIMUM_URL, isrcResolver, breaker,
+                ),
+            )
+        }
+
+        /** title/artist -> ISRC for the lrc.red/Binimum sources; same DNS, User-Agent and breaker as they use. */
+        @Provides
+        @Singleton
+        fun provideIsrcResolver(
+            okHttpClient: OkHttpClient,
+            @ApplicationContext context: Context,
+            breaker: IsrcLyricsHostBreaker,
+        ): IsrcResolver = IsrcResolver(okHttpClient, versionName(context), breaker)
+
+        private fun versionName(context: Context): String =
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
 
         /** Word-synced Apple Music TTML via lyrics.paxsenix.org; first so it wins when it has syllable timing. */
         @Provides
