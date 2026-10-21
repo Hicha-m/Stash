@@ -6,10 +6,10 @@ compatibility_flags = ["nodejs_compat"]
 
 # Caps (spec §5.4, §6.2, §7). Strings: TOML vars reach the Worker as strings.
 [vars]
-GLOBAL_DAILY_CAP = "36000"
+GLOBAL_DAILY_CAP = "47880"
 INSTALL_DAILY_CAP = "500"      # doubled 300→600 on 09-11; raised to 800 (~33%) on 10-03; lowered to 500 on 10-08
-ACCOUNT_HOURLY_CAP = "1800"
-ACCOUNT_DAILY_CAP = "36000"
+ACCOUNT_HOURLY_CAP = "2394"
+ACCOUNT_DAILY_CAP = "47880"
 ACCOUNT_UNCAPPED_LABELS = "" # no account bypasses the hourly/daily limits
 ACCOUNT_NO_COOLDOWN_LABELS = "" # every account uses the configured cooldown behavior
 DOWNLOAD_PACE_HEADROOM_PCT = "13" # 10→13 (+30%) on 2026-10-03; streams first, downloads take what the pool can spare
