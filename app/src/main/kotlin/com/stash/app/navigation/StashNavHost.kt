@@ -333,6 +333,19 @@ private fun StashNavGraph(
                 onOpenAppearance = { navController.navigate(SettingsAppearanceRoute) },
                 onOpenAbout = { navController.navigate(SettingsAboutRoute) },
                 onOpenUrl = { url -> runCatching { uriHandler.openUri(url) } },
+                // Through Audio & Quality, so Back from a search hit lands where it lives.
+                onOpenLosslessSources = {
+                    navController.navigate(SettingsAudioQualityRoute)
+                    navController.navigate(SettingsLosslessSourcesRoute)
+                },
+                onOpenHomeLayout = {
+                    navController.navigate(SettingsAppearanceRoute)
+                    navController.navigate(SettingsHomeLayoutRoute)
+                },
+                onOpenEqualizer = {
+                    navController.navigate(SettingsAudioQualityRoute)
+                    navController.navigate(EqualizerRoute)
+                },
                 onStar = { runCatching { uriHandler.openUri("https://github.com/rawnaldclark/Stash") } },
             )
         }
@@ -353,7 +366,16 @@ private fun StashNavGraph(
             com.stash.feature.settings.SettingsAudioQualityScreen(
                 onBack = { navController.popBackStack() },
                 onNavigateToEqualizer = { navController.navigate(EqualizerRoute) },
-                onNavigateToSquidWtfCaptcha = { navController.navigate(SquidWtfCaptchaRoute) },
+                onNavigateToLosslessSources = { navController.navigate(SettingsLosslessSourcesRoute) },
+                viewModel = viewModel,
+            )
+        }
+        composable<SettingsLosslessSourcesRoute> { backStackEntry ->
+            val settingsEntry = remember(backStackEntry) { navController.getBackStackEntry(SettingsRoute) }
+            val viewModel: com.stash.feature.settings.SettingsViewModel =
+                androidx.hilt.navigation.compose.hiltViewModel(settingsEntry)
+            com.stash.feature.settings.SettingsLosslessSourcesScreen(
+                onBack = { navController.popBackStack() },
                 viewModel = viewModel,
             )
         }
@@ -396,6 +418,16 @@ private fun StashNavGraph(
             val viewModel: com.stash.feature.settings.SettingsViewModel =
                 androidx.hilt.navigation.compose.hiltViewModel(settingsEntry)
             com.stash.feature.settings.SettingsAppearanceScreen(
+                onBack = { navController.popBackStack() },
+                onOpenHomeLayout = { navController.navigate(SettingsHomeLayoutRoute) },
+                viewModel = viewModel,
+            )
+        }
+        composable<SettingsHomeLayoutRoute> { backStackEntry ->
+            val settingsEntry = remember(backStackEntry) { navController.getBackStackEntry(SettingsRoute) }
+            val viewModel: com.stash.feature.settings.SettingsViewModel =
+                androidx.hilt.navigation.compose.hiltViewModel(settingsEntry)
+            com.stash.feature.settings.SettingsHomeLayoutScreen(
                 onBack = { navController.popBackStack() },
                 viewModel = viewModel,
             )
