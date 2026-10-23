@@ -125,7 +125,11 @@ class NowPlayingWordSyncedLyricsTest {
             "Word-synced lyrics are paused for a few minutes after repeated timeouts.",
         )
         expectResult(TtmlUpgradeResult.RATE_LIMITED, "Word-synced lyrics are rate-limiting, try again later.")
-        expectResult(TtmlUpgradeResult.FAILED, "Couldn't get word-synced lyrics.")
+        expectResult(TtmlUpgradeResult.FAILED, "Couldn't reach the word-synced lyrics services.")
+        expectResult(
+            TtmlUpgradeResult.UNCONFIRMED_MISS,
+            "A word-synced lyrics service didn't respond, and the others have none for this song.",
+        )
         expectResult(TtmlUpgradeResult.SKIPPED, "Nothing to upgrade for this song.")
     }
 
