@@ -47,7 +47,8 @@ data class PickerPlaylist(val key: String, val name: String, val songs: Int, val
 
 /**
  * The picker's state (link-sync spec §2.3): what the library or file holds, and what is ticked. A part with nothing in it shows
- * unticked and can't be ticked.
+ * unticked and can't be ticked. [listens] is the export's "Your whole listening history" (this phone's own plays); the other
+ * pickers leave it at 0, so it never counts there.
  */
 data class LibraryPick(
     val likes: Int,
@@ -56,17 +57,29 @@ data class LibraryPick(
     val likesOn: Boolean = true,
     val playsOn: Boolean = true,
     val ticked: Set<String> = playlists.mapTo(HashSet()) { it.key },
+    val listens: Int = 0,
+    val listensOn: Boolean = true,
 ) {
     val takesLikes: Boolean get() = likesOn && likes > 0
     val takesPlays: Boolean get() = playsOn && plays > 0
+    val takesListens: Boolean get() = listensOn && listens > 0
     val tickedPlaylists: List<PickerPlaylist> get() = playlists.filter { it.key in ticked }
 
+    /** No likes, plays or playlists ticked that hold anything (the library itself; the whole history aside). */
+    val libraryIsEmpty: Boolean get() = !takesLikes && !takesPlays && tickedPlaylists.isEmpty()
+
     /** Nothing ticked that holds anything: Save and Send wait. */
-    val isEmpty: Boolean get() = !takesLikes && !takesPlays && tickedPlaylists.isEmpty()
+    val isEmpty: Boolean get() = libraryIsEmpty && !takesListens
 }
 
-/** A button at the bottom of the picker ("Save as file", "Send to Chrome on Windows", "Import"). */
-data class PickerAction(val label: String, val onClick: () -> Unit, val primary: Boolean = false)
+/**
+ * A button at the bottom of the picker ("Save as file", "Send to Chrome on Windows", "Import"). [needsLibrary]: it carries only
+ * the library (a send), so it waits until likes, plays or a playlist is ticked; the whole history alone isn't enough.
+ */
+data class PickerAction(val label: String, val onClick: () -> Unit, val primary: Boolean = false, val needsLibrary: Boolean = false)
+
+/** The export's "Your whole listening history" row: its label, its count ("12,480 plays since March 2025") and its note. */
+data class PickerHistory(val label: String, val detail: String, val note: String)
 
 /**
  * "What to include" (spec §2.3), shared by Export for Stash on the web, Send my library to a browser, Import from Stash on the
@@ -84,6 +97,8 @@ fun LibraryPickerSheet(
     intro: String? = null,
     /** "your last 5,000" on the export (spec §2.3); the count otherwise. */
     playsDetail: String? = null,
+    /** The export only: "Your whole listening history", ticked with [LibraryPick.listensOn]. */
+    history: PickerHistory? = null,
     busy: Boolean = false,
     message: String? = null,
 ) {
@@ -119,6 +134,14 @@ fun LibraryPickerSheet(
                 enabled = pick.plays > 0 && !busy,
                 onChange = { onPick(pick.copy(playsOn = it)) },
             )
+            history?.let { h ->
+                HistoryRow(
+                    h,
+                    checked = pick.takesListens,
+                    enabled = pick.listens > 0 && !busy,
+                    onChange = { onPick(pick.copy(listensOn = it)) },
+                )
+            }
             val n = pick.playlists.size
             Row(
                 Modifier
@@ -149,12 +172,13 @@ fun LibraryPickerSheet(
             Spacer(Modifier.padding(top = 12.dp))
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (a in actions) {
+                    val enabled = !busy && !pick.isEmpty && !(a.needsLibrary && pick.libraryIsEmpty)
                     if (a.primary) {
-                        Button(onClick = a.onClick, enabled = !busy && !pick.isEmpty, modifier = Modifier.fillMaxWidth()) {
+                        Button(onClick = a.onClick, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
                             Text(a.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     } else {
-                        OutlinedButton(onClick = a.onClick, enabled = !busy && !pick.isEmpty, modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(onClick = a.onClick, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
                             Text(a.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
@@ -177,6 +201,26 @@ private fun CheckRow(label: String, detail: String, checked: Boolean, enabled: B
         Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(start = 12.dp).weight(1f))
         Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.width(24.dp))
+    }
+}
+
+/** A tick with its words on two lines under the label (the count, then the note), as a playlist row shows its songs. */
+@Composable
+private fun HistoryRow(h: PickerHistory, checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 52.dp)
+            .toggleable(value = checked, enabled = enabled, role = Role.Checkbox, onValueChange = onChange)
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(checked = checked, onCheckedChange = null, enabled = enabled)
+        Column(Modifier.padding(start = 12.dp, end = 24.dp).weight(1f)) {
+            Text(h.label, style = MaterialTheme.typography.bodyLarge)
+            Text(h.detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(h.note, style = MaterialTheme.typography.bodySmall, color = StashTheme.extendedColors.textTertiary)
+        }
     }
 }
 

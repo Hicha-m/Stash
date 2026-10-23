@@ -19,6 +19,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import javax.inject.Inject
 
 /** Where "Export for Stash on the web" (or a send) is. */
@@ -32,9 +36,13 @@ sealed interface WebLibraryExportState {
     data object Failed : WebLibraryExportState
 }
 
-/** The picker (spec §2.3) while it's open: the choice, where it can be sent, and a send in progress or why it failed. */
+/**
+ * The picker (spec §2.3) while it's open: the choice, where it can be sent, and a send in progress or why it failed.
+ * [listensSince] is when the first play of "Your whole listening history" started (null when there is none).
+ */
 data class ExportPickerUi(
     val pick: LibraryPick,
+    val listensSince: Long? = null,
     val targets: List<SendTarget> = emptyList(),
     val sending: Boolean = false,
     val message: String? = null,
@@ -64,6 +72,9 @@ class WebLibraryExportViewModel @Inject constructor(
     /** The choice made on the picker, kept while the system file picker is open (the sheet is closed by then). */
     private var chosen: ExportSelection = ExportSelection.ALL
 
+    /** Whether that file also carries "Your whole listening history" (on until the picker says otherwise). */
+    private var chosenListens: Boolean = true
+
     /** Opens the picker with what the library holds now and the last choice. */
     fun openPicker() {
         viewModelScope.launch {
@@ -72,7 +83,7 @@ class WebLibraryExportViewModel @Inject constructor(
                 return@launch
             }
             val targets = if (config.enabled) inbox.targets() else emptyList()
-            _picker.value = ExportPickerUi(pickOf(catalog, prefs.load()), targets)
+            _picker.value = ExportPickerUi(pickOf(catalog, prefs.load()), catalog.listensSince, targets)
         }
     }
 
@@ -89,6 +100,7 @@ class WebLibraryExportViewModel @Inject constructor(
     fun chooseFile() {
         val p = _picker.value ?: return
         chosen = remember(p.pick)
+        chosenListens = p.pick.takesListens
         _picker.value = null
     }
 
@@ -96,15 +108,19 @@ class WebLibraryExportViewModel @Inject constructor(
         if (_state.value is WebLibraryExportState.Working) return
         _state.value = WebLibraryExportState.Working
         val selection = chosen
+        val listens = chosenListens
         viewModelScope.launch {
-            _state.value = exporter.export(uri, selection).fold(
+            _state.value = exporter.export(uri, selection, listens).fold(
                 onSuccess = { WebLibraryExportState.Done(it) },
                 onFailure = { WebLibraryExportState.Failed },
             )
         }
     }
 
-    /** "Send to Chrome on Windows": the same document, to that browser's inbox. */
+    /**
+     * "Send to Chrome on Windows": the same document, to that browser's inbox. Never with the whole history: a send is sealed
+     * whole and kept small, so the history only goes in a saved file.
+     */
     fun send(target: SendTarget) {
         val p = _picker.value ?: return
         if (p.sending) return
@@ -139,7 +155,9 @@ class WebLibraryExportViewModel @Inject constructor(
     private fun remember(pick: LibraryPick): ExportSelection {
         val all = pick.playlists.map { it.key.toLong() }
         val ticked = pick.ticked.mapNotNull { it.toLongOrNull() }.toSet()
-        prefs.save(WebLibraryPickerPrefs.Remembered(likes = pick.likesOn, plays = pick.playsOn, unticked = all.toSet() - ticked))
+        prefs.save(
+            WebLibraryPickerPrefs.Remembered(likes = pick.likesOn, plays = pick.playsOn, unticked = all.toSet() - ticked, listens = pick.listensOn),
+        )
         return ExportSelection(
             likes = pick.takesLikes,
             plays = pick.takesPlays,
@@ -156,6 +174,12 @@ class WebLibraryExportViewModel @Inject constructor(
             likesOn = r.likes,
             playsOn = r.plays,
             ticked = catalog.playlists.filter { it.id !in r.unticked }.mapTo(HashSet()) { it.id.toString() },
+            listens = catalog.listens,
+            listensOn = r.listens,
         )
+
+        /** "March 2025": the month the history starts, in the listener's language and zone, as the picker shows it. */
+        fun historySince(epochMs: Long, zone: ZoneId = ZoneId.systemDefault(), locale: Locale = Locale.getDefault()): String =
+            DateTimeFormatter.ofPattern("LLLL yyyy", locale).format(Instant.ofEpochMilli(epochMs).atZone(zone))
     }
 }
