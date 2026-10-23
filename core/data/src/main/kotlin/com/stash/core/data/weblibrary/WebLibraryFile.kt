@@ -18,6 +18,9 @@ import java.time.format.DateTimeFormatter
  * `docs/library-file-v1.md` in the web player's repo (stash-player). Field names and meanings must not change.
  *
  * It describes songs, never carries them: no stream addresses, file paths, download state, logins or settings.
+ *
+ * The optional `listens` section (a phone's whole history, added 2026-10-23) is not a field here: it is too big to hold in
+ * memory, so [WebLibraryListens] streams it into a saved file after these fields. Without it, the bytes are exactly v1's.
  */
 @Serializable
 data class WebLibraryFile(

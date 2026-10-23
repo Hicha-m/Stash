@@ -2,6 +2,7 @@ package com.stash.core.data.weblibrary
 
 import com.stash.core.data.weblink.handoff.HandoffWire
 import com.stash.core.data.weblink.handoff.WireSong
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -72,6 +73,9 @@ object WebLibraryReader {
     /**
      * Counts [text]'s containers (`{`, `[`), values (roughly: commas and containers) and nesting outside strings, refusing it
      * as [TOO_BIG] past [shape]. One pass over the characters, no allocation.
+     *
+     * The root's [IGNORED] sections (`listens`, a phone's whole history for the web's Your record) are not counted: this
+     * reader never parses them (see [read]), so a decade of plays there costs nothing here. Their nesting is still checked.
      */
     fun checkShape(text: String, shape: Shape) {
         var depth = 0
@@ -79,27 +83,88 @@ object WebLibraryReader {
         var values = 0
         var inString = false
         var escaped = false
+        // The root's keys: the last string read at depth 1 (its first few characters only), and the key before a ':'.
+        val rootString = StringBuilder(MAX_KEY_SCAN)
+        var capturing = false
+        var rootKey: String? = null
+        // Inside an ignored section: the depth that ends it, else -1.
+        var skipTo = -1
         for (ch in text) {
             if (inString) {
                 when {
-                    escaped -> escaped = false
+                    escaped -> {
+                        escaped = false
+                        if (capturing && rootString.length < MAX_KEY_SCAN) rootString.append(ch)
+                    }
                     ch == '\\' -> escaped = true
-                    ch == '"' -> inString = false
+                    ch == '"' -> {
+                        inString = false
+                        capturing = false
+                    }
+                    capturing && rootString.length < MAX_KEY_SCAN -> rootString.append(ch)
                 }
                 continue
             }
             when (ch) {
-                '"' -> inString = true
-                '{', '[' -> {
-                    depth++
-                    containers++
-                    values++
-                    if (depth > shape.maxDepth || containers > shape.maxContainers) throw WebLibraryReadException(TOO_BIG)
+                '"' -> {
+                    inString = true
+                    if (depth == 1 && skipTo < 0) {
+                        capturing = true
+                        rootString.setLength(0)
+                    }
                 }
-                '}', ']' -> depth--
-                ',' -> if (++values > shape.maxValues) throw WebLibraryReadException(TOO_BIG)
+                ':' -> if (depth == 1) rootKey = rootString.toString()
+                '{', '[' -> {
+                    if (depth == 1 && skipTo < 0 && rootKey in IGNORED) skipTo = 1
+                    depth++
+                    if (depth > shape.maxDepth) throw WebLibraryReadException(TOO_BIG)
+                    if (skipTo < 0) {
+                        containers++
+                        values++
+                        if (containers > shape.maxContainers) throw WebLibraryReadException(TOO_BIG)
+                    }
+                }
+                '}', ']' -> {
+                    depth--
+                    if (depth == skipTo) skipTo = -1
+                }
+                ',' -> {
+                    if (depth == 1) rootKey = null
+                    if (skipTo < 0 && ++values > shape.maxValues) throw WebLibraryReadException(TOO_BIG)
+                }
             }
         }
+    }
+
+    /** Root sections this reader never reads, so never counts or parses: `listens` (library-file v1, "Listens"). */
+    private val IGNORED = setOf("listens")
+
+    /** Enough of a root key to tell it from those in [IGNORED]. */
+    private const val MAX_KEY_SCAN = 16
+
+    /**
+     * The root's fields this reader uses, as raw JSON. Decoding into this, rather than parsing the whole document into a tree,
+     * lets the parser skip every other field (`listens` above all) without building it: a big history costs no heap here.
+     */
+    @Serializable
+    private class Root(
+        val kind: JsonElement? = null,
+        val v: JsonElement? = null,
+        val generator: JsonElement? = null,
+        val likes: JsonElement? = null,
+        val playlists: JsonElement? = null,
+        val history: JsonElement? = null,
+    ) {
+        fun toJsonObject() = JsonObject(
+            buildMap {
+                kind?.let { put("kind", it) }
+                v?.let { put("v", it) }
+                generator?.let { put("generator", it) }
+                likes?.let { put("likes", it) }
+                playlists?.let { put("playlists", it) }
+                history?.let { put("history", it) }
+            },
+        )
     }
 
     private val PLAYLIST_ID = Regex("^[A-Za-z0-9_-]{1,64}$")
@@ -123,8 +188,9 @@ object WebLibraryReader {
         if (text.length > MAX_BYTES) throw WebLibraryReadException(TOO_BIG)
         checkShape(text, shape)
         val root = try {
-            json.parseToJsonElement(text) as? JsonObject
+            json.decodeFromString(Root.serializer(), text).toJsonObject()
         } catch (e: IllegalArgumentException) {
+            // Not JSON, or not an object at the root (a SerializationException is an IllegalArgumentException).
             null
         } ?: throw WebLibraryReadException(NOT_A_BACKUP)
         if (root.str("kind") != WebLibraryFile.KIND) throw WebLibraryReadException(NOT_A_BACKUP)
