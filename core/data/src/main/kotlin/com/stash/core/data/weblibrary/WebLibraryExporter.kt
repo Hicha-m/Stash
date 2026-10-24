@@ -94,14 +94,12 @@ class WebLibraryExporter @Inject constructor(
      * (the same rules as [collect]: blocked songs and songs without a title or artist never count).
      */
     suspend fun catalog(): ExportCatalog = withContext(Dispatchers.IO) {
-        database.withTransaction {
-            val dao = database.webLibraryExportDao()
+        val dao = database.webLibraryExportDao()
+        val library = database.withTransaction {
             val follows = dao.followedMixes().mapTo(HashSet()) { it.playlistId }
             ExportCatalog(
                 likes = dao.likeCount(),
                 plays = dao.playCount(WebLibraryFile.MAX_PLAYS),
-                listens = minOf(dao.ownPlayCount(), WebLibraryListens.MAX_PLAYS),
-                listensSince = dao.ownFirstPlayAt(),
                 playlists = dao.playlists().map { p ->
                     ExportPlaylistChoice(
                         id = p.id,
@@ -112,6 +110,9 @@ class WebLibraryExporter @Inject constructor(
                 },
             )
         }
+        // The history's counts read every play, so they stay out of that transaction (which holds the write lock): a play
+        // recorded in between only makes the count one newer, and the picker's counts are a guide, not the file.
+        library.copy(listens = minOf(dao.ownPlayCount(), WebLibraryListens.MAX_PLAYS), listensSince = dao.ownFirstPlayAt())
     }
 
     /** The file as text (a one-off send seals it whole): the same bytes [export] writes to a file. */
@@ -220,13 +221,17 @@ class WebLibraryExporter @Inject constructor(
      * The history is read after [collect]'s transaction, a page at a time, so the database isn't held while the file is
      * written. A play recorded meanwhile is newer than the first page and simply isn't in this file.
      */
-    internal suspend fun writeWithListens(file: WebLibraryFile, out: CountingOutputStream): ListensWritten {
+    internal suspend fun writeWithListens(
+        file: WebLibraryFile,
+        out: CountingOutputStream,
+        maxBytes: Long = WebLibraryReader.MAX_BYTES.toLong(),
+    ): ListensWritten {
         val head = WebLibraryListens.HoldLastByte(out)
         WebLibraryFile.write(file, head)
         head.flush()
         check(head.release() == '}'.code) { "The library file didn't end with its closing brace" }
         // What is left for listens: the cap, less what is written and the closing brace still to come.
-        val budget = WebLibraryReader.MAX_BYTES - out.count - 1
+        val budget = maxBytes - out.count - 1
         val written = WebLibraryListens.write(database.webLibraryExportDao(), out, budget)
         out.write('}'.code)
         return written

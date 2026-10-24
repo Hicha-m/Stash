@@ -39,6 +39,12 @@ object WebLibraryListens {
     /** A song's words are cut as a Song's are (title, artist, album: 300). */
     const val MAX_TEXT = 300
 
+    /**
+     * The least budget [write] writes into: the section's frame (`,"listens":{"device":"phone","plays":[` `],"skips":[` `]}`,
+     * 56 bytes) and room to spare.
+     */
+    const val MIN_BUDGET = 64L
+
     /** Informational: where these plays were made. */
     const val DEVICE = "phone"
 
@@ -82,7 +88,8 @@ object WebLibraryListens {
     /**
      * Writes `,"listens":{…}` to [out], the part after the rest of the file and before its closing brace, reading the plays
      * and skips from [dao]. At most [budgetBytes] go out: when the next entry wouldn't fit, that list ends there (the
-     * newest are already in, since pages run newest first). Plays come first, as they matter more to the record.
+     * newest are already in, since pages run newest first). Plays come first, as they matter more to the record. With less
+     * than [MIN_BUDGET] left (a library that already fills the file), nothing is written: the section's own frame wouldn't fit.
      */
     suspend fun write(
         dao: WebLibraryExportDao,
@@ -92,6 +99,7 @@ object WebLibraryListens {
         maxSkips: Int = MAX_SKIPS,
         pageSize: Int = PAGE,
     ): ListensWritten {
+        if (budgetBytes < MIN_BUDGET) return ListensWritten(0, 0)
         val w = BudgetedWriter(out, budgetBytes)
         w.raw(""","listens":{"device":"$DEVICE","plays":[""")
 

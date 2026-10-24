@@ -221,6 +221,57 @@ class WebLibraryListensTest {
         assertEquals("history still counts every origin", 4, catalog.plays)
     }
 
+    @Test fun `plays that share a start time all go, across a page boundary`() = runTest {
+        val song = track("Song", "Band")
+        repeat(3) { play(song, T + 1_000) } // three rows, one started_at: the cursor's id breaks the tie
+        play(song, T + 500)
+        val (text, written) = section(page = 1)
+        assertEquals(4, written.plays)
+        val plays = Json.parseToJsonElement("{" + text.drop(1) + "}").jsonObject["listens"]!!.jsonObject["plays"]!!.jsonArray
+        assertEquals(listOf(T + 1_000, T + 1_000, T + 1_000, T + 500), plays.map { it.jsonObject["s"]!!.jsonPrimitive.long })
+    }
+
+    @Test fun `the skip limit keeps the newest`() = runTest {
+        val song = track("Song", "Band")
+        repeat(5) { skip(song, T + 10_000 + it * 1_000L, positionMs = 2_000) }
+        val out = ByteArrayOutputStream()
+        val written = WebLibraryListens.write(db.webLibraryExportDao(), out, Long.MAX_VALUE, maxSkips = 2, pageSize = 2)
+        assertEquals(2, written.skips)
+        val skips = Json.parseToJsonElement("{" + out.toString(Charsets.UTF_8.name()).drop(1) + "}").jsonObject["listens"]!!
+            .jsonObject["skips"]!!.jsonArray
+        // s is when each play started: the skip's time less its 2 s.
+        assertEquals(listOf(T + 12_000, T + 11_000), skips.map { it.jsonObject["s"]!!.jsonPrimitive.long })
+    }
+
+    @Test fun `a phone play of a song with no known length leaves d out`() = runTest {
+        play(track("Untimed", "Band", durationMs = 0), T + 1_000, listenedMs = 61_000)
+        val p = WebLibraryListens.play(db.webLibraryExportDao().ownPlaysBefore(Long.MAX_VALUE, Long.MAX_VALUE, 10).single())!!
+        assertEquals(61_000L, p.ms)
+        assertNull(p.d)
+        assertTrue(section().first.contains("""{"t":"Untimed","a":"Band","s":${T + 1_000},"ms":61000}"""))
+    }
+
+    @Test fun `the whole file stays within the cap, and a library that fills it leaves the section out`() = runTest {
+        val song = track("Song", "Band", durationMs = 200_000)
+        repeat(200) { play(song, T + it * 1_000L, listenedMs = 100_000) }
+        val file = exporter.collect(T, null)
+        val base = WebLibraryFile.text(file).toByteArray().size
+
+        for (cap in listOf(base + 1_000L, base + 64L, base + 10L)) {
+            val bytes = ByteArrayOutputStream()
+            val out = WebLibraryExporter.CountingOutputStream(bytes)
+            val written = exporter.writeWithListens(file, out, maxBytes = cap)
+            assertTrue("cap $cap: ${bytes.size()} bytes", bytes.size() <= cap)
+            val root = parse(bytes.toByteArray())
+            if (cap - base < WebLibraryListens.MIN_BUDGET) {
+                assertEquals(ListensWritten(0, 0), written)
+                assertNull(root["listens"])
+            } else {
+                assertEquals(written.plays, root["listens"]!!.jsonObject["plays"]!!.jsonArray.size)
+            }
+        }
+    }
+
     @Test fun `the hold-back stream passes all but the last byte`() {
         val out = ByteArrayOutputStream()
         val held = WebLibraryListens.HoldLastByte(out)
