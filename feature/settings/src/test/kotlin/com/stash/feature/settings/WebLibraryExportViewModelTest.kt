@@ -212,6 +212,17 @@ class WebLibraryExportViewModelTest {
         assertThat(vm.picker.value!!.pick.takesListens).isFalse()
     }
 
+    @Test fun `after the app was killed behind the file picker, the export still writes what was ticked`() = runTest(dispatcher) {
+        val listens = slot<Boolean>()
+        coEvery { exporter.export(uri, any(), capture(listens)) } returns Result.success(WebLibraryExportResult(0, 0, 0))
+        remembered = WebLibraryPickerPrefs.Remembered(listens = false)
+        // A new ViewModel (the old one died with the process) gets the document straight from the file picker.
+        val vm = vm()
+        vm.export(uri)
+        advanceUntilIdle()
+        assertThat(listens.captured).isFalse()
+    }
+
     @Test fun `the whole history alone is enough to save, not to send`() = runTest(dispatcher) {
         val vm = vm()
         vm.openPicker()

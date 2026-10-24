@@ -72,9 +72,6 @@ class WebLibraryExportViewModel @Inject constructor(
     /** The choice made on the picker, kept while the system file picker is open (the sheet is closed by then). */
     private var chosen: ExportSelection = ExportSelection.ALL
 
-    /** Whether that file also carries "Your whole listening history" (on until the picker says otherwise). */
-    private var chosenListens: Boolean = true
-
     /** Opens the picker with what the library holds now and the last choice. */
     fun openPicker() {
         viewModelScope.launch {
@@ -100,7 +97,6 @@ class WebLibraryExportViewModel @Inject constructor(
     fun chooseFile() {
         val p = _picker.value ?: return
         chosen = remember(p.pick)
-        chosenListens = p.pick.takesListens
         _picker.value = null
     }
 
@@ -108,7 +104,9 @@ class WebLibraryExportViewModel @Inject constructor(
         if (_state.value is WebLibraryExportState.Working) return
         _state.value = WebLibraryExportState.Working
         val selection = chosen
-        val listens = chosenListens
+        // From the saved choice, not a field: the app can be killed while the system file picker is open, and a new
+        // ViewModel must still write what the listener ticked.
+        val listens = prefs.load().listens
         viewModelScope.launch {
             _state.value = exporter.export(uri, selection, listens).fold(
                 onSuccess = { WebLibraryExportState.Done(it) },

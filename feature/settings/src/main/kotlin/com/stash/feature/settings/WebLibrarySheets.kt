@@ -72,6 +72,9 @@ fun WebLibraryExportSheet(vm: WebLibraryExportViewModel) {
         onDismiss = vm::closePicker,
         playsDetail = if (p.pick.plays >= WebLibraryFile.MAX_PLAYS) stringResource(R.string.web_library_export_plays_detail, WebLibraryFile.MAX_PLAYS) else null,
         history = history,
+        playsLabel = stringResource(R.string.web_library_export_recent_plays),
+        // A send carries the library only: say so when the history is ticked and there is a browser to send to.
+        footnote = if (p.pick.takesListens && sendActions.isNotEmpty()) stringResource(R.string.web_library_export_history_file_only) else null,
         busy = p.sending,
         message = p.message,
     )

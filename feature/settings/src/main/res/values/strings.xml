@@ -557,7 +557,11 @@
         <item quantity="other">%1$s plays since %2$s</item>
     </plurals>
     <string name="web_library_export_history_none">No plays yet</string>
-    <string name="web_library_export_history_note">For Your record on the web: every year you listened, pressed into a record.</string>
+    <string name="web_library_export_history_note">Every play on this phone, for Your record on the web: each year you listened, pressed into a record.</string>
+    <!-- The export picker's "Plays" row: the newest plays that go into the web's history (up to 5,000). -->
+    <string name="web_library_export_recent_plays">Recent plays</string>
+    <!-- Under the Send buttons when the whole history is ticked: a send carries only the library. -->
+    <string name="web_library_export_history_file_only">Your whole listening history goes only in a saved file, not in a send.</string>
     <!-- After "Saved 3 likes, 2 playlists and 40 plays.": %s is the history's plays ("12,480 plays"). -->
     <string name="web_library_export_done_history">Your whole listening history went too: %s.</string>
     <string name="web_library_import_what_to_import">What to import</string>

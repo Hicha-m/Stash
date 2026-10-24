@@ -99,6 +99,10 @@ fun LibraryPickerSheet(
     playsDetail: String? = null,
     /** The export only: "Your whole listening history", ticked with [LibraryPick.listensOn]. */
     history: PickerHistory? = null,
+    /** The export only: "Recent plays", so it doesn't read as the whole history above it. "Plays" otherwise. */
+    playsLabel: String = "Plays",
+    /** A line under the buttons (the export: the whole history goes only in a saved file, not a send). */
+    footnote: String? = null,
     busy: Boolean = false,
     message: String? = null,
 ) {
@@ -128,7 +132,7 @@ fun LibraryPickerSheet(
                 onChange = { onPick(pick.copy(likesOn = it)) },
             )
             CheckRow(
-                label = "Plays",
+                label = playsLabel,
                 detail = playsDetail ?: count(pick.plays),
                 checked = pick.takesPlays,
                 enabled = pick.plays > 0 && !busy,
@@ -183,6 +187,10 @@ fun LibraryPickerSheet(
                         }
                     }
                 }
+            }
+            footnote?.let {
+                Spacer(Modifier.padding(top = 8.dp))
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
