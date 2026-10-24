@@ -50,6 +50,8 @@ class WebLibraryExportViewModelTest {
         likes = 1_204,
         plays = 5_000,
         playlists = listOf(ExportPlaylistChoice(1, "Night drive", 30, false), ExportPlaylistChoice(2, "Robin's mix", 12, true), ExportPlaylistChoice(3, "Gym", 8, false)),
+        listens = 12_480,
+        listensSince = MARCH_2025,
     )
 
     @Before fun setUp() {
@@ -62,7 +64,7 @@ class WebLibraryExportViewModelTest {
 
     @Test fun `an export shows its counts, then closes`() = runTest(dispatcher) {
         val result = WebLibraryExportResult(likes = 3, playlists = 2, plays = 40)
-        coEvery { exporter.export(uri, any()) } returns Result.success(result)
+        coEvery { exporter.export(uri, any(), any()) } returns Result.success(result)
         val vm = vm()
 
         vm.export(uri)
@@ -75,7 +77,7 @@ class WebLibraryExportViewModelTest {
     }
 
     @Test fun `a failure says so`() = runTest(dispatcher) {
-        coEvery { exporter.export(uri, any()) } returns Result.failure(IllegalStateException("no stream"))
+        coEvery { exporter.export(uri, any(), any()) } returns Result.failure(IllegalStateException("no stream"))
         val vm = vm()
         vm.export(uri)
         advanceUntilIdle()
@@ -84,7 +86,7 @@ class WebLibraryExportViewModelTest {
 
     @Test fun `a second tap while writing does nothing, and the dialog can't be closed mid-write`() = runTest(dispatcher) {
         val gate = CompletableDeferred<Result<WebLibraryExportResult>>()
-        coEvery { exporter.export(uri, any()) } coAnswers { gate.await() }
+        coEvery { exporter.export(uri, any(), any()) } coAnswers { gate.await() }
         val vm = vm()
 
         vm.export(uri)
@@ -95,13 +97,13 @@ class WebLibraryExportViewModelTest {
 
         gate.complete(Result.success(WebLibraryExportResult(0, 0, 0)))
         advanceUntilIdle()
-        coVerify(exactly = 1) { exporter.export(uri, any()) }
+        coVerify(exactly = 1) { exporter.export(uri, any(), any()) }
         assertThat(vm.state.value).isEqualTo(WebLibraryExportState.Done(WebLibraryExportResult(0, 0, 0)))
     }
 
     @Test fun `the first time everything is ticked, and everything ticked writes today's file`() = runTest(dispatcher) {
         val chosen = slot<ExportSelection>()
-        coEvery { exporter.export(uri, capture(chosen)) } returns Result.success(WebLibraryExportResult(0, 0, 0))
+        coEvery { exporter.export(uri, capture(chosen), any()) } returns Result.success(WebLibraryExportResult(0, 0, 0))
         val vm = vm()
         vm.openPicker()
         advanceUntilIdle()
@@ -119,7 +121,7 @@ class WebLibraryExportViewModelTest {
 
     @Test fun `the choice is what goes, and it is remembered by what was unticked`() = runTest(dispatcher) {
         val chosen = slot<ExportSelection>()
-        coEvery { exporter.export(uri, capture(chosen)) } returns Result.success(WebLibraryExportResult(0, 0, 0))
+        coEvery { exporter.export(uri, capture(chosen), any()) } returns Result.success(WebLibraryExportResult(0, 0, 0))
         val vm = vm()
         vm.openPicker()
         advanceUntilIdle()
@@ -172,11 +174,86 @@ class WebLibraryExportViewModelTest {
         assertThat(vm.picker.value!!.sending).isFalse()
     }
 
+    @Test fun `the whole history is ticked the first time and goes in the saved file`() = runTest(dispatcher) {
+        val listens = slot<Boolean>()
+        coEvery { exporter.export(uri, any(), capture(listens)) } returns Result.success(WebLibraryExportResult(0, 0, 0, listens = 12_480))
+        val vm = vm()
+        vm.openPicker()
+        advanceUntilIdle()
+        val p = vm.picker.value!!
+        assertThat(p.pick.listens).isEqualTo(12_480)
+        assertThat(p.pick.takesListens).isTrue()
+        assertThat(p.listensSince).isEqualTo(MARCH_2025)
+
+        vm.chooseFile()
+        vm.export(uri)
+        advanceUntilIdle()
+        assertThat(listens.captured).isTrue()
+        assertThat(remembered.listens).isTrue()
+    }
+
+    @Test fun `unticking the whole history is remembered, and the file goes without it`() = runTest(dispatcher) {
+        val listens = slot<Boolean>()
+        val chosen = slot<ExportSelection>()
+        coEvery { exporter.export(uri, capture(chosen), capture(listens)) } returns Result.success(WebLibraryExportResult(0, 0, 0))
+        val vm = vm()
+        vm.openPicker()
+        advanceUntilIdle()
+        vm.updatePick(vm.picker.value!!.pick.copy(listensOn = false))
+        vm.chooseFile()
+        vm.export(uri)
+        advanceUntilIdle()
+        assertThat(listens.captured).isFalse()
+        assertThat(chosen.captured).isEqualTo(ExportSelection.ALL)
+        assertThat(remembered).isEqualTo(WebLibraryPickerPrefs.Remembered(listens = false))
+
+        vm.openPicker()
+        advanceUntilIdle()
+        assertThat(vm.picker.value!!.pick.takesListens).isFalse()
+    }
+
+    @Test fun `after the app was killed behind the file picker, the export still writes what was ticked`() = runTest(dispatcher) {
+        val listens = slot<Boolean>()
+        coEvery { exporter.export(uri, any(), capture(listens)) } returns Result.success(WebLibraryExportResult(0, 0, 0))
+        remembered = WebLibraryPickerPrefs.Remembered(listens = false)
+        // A new ViewModel (the old one died with the process) gets the document straight from the file picker.
+        val vm = vm()
+        vm.export(uri)
+        advanceUntilIdle()
+        assertThat(listens.captured).isFalse()
+    }
+
+    @Test fun `the whole history alone is enough to save, not to send`() = runTest(dispatcher) {
+        val vm = vm()
+        vm.openPicker()
+        advanceUntilIdle()
+        val only = vm.picker.value!!.pick.copy(likesOn = false, playsOn = false, ticked = emptySet())
+        assertThat(only.isEmpty).isFalse()
+        assertThat(only.libraryIsEmpty).isTrue()
+    }
+
+    @Test fun `a phone with no plays of its own can't tick it`() = runTest(dispatcher) {
+        coEvery { exporter.catalog() } returns catalog.copy(listens = 0, listensSince = null)
+        val vm = vm()
+        vm.openPicker()
+        advanceUntilIdle()
+        assertThat(vm.picker.value!!.pick.takesListens).isFalse()
+    }
+
+    @Test fun `the history's start reads as a month and year`() {
+        assertThat(WebLibraryExportViewModel.historySince(MARCH_2025, java.time.ZoneOffset.UTC, java.util.Locale.US)).isEqualTo("March 2025")
+    }
+
     @Test fun `with the link switched off there is nowhere to send`() = runTest(dispatcher) {
         val vm = vm(linkEnabled = false)
         vm.openPicker()
         advanceUntilIdle()
         assertThat(vm.picker.value!!.targets).isEmpty()
         coVerify(exactly = 0) { inbox.targets() }
+    }
+
+    private companion object {
+        /** 2025-03-14T12:00:00Z */
+        const val MARCH_2025 = 1_741_953_600_000L
     }
 }

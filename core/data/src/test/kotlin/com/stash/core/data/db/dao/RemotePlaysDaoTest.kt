@@ -21,7 +21,8 @@ import org.robolectric.annotation.Config
  * play of the same track: every query below must see only the local one.
  *
  * **The checklist.** A query added later that ranks taste, counts plays for a mix, or submits listens belongs in this test.
- * Queries that only show or export history (`WebLibraryExportDao.recentPlays`, History) include remote plays on purpose.
+ * Queries that only show or export history (`WebLibraryExportDao.recentPlays`, History) include remote plays on purpose; the
+ * whole-history export (`WebLibraryExportDao.ownPlaysBefore`, the file's `listens`) must not, as they go in from where they were made.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [33])
@@ -90,6 +91,14 @@ class RemotePlaysDaoTest {
     @Test fun `history and export still show them`() = runTest {
         fill()
         assertEquals(listOf(2L, 2L, 1L), db.webLibraryExportDao().recentPlays(10).map { it.track.id })
+    }
+
+    @Test fun `the whole-history export (listens) carries only this phone's plays`() = runTest {
+        fill()
+        val export = db.webLibraryExportDao()
+        assertEquals(listOf("Borderline"), export.ownPlaysBefore(Long.MAX_VALUE, Long.MAX_VALUE, 10).map { it.title })
+        assertEquals(1, export.ownPlayCount())
+        assertEquals(T, export.ownFirstPlayAt())
     }
 
     private companion object {

@@ -16,8 +16,8 @@ import java.io.OutputStream
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** What an export wrote. */
-data class WebLibraryExportResult(val likes: Int, val playlists: Int, val plays: Int)
+/** What an export wrote. [listens] and [skips] are the `listens` section's (0 when it wasn't asked for). */
+data class WebLibraryExportResult(val likes: Int, val playlists: Int, val plays: Int, val listens: Int = 0, val skips: Int = 0)
 
 /**
  * What an export or a one-off send carries (link-sync spec §2.3): likes yes/no, plays yes/no, and which of your playlists.
@@ -43,8 +43,18 @@ data class ExportSelection(
 /** One of your playlists as the picker lists it: name, songs that would go, and whether it is a followed shared mix. */
 data class ExportPlaylistChoice(val id: Long, val name: String, val songs: Int, val sharedMix: Boolean)
 
-/** What the library holds that an export could carry, for the picker's counts (spec §2.3 "Likes · 1,204"). */
-data class ExportCatalog(val likes: Int, val plays: Int, val playlists: List<ExportPlaylistChoice>)
+/**
+ * What the library holds that an export could carry, for the picker's counts (spec §2.3 "Likes · 1,204"). [listens] is how
+ * many of this phone's own plays "Your whole listening history" would write, and [listensSince] when the first of them
+ * started (null when there is none).
+ */
+data class ExportCatalog(
+    val likes: Int,
+    val plays: Int,
+    val playlists: List<ExportPlaylistChoice>,
+    val listens: Int = 0,
+    val listensSince: Long? = null,
+)
 
 /**
  * "Export for Stash on the web" (Settings › Library & Storage): writes your likes, your own playlists and your
@@ -56,6 +66,9 @@ data class ExportCatalog(val likes: Int, val plays: Int, val playlists: List<Exp
  * as its portable description (title, artist, album, length, ISRC, Spotify id, YouTube id, an allowed cover).
  * What never goes in: Daily Mixes, Stash Mixes, the Downloads list, blocked songs, file paths, download state,
  * logins, settings, Last.fm data, the Community key.
+ *
+ * When asked, a saved file also carries `listens` ([WebLibraryListens]): every play and skip made on this phone (never a
+ * mirrored or imported one), streamed from the database, for Your record on the web.
  */
 @Singleton
 class WebLibraryExporter @Inject constructor(
@@ -81,8 +94,8 @@ class WebLibraryExporter @Inject constructor(
      * (the same rules as [collect]: blocked songs and songs without a title or artist never count).
      */
     suspend fun catalog(): ExportCatalog = withContext(Dispatchers.IO) {
-        database.withTransaction {
-            val dao = database.webLibraryExportDao()
+        val dao = database.webLibraryExportDao()
+        val library = database.withTransaction {
             val follows = dao.followedMixes().mapTo(HashSet()) { it.playlistId }
             ExportCatalog(
                 likes = dao.likeCount(),
@@ -97,6 +110,9 @@ class WebLibraryExporter @Inject constructor(
                 },
             )
         }
+        // The history's counts read every play, so they stay out of that transaction (which holds the write lock): a play
+        // recorded in between only makes the count one newer, and the picker's counts are a guide, not the file.
+        library.copy(listens = minOf(dao.ownPlayCount(), WebLibraryListens.MAX_PLAYS), listensSince = dao.ownFirstPlayAt())
     }
 
     /** The file as text (a one-off send seals it whole): the same bytes [export] writes to a file. */
@@ -153,22 +169,40 @@ class WebLibraryExporter @Inject constructor(
      * Writes the file to [targetUri] (a new document from the system file picker). The picker has already created
      * that document, so if the export fails or is cancelled (the user leaves the screen), the document is deleted
      * again: an empty `stash-library-….json` would only tell the web "That file isn't a Stash backup."
+     *
+     * With [listens], the file also carries this phone's whole listening history ([WebLibraryListens], "Your whole listening
+     * history" in the picker). Only a saved file carries it: a one-off send ([text]) is sealed whole and stays as it was.
      */
-    suspend fun export(targetUri: Uri, selection: ExportSelection = ExportSelection.ALL): Result<WebLibraryExportResult> = withContext(Dispatchers.IO) {
+    suspend fun export(
+        targetUri: Uri,
+        selection: ExportSelection = ExportSelection.ALL,
+        listens: Boolean = false,
+    ): Result<WebLibraryExportResult> = withContext(Dispatchers.IO) {
         try {
             val file = collect(System.currentTimeMillis(), generator(), selection)
             ensureActive()
             // Streamed straight into the document: the text is never held whole in memory.
             val stream = context.contentResolver.openOutputStream(targetUri)
                 ?: throw IllegalStateException("Could not open output stream for URI: $targetUri")
+            var history = ListensWritten(0, 0)
             val bytes = stream.use { raw ->
                 val out = CountingOutputStream(raw.buffered(WRITE_BUFFER))
-                WebLibraryFile.write(file, out)
+                if (listens) history = writeWithListens(file, out) else WebLibraryFile.write(file, out)
                 out.flush()
                 out.count
             }
-            val result = WebLibraryExportResult(likes = file.likes.size, playlists = file.playlists.size, plays = file.history.size)
-            Log.i(TAG, "Wrote $bytes bytes: ${result.likes} likes, ${result.playlists} playlists, ${result.plays} plays")
+            val result = WebLibraryExportResult(
+                likes = file.likes.size,
+                playlists = file.playlists.size,
+                plays = file.history.size,
+                listens = history.plays,
+                skips = history.skips,
+            )
+            Log.i(
+                TAG,
+                "Wrote $bytes bytes: ${result.likes} likes, ${result.playlists} playlists, ${result.plays} plays" +
+                    if (listens) ", listens ${result.listens} plays and ${result.skips} skips" else "",
+            )
             Result.success(result)
         } catch (e: CancellationException) {
             discard(targetUri)
@@ -178,6 +212,29 @@ class WebLibraryExporter @Inject constructor(
             discard(targetUri)
             Result.failure(e)
         }
+    }
+
+    /**
+     * Writes [file] with the `listens` section before its closing brace, to [out] (counted, so the whole file stays within
+     * the reader's 64 MiB, [WebLibraryReader.MAX_BYTES]). The rest of the file is written exactly as without it.
+     *
+     * The history is read after [collect]'s transaction, a page at a time, so the database isn't held while the file is
+     * written. A play recorded meanwhile is newer than the first page and simply isn't in this file.
+     */
+    internal suspend fun writeWithListens(
+        file: WebLibraryFile,
+        out: CountingOutputStream,
+        maxBytes: Long = WebLibraryReader.MAX_BYTES.toLong(),
+    ): ListensWritten {
+        val head = WebLibraryListens.HoldLastByte(out)
+        WebLibraryFile.write(file, head)
+        head.flush()
+        check(head.release() == '}'.code) { "The library file didn't end with its closing brace" }
+        // What is left for listens: the cap, less what is written and the closing brace still to come.
+        val budget = maxBytes - out.count - 1
+        val written = WebLibraryListens.write(database.webLibraryExportDao(), out, budget)
+        out.write('}'.code)
+        return written
     }
 
     /** Deletes the half-made document at [uri]. Best effort: a failure here only leaves the file behind. */
@@ -196,8 +253,8 @@ class WebLibraryExporter @Inject constructor(
         Log.i(TAG, if (deleted) "Deleted the unfinished export" else "The unfinished export may still be there")
     }
 
-    /** Counts what passes through, for the log line. */
-    private class CountingOutputStream(out: OutputStream) : FilterOutputStream(out) {
+    /** Counts what passes through, for the log line and the size cap. */
+    internal class CountingOutputStream(out: OutputStream) : FilterOutputStream(out) {
         var count = 0L
             private set
 

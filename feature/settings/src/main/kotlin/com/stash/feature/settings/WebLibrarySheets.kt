@@ -4,6 +4,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -17,11 +18,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.stash.core.data.weblibrary.WebLibraryFile
 import com.stash.core.data.weblink.inbox.SendTarget
 import com.stash.feature.settings.weblink.LibraryPickerSheet
 import com.stash.feature.settings.weblink.PickerAction
+import com.stash.feature.settings.weblink.PickerHistory
 
 /**
  * The export picker (link-sync spec §2.3) and what follows it: Save as file (the system file picker, then the file), or Send to
@@ -40,9 +43,22 @@ fun WebLibraryExportSheet(vm: WebLibraryExportViewModel) {
     val p = picker ?: return
     val sendActions = when (p.targets.size) {
         0 -> emptyList()
-        1 -> listOf(PickerAction(stringResource(R.string.web_library_export_send_to_target, p.targets[0].name), { vm.send(p.targets[0]) }))
-        else -> listOf(PickerAction(stringResource(R.string.web_library_export_send_to_picker), { choosingTarget = true }))
+        1 -> listOf(PickerAction(stringResource(R.string.web_library_export_send_to_target, p.targets[0].name), { vm.send(p.targets[0]) }, needsLibrary = true))
+        else -> listOf(PickerAction(stringResource(R.string.web_library_export_send_to_picker), { choosingTarget = true }, needsLibrary = true))
     }
+    val resources = LocalContext.current.resources
+    val history = PickerHistory(
+        label = stringResource(R.string.web_library_export_history_label),
+        detail = p.listensSince?.takeIf { p.pick.listens > 0 }?.let { since ->
+            resources.getQuantityString(
+                R.plurals.web_library_export_history_detail,
+                p.pick.listens,
+                "%,d".format(p.pick.listens),
+                WebLibraryExportViewModel.historySince(since),
+            )
+        } ?: stringResource(R.string.web_library_export_history_none),
+        note = stringResource(R.string.web_library_export_history_note),
+    )
     LibraryPickerSheet(
         title = stringResource(R.string.web_library_export_what_to_include),
         pick = p.pick,
@@ -55,6 +71,10 @@ fun WebLibraryExportSheet(vm: WebLibraryExportViewModel) {
         ) + sendActions,
         onDismiss = vm::closePicker,
         playsDetail = if (p.pick.plays >= WebLibraryFile.MAX_PLAYS) stringResource(R.string.web_library_export_plays_detail, WebLibraryFile.MAX_PLAYS) else null,
+        history = history,
+        playsLabel = stringResource(R.string.web_library_export_recent_plays),
+        // A send carries the library only: say so when the history is ticked and there is a browser to send to.
+        footnote = if (p.pick.takesListens && sendActions.isNotEmpty()) stringResource(R.string.web_library_export_history_file_only) else null,
         busy = p.sending,
         message = p.message,
     )
@@ -145,15 +165,27 @@ internal fun WebLibraryExportDialog(state: WebLibraryExportState, onDismiss: () 
             when (state) {
                 is WebLibraryExportState.Done -> {
                     val r = state.result
-                    Text(
-                        text = stringResource(
-                            R.string.web_library_export_done_body,
-                            resources.getQuantityString(R.plurals.web_library_export_likes, r.likes, r.likes),
-                            resources.getQuantityString(R.plurals.web_library_export_playlists, r.playlists, r.playlists),
-                            resources.getQuantityString(R.plurals.web_library_export_plays, r.plays, r.plays),
-                        ),
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
+                    Column {
+                        Text(
+                            text = stringResource(
+                                R.string.web_library_export_done_body,
+                                resources.getQuantityString(R.plurals.web_library_export_likes, r.likes, r.likes),
+                                resources.getQuantityString(R.plurals.web_library_export_playlists, r.playlists, r.playlists),
+                                resources.getQuantityString(R.plurals.web_library_export_plays, r.plays, r.plays),
+                            ),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        if (r.listens > 0) {
+                            Text(
+                                text = stringResource(
+                                    R.string.web_library_export_done_history,
+                                    resources.getQuantityString(R.plurals.web_library_export_plays, r.listens, r.listens),
+                                ),
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
+                    }
                 }
                 is WebLibraryExportState.Sent -> {
                     val r = state.result

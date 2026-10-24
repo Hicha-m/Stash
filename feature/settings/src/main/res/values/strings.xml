@@ -549,6 +549,21 @@
     <string name="web_library_export_send_to_picker">Send to…</string>
     <string name="web_library_export_send_to_title">Send to</string>
     <string name="web_library_export_plays_detail">your last %,d</string>
+    <!-- The export picker's tick for this phone's whole history (library-file v1 "Listens"), for Your record on the web. -->
+    <string name="web_library_export_history_label">Your whole listening history</string>
+    <!-- %1$s the count ("12,480"), %2$s the month of the first play ("March 2025"). -->
+    <plurals name="web_library_export_history_detail">
+        <item quantity="one">%1$s play since %2$s</item>
+        <item quantity="other">%1$s plays since %2$s</item>
+    </plurals>
+    <string name="web_library_export_history_none">No plays yet</string>
+    <string name="web_library_export_history_note">Every play on this phone, for Your record on the web: each year you listened, pressed into a record.</string>
+    <!-- The export picker's "Plays" row: the newest plays that go into the web's history (up to 5,000). -->
+    <string name="web_library_export_recent_plays">Recent plays</string>
+    <!-- Under the Send buttons when the whole history is ticked: a send carries only the library. -->
+    <string name="web_library_export_history_file_only">Your whole listening history goes only in a saved file, not in a send.</string>
+    <!-- After "Saved 3 likes, 2 playlists and 40 plays.": %s is the history's plays ("12,480 plays"). -->
+    <string name="web_library_export_done_history">Your whole listening history went too: %s.</string>
     <string name="web_library_import_what_to_import">What to import</string>
     <string name="web_library_import_action_import">Import</string>
     <string name="web_library_import_reading_title">Reading the file</string>

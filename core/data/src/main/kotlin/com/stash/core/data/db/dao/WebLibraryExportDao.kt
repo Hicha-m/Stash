@@ -217,6 +217,100 @@ interface WebLibraryExportDao {
     )
     suspend fun playKeysBetween(fromMs: Long, toMs: Long): List<PlayKeyRow>
 
+    // ── Your whole listening history (library-file v1 "Listens") ────────────────────────────────────────────────────
+    //
+    // Only this phone's own listens: `origin_device IS NULL`. A play mirrored from another device or imported (Stash on the
+    // web, Last.fm, ListenBrainz) comes into the web from where it was made, so it never goes out again from here.
+    // (`recentPlays` above, the file's `history`, includes them on purpose; see RemotePlaysDaoTest's checklist.)
+    // Skips have no origin column: only ListeningRecorder writes them, so every skip is this phone's own.
+    //
+    // Read in pages, newest first, by a (time, id) cursor: a decade is about 100,000 plays, and a page of 5,000 small rows
+    // is all that is in memory at once. `started_at <= :beforeAt` is a range on the indexed column, so each page starts
+    // with an index seek instead of re-reading every newer row.
+
+    /** One of this phone's plays, with just the words and times the file needs. */
+    data class ListenRow(
+        val id: Long,
+        val title: String,
+        val artist: String,
+        val album: String,
+        @ColumnInfo(name = "started_at") val startedAt: Long,
+        @ColumnInfo(name = "listened_ms") val listenedMs: Long?,
+        @ColumnInfo(name = "duration_ms") val durationMs: Long,
+    )
+
+    /** One of this phone's skips: when it happened and how far the song had got. */
+    data class SkipRow(
+        val id: Long,
+        val title: String,
+        val artist: String,
+        val album: String,
+        @ColumnInfo(name = "skipped_at") val skippedAt: Long,
+        @ColumnInfo(name = "position_ms") val positionMs: Long,
+    )
+
+    /**
+     * Up to [limit] of this phone's plays older than the cursor ([beforeAt], [beforeId]), newest first. The first page passes
+     * [Long.MAX_VALUE] for both; the next passes the last row's `started_at` and `id`.
+     */
+    @Query(
+        """
+        SELECT le.id, t.title, t.artist, t.album, le.started_at, le.listened_ms, t.duration_ms
+        FROM listening_events le
+        JOIN tracks t ON t.id = le.track_id
+        WHERE le.origin_device IS NULL
+          AND le.started_at > 0
+          AND le.started_at <= :beforeAt
+          AND (le.started_at < :beforeAt OR le.id < :beforeId)
+          AND TRIM(t.title) != '' AND TRIM(t.artist) != ''
+          AND $NOT_BLOCKED
+        ORDER BY le.started_at DESC, le.id DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun ownPlaysBefore(beforeAt: Long, beforeId: Long, limit: Int): List<ListenRow>
+
+    /** Up to [limit] of this phone's skips older than the cursor, newest first ([ownPlaysBefore]'s paging). */
+    @Query(
+        """
+        SELECT se.id, t.title, t.artist, t.album, se.skipped_at, se.position_ms
+        FROM track_skip_events se
+        JOIN tracks t ON t.id = se.track_id
+        WHERE se.skipped_at > 0
+          AND se.skipped_at <= :beforeAt
+          AND (se.skipped_at < :beforeAt OR se.id < :beforeId)
+          AND TRIM(t.title) != '' AND TRIM(t.artist) != ''
+          AND $NOT_BLOCKED
+        ORDER BY se.skipped_at DESC, se.id DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun ownSkipsBefore(beforeAt: Long, beforeId: Long, limit: Int): List<SkipRow>
+
+    /** How many plays [ownPlaysBefore] pages through (the picker's "12,480 plays"). */
+    @Query(
+        """
+        SELECT COUNT(*) FROM listening_events le
+        JOIN tracks t ON t.id = le.track_id
+        WHERE le.origin_device IS NULL AND le.started_at > 0
+          AND TRIM(t.title) != '' AND TRIM(t.artist) != ''
+          AND $NOT_BLOCKED
+        """,
+    )
+    suspend fun ownPlayCount(): Int
+
+    /** When the first of those plays started (the picker's "since March 2025"); null when there is none. */
+    @Query(
+        """
+        SELECT MIN(le.started_at) FROM listening_events le
+        JOIN tracks t ON t.id = le.track_id
+        WHERE le.origin_device IS NULL AND le.started_at > 0
+          AND TRIM(t.title) != '' AND TRIM(t.artist) != ''
+          AND $NOT_BLOCKED
+        """,
+    )
+    suspend fun ownFirstPlayAt(): Long?
+
     companion object {
         /** [SongColumns] of a track (`t`). */
         const val SONG_COLUMNS =
