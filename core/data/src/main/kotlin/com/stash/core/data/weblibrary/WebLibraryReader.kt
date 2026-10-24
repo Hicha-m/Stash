@@ -2,7 +2,9 @@ package com.stash.core.data.weblibrary
 
 import com.stash.core.data.weblink.handoff.HandoffWire
 import com.stash.core.data.weblink.handoff.WireSong
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.decodeFromStream
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -10,6 +12,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.longOrNull
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 
@@ -77,7 +80,16 @@ object WebLibraryReader {
      * The root's [IGNORED] sections (`listens`, a phone's whole history for the web's Your record) are not counted: this
      * reader never parses them (see [read]), so a decade of plays there costs nothing here. Their nesting is still checked.
      */
-    fun checkShape(text: String, shape: Shape) {
+    fun checkShape(text: String, shape: Shape) = scanShape(text.length, shape) { text[it] }
+
+    /**
+     * [checkShape] over UTF-8 [bytes] (the first [length]), without decoding them: every character the scan looks at is ASCII,
+     * and a multi-byte UTF-8 sequence is made only of bytes from 0x80 up, so none of it is ever taken for one.
+     */
+    fun checkShape(bytes: ByteArray, length: Int, shape: Shape) = scanShape(length, shape) { (bytes[it].toInt() and 0xff).toChar() }
+
+    /** The one pass behind both [checkShape]s, over [length] characters that [at] reads. Inline, so no call per character. */
+    private inline fun scanShape(length: Int, shape: Shape, at: (Int) -> Char) {
         var depth = 0
         var containers = 0
         var values = 0
@@ -89,7 +101,8 @@ object WebLibraryReader {
         var rootKey: String? = null
         // Inside an ignored section: the depth that ends it, else -1.
         var skipTo = -1
-        for (ch in text) {
+        for (i in 0 until length) {
+            val ch = at(i)
             if (inString) {
                 when {
                     escaped -> {
@@ -171,9 +184,13 @@ object WebLibraryReader {
     private val SHARE_ID = Regex("^[A-Za-z0-9]{8}$")
     private val json = Json { ignoreUnknownKeys = true }
 
-    /** Reads [input] (closed by the caller), refusing more than [MAX_BYTES]. */
+    /**
+     * Reads [input] (closed by the caller), refusing more than [MAX_BYTES]. The file is held once, as its bytes: the shape is
+     * checked on them and they are parsed as a stream, never copied into one (twice as big) string.
+     */
+    @OptIn(ExperimentalSerializationApi::class)
     fun read(input: InputStream, now: Long, shape: Shape = FILE_SHAPE): WebLibraryContent {
-        val out = ByteArrayOutputStream()
+        val out = Bytes()
         val buf = ByteArray(64 * 1024)
         while (true) {
             val n = input.read(buf)
@@ -181,18 +198,31 @@ object WebLibraryReader {
             if (out.size() + n > MAX_BYTES) throw WebLibraryReadException(TOO_BIG)
             out.write(buf, 0, n)
         }
-        return read(out.toString(Charsets.UTF_8.name()), now, shape)
+        checkShape(out.buffer, out.size(), shape)
+        val root = parse { json.decodeFromStream(Root.serializer(), out.inputStream()) }
+        return contentOf(root, now)
     }
 
     fun read(text: String, now: Long, shape: Shape = FILE_SHAPE): WebLibraryContent {
         if (text.length > MAX_BYTES) throw WebLibraryReadException(TOO_BIG)
         checkShape(text, shape)
-        val root = try {
-            json.decodeFromString(Root.serializer(), text).toJsonObject()
-        } catch (e: IllegalArgumentException) {
-            // Not JSON, or not an object at the root (a SerializationException is an IllegalArgumentException).
-            null
-        } ?: throw WebLibraryReadException(NOT_A_BACKUP)
+        return contentOf(parse { json.decodeFromString(Root.serializer(), text) }, now)
+    }
+
+    /** A [ByteArrayOutputStream] whose bytes are read where they are, not copied out. */
+    private class Bytes : ByteArrayOutputStream(64 * 1024) {
+        val buffer: ByteArray get() = buf
+        fun inputStream() = ByteArrayInputStream(buf, 0, count)
+    }
+
+    /** The root, or [NOT_A_BACKUP] when it isn't JSON or isn't an object (a SerializationException is an IllegalArgumentException). */
+    private inline fun parse(decode: () -> Root): JsonObject = try {
+        decode().toJsonObject()
+    } catch (e: IllegalArgumentException) {
+        throw WebLibraryReadException(NOT_A_BACKUP)
+    }
+
+    private fun contentOf(root: JsonObject, now: Long): WebLibraryContent {
         if (root.str("kind") != WebLibraryFile.KIND) throw WebLibraryReadException(NOT_A_BACKUP)
         val v = root.integer("v")
         if (v != WebLibraryFile.VERSION.toLong()) throw WebLibraryReadException(if (v != null && v > WebLibraryFile.VERSION) NEWER else NOT_A_BACKUP)
