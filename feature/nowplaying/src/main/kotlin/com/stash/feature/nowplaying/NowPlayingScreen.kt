@@ -18,6 +18,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.platform.LocalDensity
+import com.stash.core.data.backcover.BackCoverAlbum
 import com.stash.core.data.prefs.NowPlayingAction
 import com.stash.feature.nowplaying.ui.CompactCover
 import com.stash.feature.nowplaying.ui.LyricsMenuButton
@@ -29,6 +30,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -115,7 +117,9 @@ import com.stash.feature.nowplaying.ui.WithAlbumChrome
 import com.stash.core.ui.ambient.LocalAlbumChrome
 import com.stash.feature.nowplaying.ui.npInk
 import com.stash.feature.nowplaying.ui.QueueBottomSheet
+import com.stash.feature.nowplaying.ui.LoadedBackCover
 import com.stash.feature.nowplaying.ui.SwipeableArt
+import com.stash.feature.nowplaying.ui.rememberLoadedBackCover
 import com.stash.feature.nowplaying.ui.hasNextInQueue
 import com.stash.feature.nowplaying.ui.hasPreviousInQueue
 import com.stash.feature.nowplaying.sheet.HeroArt
@@ -157,6 +161,57 @@ fun NowPlayingScreen(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val track = uiState.currentTrack
+    // The album's back, once its image is in hand: a tap on the art turns the cover over to it, and
+    // a swipe there turns through the pages inside.
+    val coverArt by viewModel.coverArt.collectAsStateWithLifecycle()
+    val backCoverKey by viewModel.backCoverKey.collectAsStateWithLifecycle()
+    val backCover = rememberLoadedBackCover(coverArt?.back)
+    val insidePages = coverArt?.inside.orEmpty()
+    // Settings > Appearance > Cycle album art: the front turns slowly through the back and the
+    // pages inside while Now Playing is up, until the art is turned over by hand.
+    val cycleAlbumArt by viewModel.cycleAlbumArt.collectAsStateWithLifecycle()
+    var cycleIndex by remember(backCoverKey) { mutableStateOf(0) }
+    var cycleSnap by remember { mutableStateOf(0) }
+    var backUp by remember { mutableStateOf(false) }
+    // The page the back opens on: the one the cycle was showing when the art was turned over.
+    var packageStart by remember(backCoverKey) { mutableStateOf(0) }
+    val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
+    val npInSight = lifecycleState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
+        (sheet == null || sheet.settledAnchor == com.stash.feature.nowplaying.sheet.PlayerSheetAnchor.FULL)
+    // A page (or the front) pinched off the art, held up over the whole screen: put back by a new
+    // album, or a new song when there is no album to go by.
+    val pageZoom = com.stash.feature.nowplaying.ui.rememberPageZoom(track?.let { BackCoverAlbum.of(it)?.key ?: it.id })
+    // Page index's Discogs page when its image comes from Discogs (0 is the back), for the credit.
+    val discogsCredit: (Int) -> String? = remember(coverArt) {
+        { index ->
+            val art = coverArt
+            art?.discogsPage?.takeIf { if (index == 0) art.backFromDiscogs else art.insideFromDiscogs }
+        }
+    }
+    val backFace: (@Composable (Modifier) -> Unit)? = remember(backCover, insidePages, pageZoom, discogsCredit, packageStart) {
+        backCover?.let { loaded ->
+            { faceModifier: Modifier ->
+                com.stash.feature.nowplaying.ui.AlbumPackage(
+                    pageCount = 1 + insidePages.size,
+                    modifier = faceModifier,
+                    credit = discogsCredit,
+                    initialPage = packageStart,
+                ) { index ->
+                    if (index == 0) {
+                        AlbumBackSection(loaded, pageZoom, discogsCredit(0))
+                    } else {
+                        InsidePageSection(
+                            url = insidePages[index - 1],
+                            description = "Inside page $index of ${insidePages.size}",
+                            zoom = pageZoom,
+                            discogsPage = discogsCredit(index),
+                        )
+                    }
+                }
+            }
+        }
+    }
     val resolvingArtist by viewModel.resolvingArtist.collectAsStateWithLifecycle()
     val isDownloadingCurrent by viewModel.isDownloadingCurrent.collectAsStateWithLifecycle()
     val exportingLyricsTrackId by viewModel.exportingLyricsTrackId.collectAsStateWithLifecycle()
@@ -964,7 +1019,8 @@ fun NowPlayingScreen(
                                 ) {
                                     // Swipe for the next / previous song, double-tap a side to seek
                                     // 10 s: through the same ViewModel calls as the transport and the
-                                    // progress bar, and off for a listener, as those are.
+                                    // progress bar, and off for a listener, as those are. A tap turns
+                                    // the cover over when the album's back is known.
                                     SwipeableArt(
                                         trackKey = track?.let { it.id to uiState.currentIndex },
                                         gesturesEnabled = track != null && !isListener,
@@ -976,13 +1032,64 @@ fun NowPlayingScreen(
                                         onNext = viewModel::onSkipNext,
                                         onPrevious = viewModel::onSwipePrevious,
                                         onSeekTo = viewModel::onSeekTo,
+                                        flipKey = backCoverKey,
+                                        back = backFace,
                                         modifier = artShared,
-                                    ) { swipeModifier ->
-                                        AlbumArtSection(
-                                            albumArtUrl = track?.albumArtUrl,
-                                            albumArtPath = track?.albumArtPath,
-                                            modifier = swipeModifier,
-                                        )
+                                        onShowBackChange = { up ->
+                                            if (up && !backUp) packageStart = (cycleIndex - 1).coerceAtLeast(0)
+                                            backUp = up
+                                        },
+                                    ) { faceModifier ->
+                                        // Turned over by hand: once the front is out of sight (past
+                                        // the turn's middle), it is the front again, unfaded.
+                                        LaunchedEffect(backUp) {
+                                            if (backUp && cycleIndex != 0) {
+                                                kotlinx.coroutines.delay(CYCLE_RESET_AFTER_MS)
+                                                cycleIndex = 0
+                                                cycleSnap++
+                                            }
+                                        }
+                                        val front: @Composable (Modifier) -> Unit = { m ->
+                                            AlbumArtSection(
+                                                albumArtUrl = track?.albumArtUrl,
+                                                albumArtPath = track?.albumArtPath,
+                                                zoom = pageZoom,
+                                                modifier = m,
+                                            )
+                                        }
+                                        val loaded = backCover
+                                        if (cycleAlbumArt && loaded != null) androidx.compose.runtime.key(backCoverKey) {
+                                            // Keyed by album: a page still fading out is never drawn
+                                            // from the next album's list.
+                                            val context = androidx.compose.ui.platform.LocalContext.current
+                                            com.stash.feature.nowplaying.ui.CyclingArt(
+                                                pageCount = 1 + insidePages.size,
+                                                index = cycleIndex,
+                                                onIndexChange = { cycleIndex = it },
+                                                running = npInSight && !backUp && pageZoom.page == null,
+                                                snapKey = cycleSnap,
+                                                load = { n ->
+                                                    n == 1 || insidePages.getOrNull(n - 2)
+                                                        ?.let { com.stash.feature.nowplaying.ui.loadPageImage(context, it) } == true
+                                                },
+                                                modifier = faceModifier,
+                                            ) { n ->
+                                                when (n) {
+                                                    0 -> front(Modifier)
+                                                    1 -> AlbumBackSection(loaded, pageZoom, discogsCredit(0))
+                                                    else -> insidePages.getOrNull(n - 2)?.let { url ->
+                                                        InsidePageSection(
+                                                            url = url,
+                                                            description = "Inside page ${n - 1} of ${insidePages.size}",
+                                                            zoom = pageZoom,
+                                                            discogsPage = discogsCredit(n - 1),
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            front(faceModifier)
+                                        }
                                     }
                                     if (room != null) {
                                         // "Maya joined", "Rawn skipped": over the art, so the layout never shifts.
@@ -1170,6 +1277,7 @@ fun NowPlayingScreen(
             }
         }
         if (room != null) com.stash.feature.nowplaying.listen.FloatingReactions(together.reactions, animate = ambientAnimationEnabled, modifier = Modifier.fillMaxSize().then(controlsLayer))
+        com.stash.feature.nowplaying.ui.PageZoomLayer(pageZoom)
     }
 
     if (showOptionsSheet && track != null) WithAlbumChrome { sheetChrome ->
@@ -1442,18 +1550,14 @@ private fun TrackInfoBlock(
     }
 }
 
-/**
- * Album art with a glow in the album accent behind it (Coil 3 [AsyncImage]). The glow's colour is
- * read in the layer's draw block, so the album colour's crossfade redraws the shadow and never
- * recomposes the art.
- */
+/** Album art with a glow in the album accent behind it ([ArtGlow]; Coil 3 [AsyncImage]). */
 @Composable
 private fun AlbumArtSection(
     albumArtUrl: String?,
     albumArtPath: String?,
+    zoom: com.stash.feature.nowplaying.ui.PageZoom,
     modifier: Modifier = Modifier,
 ) {
-    val chrome = LocalAlbumChrome.current
     val artModel = albumArtPath ?: albumArtUrl
     // An image that cannot load (deleted upstream, a 404, a network failure) must
     // read as "no art" — a quiet tile in the surface tone, same shape as the art —
@@ -1464,23 +1568,17 @@ private fun AlbumArtSection(
     // Shared with lyrics mode's compact cover: one fixed decode (see rememberNpArtRequest).
     val artRequest = com.stash.feature.nowplaying.ui.rememberNpArtRequest(artModel)
 
-    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        // Glow behind the artwork.
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(10.dp)
-                // Modifier.shadow(40.dp, RoundedCornerShape(20.dp), ...) spelled out, so the
-                // shadow colours are read at draw time.
-                .graphicsLayer {
-                    shadowElevation = 40.dp.toPx()
-                    shape = ArtGlowShape
-                    clip = false
-                    val glow = chrome.accent.copy(alpha = 0.25f)
-                    ambientShadowColor = glow
-                    spotShadowColor = glow
-                },
-        )
+    // Pinched, the front lifts off to the whole screen like the pages inside.
+    val lifted = remember(artRequest) {
+        artModel?.let { com.stash.feature.nowplaying.ui.LiftedPage("front:$it", artRequest, "Album art") }
+    }
+    com.stash.feature.nowplaying.ui.LiftablePage(
+        zoom = zoom,
+        page = lifted,
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        ArtGlow()
 
         AsyncImage(
             model = artRequest,
@@ -1494,6 +1592,128 @@ private fun AlbumArtSection(
         )
     }
 }
+
+/**
+ * The glow in the album accent behind a face of the art, filling its box. The colour is read in
+ * the layer's draw block, so the album colour's crossfade redraws the shadow and never recomposes.
+ */
+@Composable
+private fun ArtGlow() {
+    val chrome = LocalAlbumChrome.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(10.dp)
+            // Modifier.shadow(40.dp, RoundedCornerShape(20.dp), ...) spelled out, so the
+            // shadow colours are read at draw time.
+            .graphicsLayer {
+                shadowElevation = 40.dp.toPx()
+                shape = ArtGlowShape
+                clip = false
+                val glow = chrome.accent.copy(alpha = 0.25f)
+                ambientShadowColor = glow
+                spotShadowColor = glow
+            },
+    )
+}
+
+/**
+ * The album's back cover, the art's other face: at its own shape (an LP's back is square, a CD's
+ * tray card wider than tall), centred in the art's square, with the front's glow and corners.
+ */
+@Composable
+private fun AlbumBackSection(
+    back: LoadedBackCover,
+    zoom: com.stash.feature.nowplaying.ui.PageZoom,
+    discogsPage: String?,
+    modifier: Modifier = Modifier,
+) {
+    val lifted = remember(back, discogsPage) {
+        com.stash.feature.nowplaying.ui.LiftedPage(back.request.data.toString(), back.request, "Back cover", discogsPage)
+    }
+    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        // A sliver of a scan (a spine, a panorama of a gatefold) would read as broken: past these
+        // shapes it is cropped to them instead.
+        com.stash.feature.nowplaying.ui.LiftablePage(
+            zoom = zoom,
+            page = lifted,
+            modifier = Modifier.aspectRatio(back.aspectRatio.coerceIn(BACK_MIN_ASPECT, BACK_MAX_ASPECT)),
+        ) {
+            ArtGlow()
+            AsyncImage(
+                model = back.request,
+                contentDescription = "Back cover",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(20.dp)),
+            )
+        }
+    }
+}
+
+/**
+ * One page inside the album (a booklet page, a gatefold panel, the inner sleeve), drawn like the
+ * back: at its own shape once loaded, centred, with the glow and corners. A quiet tile in the
+ * art's place while it loads or if it can't.
+ */
+@Composable
+private fun InsidePageSection(
+    url: String,
+    description: String,
+    zoom: com.stash.feature.nowplaying.ui.PageZoom,
+    discogsPage: String?,
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val request = remember(url) { com.stash.feature.nowplaying.ui.backCoverRequest(context, url) }
+    val lifted = remember(request, description, discogsPage) {
+        com.stash.feature.nowplaying.ui.LiftedPage(url, request, description, discogsPage)
+    }
+    var aspect by remember(url) { mutableStateOf(1f) }
+    // A failed load (archive.org's bad moments) is tried again: a new try redraws the image anew.
+    var attempt by remember(url) { mutableStateOf(1) }
+    var failedAttempt by remember(url) { mutableStateOf(0) }
+    LaunchedEffect(url, failedAttempt) {
+        if (failedAttempt == 0 || failedAttempt >= com.stash.feature.nowplaying.ui.IMAGE_TRIES) return@LaunchedEffect
+        kotlinx.coroutines.delay(com.stash.feature.nowplaying.ui.IMAGE_RETRY_MS * failedAttempt)
+        attempt = failedAttempt + 1
+    }
+    val tile = MaterialTheme.colorScheme.surfaceVariant
+    val tilePainter = remember(tile) { ColorPainter(tile) }
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        com.stash.feature.nowplaying.ui.LiftablePage(
+            zoom = zoom,
+            page = lifted,
+            modifier = Modifier.aspectRatio(aspect.coerceIn(BACK_MIN_ASPECT, BACK_MAX_ASPECT)),
+        ) {
+            ArtGlow()
+            androidx.compose.runtime.key(attempt) {
+                AsyncImage(
+                    model = request,
+                    contentDescription = description,
+                    contentScale = ContentScale.Crop,
+                    placeholder = tilePainter,
+                    error = tilePainter,
+                    onSuccess = { state ->
+                        val size = state.painter.intrinsicSize
+                        if (size.width > 0f && size.height > 0f) aspect = size.width / size.height
+                    },
+                    onError = { failedAttempt = attempt },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(RoundedCornerShape(20.dp)),
+                )
+            }
+        }
+    }
+}
+
+/** A cycled page turned over by hand becomes the front after this: once the turn hides it. */
+private const val CYCLE_RESET_AFTER_MS = 300L
+
+/** The narrowest and widest a back cover is drawn (width over height). */
+private const val BACK_MIN_ASPECT = 0.6f
+private const val BACK_MAX_ASPECT = 1.7f
 
 /** The album art glow's shape (the art's own corners). */
 private val ArtGlowShape = RoundedCornerShape(20.dp)

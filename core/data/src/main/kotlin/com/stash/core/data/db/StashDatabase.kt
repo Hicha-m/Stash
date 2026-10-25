@@ -111,8 +111,9 @@ import com.stash.core.data.db.entity.TrackTagEntity
         com.stash.core.data.db.entity.CloudFolderEntity::class,
         com.stash.core.data.db.entity.CloudItemEntity::class,
         com.stash.core.data.db.entity.CloudUploadEntity::class,
+        com.stash.core.data.db.entity.AlbumBackCoverEntity::class,
     ],
-    version = 62,
+    version = 65,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -137,6 +138,8 @@ abstract class StashDatabase : RoomDatabase() {
     abstract fun artistImageDao(): ArtistImageDao
 
     abstract fun artistGenreDao(): ArtistGenreDao
+
+    abstract fun albumBackCoverDao(): com.stash.core.data.db.dao.AlbumBackCoverDao
 
     abstract fun listeningEventDao(): ListeningEventDao
 
@@ -1693,6 +1696,48 @@ abstract class StashDatabase : RoomDatabase() {
         }
 
         /**
+         * v62 -> v63: Now Playing's back cover flip. One new, empty cache table,
+         * `album_back_covers` (one row per album looked up on the Cover Art Archive). Nothing
+         * existing changes.
+         */
+        val MIGRATION_62_63 = object : Migration(62, 63) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `album_back_covers` (" +
+                        "`album_key` TEXT NOT NULL COLLATE NOCASE, `image_url` TEXT, `release_mbid` TEXT, " +
+                        "`attempted_at` INTEGER NOT NULL, PRIMARY KEY(`album_key`))",
+                )
+            }
+        }
+
+        /**
+         * v63 -> v64: the pages inside an album's cover, beside its back. One nullable column,
+         * `album_back_covers.inside_urls`; a v63 row reads as "inside not looked for yet".
+         */
+        val MIGRATION_63_64 = object : Migration(63, 64) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `album_back_covers` ADD COLUMN `inside_urls` TEXT")
+            }
+        }
+
+        /**
+         * v64 -> v65: Discogs as a second source of backs and inside pages. Two flags,
+         * `album_back_covers.back_from_discogs` and `inside_from_discogs` (0 for every v64 row: all
+         * of it came from the Cover Art Archive), and `discogs_page`, the discogs.com page the
+         * Discogs images come from, which the API terms want linked beside them. A v64 row missing a
+         * back or an inside is made due for a lookup again (attempted at the epoch), so Discogs is
+         * asked for what the archive lacked now, not once the 30-day miss TTL runs out.
+         */
+        val MIGRATION_64_65 = object : Migration(64, 65) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("UPDATE `album_back_covers` SET `attempted_at` = 0 WHERE `image_url` IS NULL OR `inside_urls` = ''")
+                db.execSQL("ALTER TABLE `album_back_covers` ADD COLUMN `back_from_discogs` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `album_back_covers` ADD COLUMN `inside_from_discogs` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `album_back_covers` ADD COLUMN `discogs_page` TEXT")
+            }
+        }
+
+        /**
          * Master's v56 `tidal_match_cache`, for the steps above that heal the All Songs PR's debug
          * databases (they skipped master's 55 -> 56). Must stay identical to [MIGRATION_55_56]'s
          * table; the migration tests validate both against the exported schema.
@@ -1791,6 +1836,9 @@ abstract class StashDatabase : RoomDatabase() {
                 MIGRATION_59_60,
                 MIGRATION_60_61,
                 MIGRATION_61_62,
+                MIGRATION_62_63,
+                MIGRATION_63_64,
+                MIGRATION_64_65,
             )
         }
     }

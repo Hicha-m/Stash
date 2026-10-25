@@ -20,11 +20,16 @@ import com.stash.core.model.SCANNED_UNKNOWN_ARTIST
 import com.stash.core.model.isScannedSong
 import com.stash.core.ui.components.PlaylistInfo
 import com.stash.core.model.Track
+import coil3.SingletonImageLoader
+import com.stash.core.data.backcover.AlbumBackCovers
+import com.stash.core.data.backcover.AlbumCoverArt
+import com.stash.core.data.backcover.BackCoverAlbum
 import com.stash.data.lyrics.LyricsRepository
 import com.stash.data.lyrics.sidecar.LyricsSidecarWriter
 import com.stash.data.lyrics.source.LyricsQuery
 import com.stash.feature.nowplaying.ui.LyricsOutputOffset
 import com.stash.feature.nowplaying.ui.LyricsViewState
+import com.stash.feature.nowplaying.ui.backCoverRequest
 import com.stash.feature.nowplaying.ui.clampOutputOffsetMs
 import com.stash.feature.nowplaying.ui.effectiveLyricsOffsetMs
 import com.stash.feature.nowplaying.ui.lyricsPositionMs
@@ -37,6 +42,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -57,6 +64,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -108,6 +116,10 @@ class NowPlayingViewModel @Inject constructor(
     // The output lyrics are heard through and its own lyrics offset (Bluetooth latency). Hilt
     // binds the routed output; tests leave the default, which knows no output.
     private val lyricsOutputOffsets: LyricsOutputOffsets = LyricsOutputOffsets.None,
+    // The album back covers the art flips to. Hilt binds the Cover Art Archive lookup; tests leave
+    // the default, which knows none.
+    private val backCovers: AlbumBackCovers = AlbumBackCovers.None,
+    private val trackAlbums: com.stash.core.data.lastfm.TrackAlbums = com.stash.core.data.lastfm.TrackAlbums.None,
 ) : ViewModel() {
 
     /**
@@ -158,6 +170,10 @@ class NowPlayingViewModel @Inject constructor(
     val ambientAnimationEnabled: StateFlow<Boolean?> = nowPlayingPreference.ambientAnimationEnabled
         .map<Boolean, Boolean?> { it }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** Settings > Appearance > Cycle album art. */
+    val cycleAlbumArt: StateFlow<Boolean> = nowPlayingPreference.cycleAlbumArt
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     /** Settings > Appearance > Ambient style. */
     val ambientStyle: StateFlow<com.stash.core.data.prefs.AmbientStyle?> = nowPlayingPreference.ambientStyle
@@ -628,6 +644,96 @@ class NowPlayingViewModel @Inject constructor(
         }
     }
 
+    // ── Back cover: a tap on the art turns it over to the album's back, and its pill opens the inside ──
+
+    /**
+     * The playing song's album as the back cover lookup knows it, one emission per album. Waits for
+     * Room's answer, as [lyricsTargets] does: the player's own track comes first without the ISRC
+     * the library row holds, which finds the album more surely than its title.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val backCoverAlbums: Flow<BackCoverAlbum?> = uiState
+        .filter { s -> s.currentTrack == null || s.currentTrackStored != null }
+        .map { s -> s.currentTrack }
+        .distinctUntilChanged { a, b ->
+            a?.id == b?.id && a?.title == b?.title && a?.artist == b?.artist &&
+                a?.album == b?.album && a?.albumArtist == b?.albumArtist && a?.isrc == b?.isrc
+        }
+        // A song with no album of its own (a Last.fm playlist's, a mix's) gets Last.fm's.
+        .mapLatest { track -> track?.let { BackCoverAlbum.of(it) ?: BackCoverAlbum.of(trackAlbums.withAlbum(it)) } }
+        .distinctUntilChanged { old, new -> old?.key == new?.key }
+
+    /**
+     * The playing album's back cover and inside pages (Cover Art Archive scans), or null while
+     * they aren't known. Now Playing loads the back and turns the art over to it on a tap; the
+     * inside opens from the back.
+     */
+    /**
+     * The playing album's key, the art's flip key: from the song's own album, or the one Last.fm
+     * names for a song without one (a stream never stored has no row for it to be filled into).
+     */
+    val backCoverKey: StateFlow<String?> = backCoverAlbums
+        .map { it?.key }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), null)
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val coverArt: StateFlow<AlbumCoverArt?> = backCoverAlbums
+        .flatMapLatest { album -> if (album == null) flowOf(null) else backCovers.observe(album) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), null)
+
+    /**
+     * Looks the playing album's back cover and inside pages up, and fetches the back's image, while
+     * the app is in the foreground, after the lyrics prefetch's [PREFETCH_DWELL_MS]: so the flip is
+     * ready by the time Now Playing opens, a skip through a queue looks nothing up, and nothing runs
+     * with the screen off. Once per album: the answer is stored, the image disk-cached, and a skip
+     * to another album cancels the walk (a cancellation is not a failure, so the album isn't held
+     * back). The back is stored as soon as it is found, before the walk for the inside ends, so its
+     * image is fetched then.
+     */
+    private fun prefetchBackCoverWhileForeground() {
+        viewModelScope.launch {
+            combine(backCoverAlbums, appForeground.foreground) { album, foreground -> album to foreground }
+                .distinctUntilChanged { old, new -> old.first?.key == new.first?.key && old.second == new.second }
+                .collectLatest { (album, foreground) ->
+                    if (!foreground || album == null) return@collectLatest
+                    delay(PREFETCH_DWELL_MS)
+                    coroutineScope {
+                        val fetchBack = launch {
+                            fetchBackImage(backCovers.observe(album).mapNotNull { it?.back }.first())
+                        }
+                        var art = backCovers.resolve(album)
+                        // A failed lookup (a server's bad moment) is tried again while the album
+                        // plays on: past the repository's backoff, a few times.
+                        var retries = 0
+                        while (art == null && retries++ < BACK_COVER_RETRIES) {
+                            delay(com.stash.core.data.backcover.AlbumBackCoverRepository.FAILURE_BACKOFF_MS + 1_000L)
+                            art = backCovers.resolve(album)
+                        }
+                        // The watcher may not have seen a back stored at the walk's very end.
+                        if (fetchBack.isActive) {
+                            fetchBack.cancel()
+                            art?.back?.let(::fetchBackImage)
+                        }
+                        // The next song's album too, so its flip is ready the moment it starts.
+                        lookAhead(album)
+                    }
+                }
+        }
+    }
+
+    /** Looks up the album of the song after the playing one, when it is another album. */
+    private suspend fun lookAhead(current: BackCoverAlbum) {
+        val s = uiState.value
+        val next = s.queue.getOrNull(s.currentIndex + 1) ?: return
+        val album = BackCoverAlbum.of(next) ?: BackCoverAlbum.of(trackAlbums.withAlbum(next)) ?: return
+        if (album.key == current.key) return
+        backCovers.resolve(album)?.back?.let(::fetchBackImage)
+    }
+
+    private fun fetchBackImage(url: String) {
+        SingletonImageLoader.get(appContext).enqueue(backCoverRequest(appContext, url))
+    }
+
     /** The source-chain query for [track]; [trackId] is the row to store under (0 for a stream). */
     private fun lyricsQuery(track: Track, trackId: Long) = LyricsQuery(
         trackId = trackId,
@@ -737,6 +843,7 @@ class NowPlayingViewModel @Inject constructor(
     init {
         observePlayerStateLive()
         prefetchLyricsWhileForeground()
+        prefetchBackCoverWhileForeground()
         observeUserPlaylists()
     }
 
@@ -1650,6 +1757,9 @@ private const val ROW_LAG_GRACE_MS = 400L
  * queue looks nothing up, short enough that lyrics are in hand well before most people open them.
  */
 private const val PREFETCH_DWELL_MS = 1_800L
+
+/** A failed back cover lookup is tried again this many times while its album plays. */
+private const val BACK_COVER_RETRIES = 3
 
 /**
  * The last resort for Now Playing's download ring: a download whose queue row never settles

@@ -14,6 +14,28 @@ interface MusicBrainzClient {
     /** Name search that resolves an MBID (score+type gated) then fetches its
      *  url-rels; null if no confident match. */
     suspend fun searchByName(name: String): JsonObject?
+
+    /** Recordings with this ISRC, each with its releases (release group and media inside); null on
+     *  failure, an empty `recordings` list when MusicBrainz has none. */
+    suspend fun searchRecordingsByIsrc(isrc: String): JsonObject?
+
+    /** Release groups titled [album] by [artist] (Lucene search, scored); null on failure. */
+    suspend fun searchReleaseGroups(artist: String, album: String): JsonObject?
+
+    /**
+     * Releases titled [album] by [artist] (Lucene search, scored), each with its release group; null
+     * on failure. For an edition titled apart from its album ("OK Computer OKNOTOK 1997 2017").
+     */
+    suspend fun searchReleases(artist: String, album: String): JsonObject? = null
+
+    /** A release group's official releases with their media (formats); null on failure. */
+    suspend fun browseReleases(releaseGroupId: String): JsonObject?
+
+    /** A release group with its URL relationships (its Discogs master among them); null on failure. */
+    suspend fun releaseGroupUrlRels(releaseGroupId: String): JsonObject?
+
+    /** A release with its URL relationships (its Discogs release among them); null on failure. */
+    suspend fun releaseUrlRels(releaseId: String): JsonObject?
 }
 
 private val HOST_KIND = linkedMapOf(
