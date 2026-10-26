@@ -22,7 +22,7 @@ import com.stash.core.media.output.StashAudioOutputProvider
 private val flacSafeSelector = MediaCodecSelector { mimeType, secure, tunneling ->
     val all = MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, secure, tunneling)
     if (mimeType == MimeTypes.AUDIO_FLAC) {
-        val safe = all.filterNot { it.name.startsWith("c2.sec.") || it.name.startsWith("OMX.sec.") }
+        val safe = all.filterNot { it.name.startsWith("c2.sec.") || it.name.startsWith("OMX.sec.", ignoreCase = true) }
         if (safe.isNotEmpty()) safe else all
     } else {
         all
