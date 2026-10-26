@@ -127,6 +127,7 @@ import com.stash.feature.nowplaying.sheet.PlayerSheetMath
 import com.stash.feature.nowplaying.sheet.PlayerSheetState
 import com.stash.feature.nowplaying.sheet.PlayerSheetAnchor
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.unit.toSize
@@ -182,6 +183,26 @@ fun NowPlayingScreen(
     // A page (or the front) pinched off the art, held up over the whole screen: put back by a new
     // album, or a new song when there is no album to go by.
     val pageZoom = com.stash.feature.nowplaying.ui.rememberPageZoom(track?.let { BackCoverAlbum.of(it)?.key ?: it.id })
+    // Full art (the top row's toggle): the art across the width and down behind the controls, the
+    // album's pages taking turns as the song plays. It grows out of the square art, so where the
+    // square sits is kept (window coordinates).
+    val fullArtPref by viewModel.fullArt.collectAsStateWithLifecycle()
+    val fullArtZoom by viewModel.fullArtZoom.collectAsStateWithLifecycle()
+    val fullArtPan by viewModel.fullArtPan.collectAsStateWithLifecycle()
+    val fullArtBlend by viewModel.fullArtBlend.collectAsStateWithLifecycle()
+    val titleAlign by viewModel.titleAlign.collectAsStateWithLifecycle()
+    val titleButton by viewModel.titleButton.collectAsStateWithLifecycle()
+    val fullArt = com.stash.feature.nowplaying.ui.rememberFullArtState()
+    var artBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
+    // Read as thresholds, so the grow's frames don't recompose the screen.
+    val fullArtDark by remember { androidx.compose.runtime.derivedStateOf { fullArt.grow.value > 0.5f } }
+    val fullArtCovers by remember { androidx.compose.runtime.derivedStateOf { fullArt.grow.value >= 1f } }
+    // Now Playing settled at the top of the sheet (not mid-drag, not under the queue).
+    val npAtTop by remember(sheet) {
+        androidx.compose.runtime.derivedStateOf {
+            sheet == null || (sheet.settledAnchor == com.stash.feature.nowplaying.sheet.PlayerSheetAnchor.FULL && sheet.progress >= 1f)
+        }
+    }
     // Page index's Discogs page when its image comes from Discogs (0 is the back), for the credit.
     val discogsCredit: (Int) -> String? = remember(coverArt) {
         { index ->
@@ -477,6 +498,40 @@ fun NowPlayingScreen(
     // The album colours come from LocalAlbumChrome (the app-wide palette the mini player wears
     // too), not from the art this screen loads; both covers share one decode (rememberNpArtRequest).
     val artModel: Any? = track?.albumArtPath ?: track?.albumArtUrl
+    // Full art's pages: the front (the square art's own decode), then the back and the pages
+    // inside as far as they're known.
+    val frontRequest = com.stash.feature.nowplaying.ui.rememberNpArtRequest(artModel)
+    val npContext = androidx.compose.ui.platform.LocalContext.current
+    val fullArtPages = remember(artModel, frontRequest, coverArt) {
+        if (artModel == null) {
+            emptyList()
+        } else {
+            buildList {
+                add(com.stash.feature.nowplaying.ui.FullArtPage("front:$artModel", frontRequest, "Album art"))
+                val art = coverArt
+                art?.back?.let { url ->
+                    add(
+                        com.stash.feature.nowplaying.ui.FullArtPage(
+                            "back:$url", com.stash.feature.nowplaying.ui.backCoverRequest(npContext, url), "Back cover",
+                            art.discogsPage?.takeIf { art.backFromDiscogs },
+                        ),
+                    )
+                }
+                art?.inside?.forEachIndexed { i, url ->
+                    add(
+                        com.stash.feature.nowplaying.ui.FullArtPage(
+                            "inside:$url", com.stash.feature.nowplaying.ui.backCoverRequest(npContext, url),
+                            "Inside page ${i + 1} of ${art.inside.size}",
+                            art.discogsPage?.takeIf { art.insideFromDiscogs },
+                        ),
+                    )
+                }
+            }
+        }
+    }
+    val fullArtOn = fullArtPref == true && fullArtPages.isNotEmpty()
+    // The square art's pages and full art's line up (front, back, inside) when the back is known.
+    val pagesLineUp = coverArt?.back != null
     // The holder only (no colour read here): each reader takes its colour where it draws, so the
     // 800 ms crossfade on a song change never recomposes the whole screen.
     val chrome = LocalAlbumChrome.current
@@ -519,8 +574,9 @@ fun NowPlayingScreen(
     // The row's width: the window less Now Playing's 24dp margins. Pins that don't fit at 44dp
     // go to the ⋮ menu for now (narrow phones, large display sizes); see fitTopRow.
     val rowWidthDp = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp - 48f
-    val rowFit = remember(pins, actionCtx, rowWidthDp) {
-        fitTopRow(topRowActions(pins, actionCtx), rowWidthDp)
+    val hasArt = artModel != null
+    val rowFit = remember(pins, actionCtx, rowWidthDp, hasArt) {
+        fitTopRow(topRowActions(pins, actionCtx), rowWidthDp, extraSlots = if (hasArt) 1 else 0)
     }
     val onAction: (NowPlayingAction) -> Unit = remember(radioTuning, radioLabel, togetherState, track, postToCommunity) {
         { action ->
@@ -843,441 +899,503 @@ fun NowPlayingScreen(
         )
     }
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            // In the sheet the card draws the ground (it fades in as the card grows).
-            .then(if (sheet == null) Modifier.background(MaterialTheme.colorScheme.background) else Modifier),
-    ) {
-        // Ambient animated background behind everything — dark canvas, the
-        // light pastel wash, or a dead-black AMOLED ground, following the
-        // resolved app theme. It runs to the screen's bottom edge, under the
-        // system navigation bar (the tab bar slides away under the player).
-        if (ambientAnimationEnabled) SheetAmbient(sheet) { ambientModifier ->
-            when (ambientStyle) {
-                com.stash.core.data.prefs.AmbientStyle.SOFT_GLOW -> AmbientBackground(
-                    lightMode = MaterialTheme.colorScheme.background.luminance() >= 0.5f,
-                    amoledMode = LocalIsAmoledTheme.current,
-                    modifier = ambientModifier,
-                    entranceAnimated = sheet == null,
-                )
-                // Settings > Appearance > Ambient style: the original orbs, in the same album colours.
-                com.stash.core.data.prefs.AmbientStyle.CLASSIC -> com.stash.feature.nowplaying.ui.ClassicAmbientBackground(
-                    lightMode = MaterialTheme.colorScheme.background.luminance() >= 0.5f,
-                    amoledMode = LocalIsAmoledTheme.current,
-                    modifier = ambientModifier,
-                )
+    // The controls go white on full art's dark blend, whatever the theme.
+    com.stash.feature.nowplaying.ui.FullArtTheme(on = fullArtDark) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                // In the sheet the card draws the ground (it fades in as the card grows).
+                .then(if (sheet == null) Modifier.background(MaterialTheme.colorScheme.background) else Modifier),
+        ) {
+            // Ambient animated background behind everything — dark canvas, the
+            // light pastel wash, or a dead-black AMOLED ground, following the
+            // resolved app theme. It runs to the screen's bottom edge, under the
+            // system navigation bar (the tab bar slides away under the player).
+            // (Not under full art once it covers the screen: nothing of it would show.)
+            if (ambientAnimationEnabled && !fullArtCovers) SheetAmbient(sheet) { ambientModifier ->
+                when (ambientStyle) {
+                    com.stash.core.data.prefs.AmbientStyle.SOFT_GLOW -> AmbientBackground(
+                        lightMode = MaterialTheme.colorScheme.background.luminance() >= 0.5f,
+                        amoledMode = LocalIsAmoledTheme.current,
+                        modifier = ambientModifier,
+                        entranceAnimated = sheet == null,
+                    )
+                    // Settings > Appearance > Ambient style: the original orbs, in the same album colours.
+                    com.stash.core.data.prefs.AmbientStyle.CLASSIC -> com.stash.feature.nowplaying.ui.ClassicAmbientBackground(
+                        lightMode = MaterialTheme.colorScheme.background.luminance() >= 0.5f,
+                        amoledMode = LocalIsAmoledTheme.current,
+                        modifier = ambientModifier,
+                    )
+                }
             }
-        }
 
-        // The raw navigation-bar inset (never consumed by the scaffold here), so the
-        // controls sit above the gesture handle or the 3-button bar and do not move
-        // while the screen slides away.
-        val navBarInset = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+            // Full art, behind the controls; it grows out of the square art and back into it.
+            com.stash.feature.nowplaying.ui.FullArtLayer(
+                state = fullArt,
+                active = fullArtOn,
+                visible = npAtTop,
+                // Lyrics read over the blend: the art fades while the cover flies to the header.
+                artShown = !reading,
+                running = npInSight,
+                pages = fullArtPages,
+                startPage = if (cycleAlbumArt && pagesLineUp) cycleIndex else 0,
+                trackKey = track?.let { it.id to uiState.currentIndex },
+                positionMs = { playerPosition.value },
+                durationMs = uiState.durationMs,
+                isPlaying = uiState.playWhenReady || uiState.isPlaying,
+                origin = { artBounds },
+                originCornerPx = PlayerSheetMath.HERO_ART_CORNER_DP * screenDensity,
+                // The square art follows, so turning full art off lands on the same page.
+                onPage = { if (pagesLineUp) cycleIndex = it },
+                zoom = fullArtZoom,
+                panDpPerS = fullArtPan.dpPerSecond,
+                solidBlend = fullArtBlend == com.stash.core.data.prefs.FullArtBlend.SOLID,
+            )
 
-        // -- Progress + transport: one piece, shared by both modes. In lyrics mode it glides
-        // from under the title to the bottom edge (a shared element, see ModeBounds). --
-        val foot: @Composable (Modifier) -> Unit = { footModifier ->
-            Column(modifier = footModifier.fillMaxWidth()) {
-                // -- Progress bar --
-                GlowingProgressBar(
-                    progress = { progressFraction(playerPosition.value, uiState.durationMs) },
-                    accentColor = { chrome.accent },
-                    elapsedMs = { playerPosition.value },
-                    totalMs = uiState.durationMs,
-                    onSeek = viewModel::onSeekTo,
-                    seekable = !isListener,
-                    modifier = Modifier.fillMaxWidth(),
-                    center = {
-                        if (isListener) {
-                            com.stash.feature.nowplaying.listen.LivePill(
-                                pausedLocally = room.pausedLocally,
-                                accent = chrome.accent,
-                                ink = npInk(),
-                                onRejoin = together::rejoin,
-                            )
-                        }
-                    },
-                )
+            // The raw navigation-bar inset (never consumed by the scaffold here), so the
+            // controls sit above the gesture handle or the 3-button bar and do not move
+            // while the screen slides away.
+            val navBarInset = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
-                Spacer(modifier = Modifier.height(StackRhythm.ProgressToControls))
-
-                // -- Playback controls -- the same row for host and listener, so a role change
-                // doesn't move anything; a listener's skip slots are simply empty.
-                PlaybackControls(
-                    // The player's intent, not isPlaying (false while buffering): the button shows
-                    // Pause, and pauses, while a stream stalls. A paused buffer shows Play, not a spinner.
-                    isPlaying = uiState.playWhenReady || uiState.isPlaying,
-                    isBuffering = uiState.isBuffering && (uiState.playWhenReady || uiState.isPlaying),
-                    shuffleEnabled = uiState.shuffleEnabled,
-                    repeatMode = uiState.repeatMode,
-                    onPlayPauseClick = viewModel::onPlayPauseClick,
-                    onSkipNext = viewModel::onSkipNext,
-                    onSkipPrevious = viewModel::onSkipPrevious,
-                    onToggleShuffle = viewModel::onToggleShuffle,
-                    onCycleRepeatMode = viewModel::onCycleRepeatMode,
-                    // In a session: shuffle and repeat do nothing there, so React takes their place.
-                    onReact = if (room != null) together::react else null,
-                    canSkip = !isListener,
-                )
-            }
-        }
-
-        Column(modifier = Modifier.fillMaxSize().padding(bottom = navBarInset)) {
-            // -- Top row: dismiss, then cast, the pinned actions, ⋮ and (pinned) queue. It stays
-            // put while the art and the lyrics swap beneath it. --
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .then(controlsLayer)
-                    .statusBarsPadding()
-                    .padding(horizontal = 24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                WithAlbumChrome { topChrome ->
-                    NowPlayingTopBar(
-                        fit = rowFit,
-                        visualState = visualState,
-                        hasTrack = uiState.hasTrack,
-                        isDownloading = isDownloadingCurrent,
-                        radioLock = radioLock,
-                        ink = npInk(),
-                        accent = topChrome.accent,
-                        // In lyrics mode Dismiss goes back to the art, like back and the cover.
-                        dismissDescription = if (reading) "Back to the cover" else "Dismiss",
-                        onDismiss = if (reading) viewModel::onDismissLyrics else onDismiss,
-                        onMoreClick = { showOptionsSheet = true },
-                        onAction = onPinnedAction,
-                        dismissModifier = Modifier.focusRequester(dismissFocus),
-                        castButton = {
-                            com.stash.feature.nowplaying.cast.CastButton(
-                                connection = castConnection,
-                                tint = npInk(),
-                                accentColor = topChrome.accent,
-                                onClick = { showCastSheet = true },
-                            )
+            // -- Progress + transport: one piece, shared by both modes. In lyrics mode it glides
+            // from under the title to the bottom edge (a shared element, see ModeBounds). --
+            val foot: @Composable (Modifier) -> Unit = { footModifier ->
+                Column(modifier = footModifier.fillMaxWidth()) {
+                    // -- Progress bar --
+                    GlowingProgressBar(
+                        progress = { progressFraction(playerPosition.value, uiState.durationMs) },
+                        accentColor = { chrome.accent },
+                        elapsedMs = { playerPosition.value },
+                        totalMs = uiState.durationMs,
+                        onSeek = viewModel::onSeekTo,
+                        seekable = !isListener,
+                        modifier = Modifier.fillMaxWidth(),
+                        center = {
+                            if (isListener) {
+                                com.stash.feature.nowplaying.listen.LivePill(
+                                    pausedLocally = room.pausedLocally,
+                                    accent = chrome.accent,
+                                    ink = npInk(),
+                                    onRejoin = together::rejoin,
+                                )
+                            }
                         },
                     )
-                }
-                if (room != null) {
-                    com.stash.feature.nowplaying.listen.SessionBar(
-                        room = room,
-                        onClick = { showSession = true },
-                        modifier = Modifier.padding(top = 4.dp),
+
+                    Spacer(modifier = Modifier.height(StackRhythm.ProgressToControls))
+
+                    // -- Playback controls -- the same row for host and listener, so a role change
+                    // doesn't move anything; a listener's skip slots are simply empty.
+                    PlaybackControls(
+                        // The player's intent, not isPlaying (false while buffering): the button shows
+                        // Pause, and pauses, while a stream stalls. A paused buffer shows Play, not a spinner.
+                        isPlaying = uiState.playWhenReady || uiState.isPlaying,
+                        isBuffering = uiState.isBuffering && (uiState.playWhenReady || uiState.isPlaying),
+                        shuffleEnabled = uiState.shuffleEnabled,
+                        repeatMode = uiState.repeatMode,
+                        onPlayPauseClick = viewModel::onPlayPauseClick,
+                        onSkipNext = viewModel::onSkipNext,
+                        onSkipPrevious = viewModel::onSkipPrevious,
+                        onToggleShuffle = viewModel::onToggleShuffle,
+                        onCycleRepeatMode = viewModel::onCycleRepeatMode,
+                        // In a session: shuffle and repeat do nothing there, so React takes their place.
+                        onReact = if (room != null) together::react else null,
+                        canSkip = !isListener,
                     )
                 }
             }
 
-            // The art view and the lyrics view swap here. The cover shrinks from the big art
-            // into the header (and grows back), the progress + transport glide between their
-            // two homes, and the rest crossfades, the lyrics side rising 8dp in a short stagger.
-            SharedTransitionLayout(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                AnimatedContent(
-                    targetState = reading,
-                    transitionSpec = {
-                        fadeIn(tween(MODE_FADE_IN_MS, delayMillis = MODE_FADE_IN_DELAY_MS))
-                            .togetherWith(fadeOut(tween(MODE_FADE_OUT_MS)))
-                            .using(SizeTransform(clip = false))
-                    },
-                    label = "np-mode",
-                ) { showLyrics ->
-                    val artShared = Modifier.sharedElement(
-                        sharedContentState = rememberSharedContentState(ART_SHARED_KEY),
-                        animatedVisibilityScope = this@AnimatedContent,
-                        boundsTransform = ModeBounds,
-                    )
-                    val footShared = Modifier.sharedElement(
-                        sharedContentState = rememberSharedContentState(FOOT_SHARED_KEY),
-                        animatedVisibilityScope = this@AnimatedContent,
-                        boundsTransform = ModeBounds,
-                    )
-                    if (!showLyrics) {
-                        Column(modifier = Modifier.fillMaxSize()) {
-                            // #333 v2 — the slot system. No estimated heights, no thresholds:
-                            // the title/progress/controls stack is FIXED and anchors to the
-                            // bottom of the column (directly above the lyrics bar when it's
-                            // present), while the album art lives in a weight(1f) slot that
-                            // absorbs exactly whatever height this phone/scale/bar
-                            // combination leaves over. The art sizes to its slot (capped by
-                            // width and the 375dp design ceiling) and centers in it, so any
-                            // slack splits evenly around the art instead of pooling anywhere.
-                            // Every phone renders the same anatomy, scaled — nothing clips,
-                            // nothing crowds, nothing pools.
-                            NowPlayingBody(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .weight(1f)
-                                    .padding(horizontal = 24.dp),
-                                stackModifier = controlsLayer,
-                                art = {
-                                // -- Album art: NowPlayingBody sizes this slot (a square) --
-                                Box(
+            Column(modifier = Modifier.fillMaxSize().padding(bottom = navBarInset)) {
+                // -- Top row: dismiss, then cast, the pinned actions, ⋮ and (pinned) queue. It stays
+                // put while the art and the lyrics swap beneath it. --
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(controlsLayer)
+                        .statusBarsPadding()
+                        .padding(horizontal = 24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    WithAlbumChrome { topChrome ->
+                        NowPlayingTopBar(
+                            fit = rowFit,
+                            visualState = visualState,
+                            hasTrack = uiState.hasTrack,
+                            isDownloading = isDownloadingCurrent,
+                            radioLock = radioLock,
+                            ink = npInk(),
+                            accent = topChrome.accent,
+                            // In lyrics mode Dismiss goes back to the art, like back and the cover.
+                            dismissDescription = if (reading) "Back to the cover" else "Dismiss",
+                            onDismiss = if (reading) viewModel::onDismissLyrics else onDismiss,
+                            onMoreClick = { showOptionsSheet = true },
+                            onAction = onPinnedAction,
+                            dismissModifier = Modifier.focusRequester(dismissFocus),
+                            castButton = {
+                                com.stash.feature.nowplaying.cast.CastButton(
+                                    connection = castConnection,
+                                    tint = npInk(),
+                                    accentColor = topChrome.accent,
+                                    onClick = { showCastSheet = true },
+                                )
+                            },
+                            fullArt = if (hasArt) fullArtOn else null,
+                            onToggleFullArt = viewModel::onToggleFullArt,
+                        )
+                    }
+                    if (room != null) {
+                        com.stash.feature.nowplaying.listen.SessionBar(
+                            room = room,
+                            onClick = { showSession = true },
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                }
+
+                // The art view and the lyrics view swap here. The cover shrinks from the big art
+                // into the header (and grows back), the progress + transport glide between their
+                // two homes, and the rest crossfades, the lyrics side rising 8dp in a short stagger.
+                SharedTransitionLayout(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                    AnimatedContent(
+                        targetState = reading,
+                        transitionSpec = {
+                            fadeIn(tween(MODE_FADE_IN_MS, delayMillis = MODE_FADE_IN_DELAY_MS))
+                                .togetherWith(fadeOut(tween(MODE_FADE_OUT_MS)))
+                                .using(SizeTransform(clip = false))
+                        },
+                        label = "np-mode",
+                    ) { showLyrics ->
+                        val artShared = Modifier.sharedElement(
+                            sharedContentState = rememberSharedContentState(ART_SHARED_KEY),
+                            animatedVisibilityScope = this@AnimatedContent,
+                            boundsTransform = ModeBounds,
+                        )
+                        val footShared = Modifier.sharedElement(
+                            sharedContentState = rememberSharedContentState(FOOT_SHARED_KEY),
+                            animatedVisibilityScope = this@AnimatedContent,
+                            boundsTransform = ModeBounds,
+                        )
+                        if (!showLyrics) {
+                            Column(modifier = Modifier.fillMaxSize()) {
+                                // #333 v2 — the slot system. No estimated heights, no thresholds:
+                                // the title/progress/controls stack is FIXED and anchors to the
+                                // bottom of the column (directly above the lyrics bar when it's
+                                // present), while the album art lives in a weight(1f) slot that
+                                // absorbs exactly whatever height this phone/scale/bar
+                                // combination leaves over. The art sizes to its slot (capped by
+                                // width and the 375dp design ceiling) and centers in it, so any
+                                // slack splits evenly around the art instead of pooling anywhere.
+                                // Every phone renders the same anatomy, scaled — nothing clips,
+                                // nothing crowds, nothing pools.
+                                NowPlayingBody(
                                     modifier = Modifier
-                                        .fillMaxSize()
-                                        .then(heroLayer(isCurrentMode = !reading, cornerDp = PlayerSheetMath.HERO_ART_CORNER_DP)),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    // Swipe for the next / previous song, double-tap a side to seek
-                                    // 10 s: through the same ViewModel calls as the transport and the
-                                    // progress bar, and off for a listener, as those are. A tap turns
-                                    // the cover over when the album's back is known.
-                                    SwipeableArt(
-                                        trackKey = track?.let { it.id to uiState.currentIndex },
-                                        gesturesEnabled = track != null && !isListener,
-                                        canNext = canSwipeNext,
-                                        canPrevious = canSwipePrevious,
-                                        canSeek = uiState.durationMs > 0L,
-                                        positionMs = { playerPosition.value },
-                                        durationMs = uiState.durationMs,
-                                        onNext = viewModel::onSkipNext,
-                                        onPrevious = viewModel::onSwipePrevious,
-                                        onSeekTo = viewModel::onSeekTo,
-                                        flipKey = backCoverKey,
-                                        back = backFace,
-                                        modifier = artShared,
-                                        onShowBackChange = { up ->
-                                            if (up && !backUp) packageStart = (cycleIndex - 1).coerceAtLeast(0)
-                                            backUp = up
-                                        },
-                                    ) { faceModifier ->
-                                        // Turned over by hand: once the front is out of sight (past
-                                        // the turn's middle), it is the front again, unfaded.
-                                        LaunchedEffect(backUp) {
-                                            if (backUp && cycleIndex != 0) {
-                                                kotlinx.coroutines.delay(CYCLE_RESET_AFTER_MS)
-                                                cycleIndex = 0
-                                                cycleSnap++
+                                        .fillMaxWidth()
+                                        .weight(1f)
+                                        .padding(horizontal = 24.dp),
+                                    stackModifier = controlsLayer,
+                                    art = {
+                                    // -- Album art: NowPlayingBody sizes this slot (a square) --
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .onGloballyPositioned { if (!reading && it.isAttached) artBounds = it.boundsInWindow() }
+                                            .then(heroLayer(isCurrentMode = !reading, cornerDp = PlayerSheetMath.HERO_ART_CORNER_DP))
+                                            // Full art draws the art while it's out (it grew from here).
+                                            .graphicsLayer { alpha = if (fullArt.grow.value > 0f && fullArt.ready) 0f else 1f },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        // Swipe for the next / previous song, double-tap a side to seek
+                                        // 10 s: through the same ViewModel calls as the transport and the
+                                        // progress bar, and off for a listener, as those are. A tap turns
+                                        // the cover over when the album's back is known.
+                                        SwipeableArt(
+                                            trackKey = track?.let { it.id to uiState.currentIndex },
+                                            gesturesEnabled = track != null && !isListener,
+                                            canNext = canSwipeNext,
+                                            canPrevious = canSwipePrevious,
+                                            canSeek = uiState.durationMs > 0L,
+                                            positionMs = { playerPosition.value },
+                                            durationMs = uiState.durationMs,
+                                            onNext = viewModel::onSkipNext,
+                                            onPrevious = viewModel::onSwipePrevious,
+                                            onSeekTo = viewModel::onSeekTo,
+                                            flipKey = backCoverKey,
+                                            back = backFace,
+                                            modifier = artShared,
+                                            onShowBackChange = { up ->
+                                                if (up && !backUp) packageStart = (cycleIndex - 1).coerceAtLeast(0)
+                                                // Turned back by hand: the front comes up as the front,
+                                                // unfaded, whatever page the cycle had shown. Set here,
+                                                // not in the front face, which isn't composed while the
+                                                // back is up.
+                                                if (!up && backUp) {
+                                                    cycleIndex = 0
+                                                    cycleSnap++
+                                                }
+                                                backUp = up
+                                            },
+                                        ) { faceModifier ->
+                                            val front: @Composable (Modifier) -> Unit = { m ->
+                                                AlbumArtSection(
+                                                    albumArtUrl = track?.albumArtUrl,
+                                                    albumArtPath = track?.albumArtPath,
+                                                    zoom = pageZoom,
+                                                    modifier = m,
+                                                )
                                             }
-                                        }
-                                        val front: @Composable (Modifier) -> Unit = { m ->
-                                            AlbumArtSection(
-                                                albumArtUrl = track?.albumArtUrl,
-                                                albumArtPath = track?.albumArtPath,
-                                                zoom = pageZoom,
-                                                modifier = m,
-                                            )
-                                        }
-                                        val loaded = backCover
-                                        if (cycleAlbumArt && loaded != null) androidx.compose.runtime.key(backCoverKey) {
-                                            // Keyed by album: a page still fading out is never drawn
-                                            // from the next album's list.
-                                            val context = androidx.compose.ui.platform.LocalContext.current
-                                            com.stash.feature.nowplaying.ui.CyclingArt(
-                                                pageCount = 1 + insidePages.size,
-                                                index = cycleIndex,
-                                                onIndexChange = { cycleIndex = it },
-                                                running = npInSight && !backUp && pageZoom.page == null,
-                                                snapKey = cycleSnap,
-                                                load = { n ->
-                                                    n == 1 || insidePages.getOrNull(n - 2)
-                                                        ?.let { com.stash.feature.nowplaying.ui.loadPageImage(context, it) } == true
-                                                },
-                                                modifier = faceModifier,
-                                            ) { n ->
-                                                when (n) {
-                                                    0 -> front(Modifier)
-                                                    1 -> AlbumBackSection(loaded, pageZoom, discogsCredit(0))
-                                                    else -> insidePages.getOrNull(n - 2)?.let { url ->
-                                                        InsidePageSection(
-                                                            url = url,
-                                                            description = "Inside page ${n - 1} of ${insidePages.size}",
-                                                            zoom = pageZoom,
-                                                            discogsPage = discogsCredit(n - 1),
-                                                        )
+                                            val loaded = backCover
+                                            if (cycleAlbumArt && loaded != null) androidx.compose.runtime.key(backCoverKey) {
+                                                // Keyed by album: a page still fading out is never drawn
+                                                // from the next album's list.
+                                                val context = androidx.compose.ui.platform.LocalContext.current
+                                                com.stash.feature.nowplaying.ui.CyclingArt(
+                                                    pageCount = 1 + insidePages.size,
+                                                    index = cycleIndex,
+                                                    onIndexChange = { cycleIndex = it },
+                                                    running = npInSight && !backUp && pageZoom.page == null && !(fullArtOn && !reading),
+                                                    snapKey = cycleSnap,
+                                                    load = { n ->
+                                                        n == 1 || insidePages.getOrNull(n - 2)
+                                                            ?.let { com.stash.feature.nowplaying.ui.loadPageImage(context, it) } == true
+                                                    },
+                                                    modifier = faceModifier,
+                                                ) { n ->
+                                                    when (n) {
+                                                        0 -> front(Modifier)
+                                                        1 -> AlbumBackSection(loaded, pageZoom, discogsCredit(0))
+                                                        else -> insidePages.getOrNull(n - 2)?.let { url ->
+                                                            InsidePageSection(
+                                                                url = url,
+                                                                description = "Inside page ${n - 1} of ${insidePages.size}",
+                                                                zoom = pageZoom,
+                                                                discogsPage = discogsCredit(n - 1),
+                                                            )
+                                                        }
                                                     }
                                                 }
+                                            } else {
+                                                front(faceModifier)
                                             }
-                                        } else {
-                                            front(faceModifier)
+                                        }
+                                        // Full art: a swipe across the art turns its page; the square's own
+                                        // gestures (skip, seek, turn over) wait under it.
+                                        if (fullArtOn && !reading) com.stash.feature.nowplaying.ui.FullArtSwipe(fullArt)
+                                        if (room != null) {
+                                            // "Maya joined", "Rawn skipped": over the art, so the layout never shifts.
+                                            com.stash.feature.nowplaying.listen.SessionEventChip(together.events, room.myId, Modifier.align(Alignment.TopCenter))
                                         }
                                     }
-                                    if (room != null) {
-                                        // "Maya joined", "Rawn skipped": over the art, so the layout never shifts.
-                                        com.stash.feature.nowplaying.listen.SessionEventChip(together.events, room.myId, Modifier.align(Alignment.TopCenter))
+                                    },
+                                    stack = {
+                                    // -- Track info -- (tap the title/artist to open the artist
+                                    // profile; the trailing chevron signals it's actionable, and
+                                    // swaps to a spinner while the artist name is being resolved).
+                                    // The like heart floats at the right edge (relocated out of the
+                                    // crowded top icon row); symmetric horizontal padding keeps the
+                                    // title/artist block optically centred under the album art.
+                                    // Settings > Appearance > Button beside the title: the sleep timer,
+                                    // nothing, or one of the actions (none while it can't be used here).
+                                    val titleAction = titleButton.action?.takeIf { isActionAvailable(it, actionCtx) }
+                                    TrackInfoBlock(
+                                        track = track,
+                                        resolvingArtist = resolvingArtist,
+                                        onTrackInfoTapped = viewModel::onTrackInfoTapped,
+                                        isLiked = uiState.currentTrack?.stashLikedAt != null,
+                                        onLikeTap = viewModel::onLikeTap,
+                                        alignStart = titleAlign == com.stash.core.data.prefs.NpTitleAlign.START,
+                                        sideButton = when {
+                                            titleButton == com.stash.core.data.prefs.TitleButton.SLEEP_TIMER -> { m ->
+                                                // The album accent is read in its own scope: the crossfade
+                                                // recomposes the button, not the title.
+                                                WithAlbumChrome { chrome ->
+                                                    SleepTimerButton(
+                                                        state = sleepTimerState,
+                                                        onClick = { showSleepTimerSheet = true },
+                                                        activeTint = chrome.accent,
+                                                        idleTint = npInk().copy(alpha = 0.7f),
+                                                        buttonSize = 26.dp,
+                                                        iconSize = 20.dp,
+                                                        modifier = m,
+                                                    )
+                                                }
+                                            }
+                                            titleAction != null -> { m ->
+                                                TitleActionButton(titleAction, visualState, onPinnedAction, m)
+                                            }
+                                            else -> null
+                                        },
+                                    )
+
+                                    // Quality line — codec + bit-depth/sample-rate + bitrate, when known.
+                                    // Sized smaller than the artist/album line; degrades gracefully when
+                                    // some fields are missing (returns a partial line, not nothing).
+                                    // When the active MediaItem is sourced from an http(s) URI (Kennyy
+                                    // stream rather than a local file), a small wifi glyph prefixes
+                                    // the line so the user knows playback is using their connection.
+                                    if (track != null) {
+                                        val qualityText = trackQualityText(track)
+                                        if (qualityText != null) {
+                                            Spacer(modifier = Modifier.height(StackRhythm.ArtistToQuality))
+                                            // The live verdict ("Bit-perfect", "Hi-Res") rides on the end;
+                                            // tapping opens the full signal path, the only place that
+                                            // says when Android resampled the song.
+                                            val badge = signalVerdict?.let { with(com.stash.feature.nowplaying.ui.SignalPathBadge) { it.badge() } }
+                                            QualityLine(
+                                                qualityText = if (badge != null) "$qualityText \u00B7 $badge" else qualityText,
+                                                isStreaming = uiState.isStreaming,
+                                                onClick = { showSignalPath = true },
+                                            )
+                                        }
                                     }
-                                }
-                                },
-                                stack = {
-                                // -- Track info -- (tap the title/artist to open the artist
-                                // profile; the trailing chevron signals it's actionable, and
-                                // swaps to a spinner while the artist name is being resolved).
-                                // The like heart floats at the right edge (relocated out of the
-                                // crowded top icon row); symmetric horizontal padding keeps the
-                                // title/artist block optically centred under the album art.
-                                TrackInfoBlock(
-                                    track = track,
-                                    resolvingArtist = resolvingArtist,
-                                    onTrackInfoTapped = viewModel::onTrackInfoTapped,
-                                    sleepTimerState = sleepTimerState,
-                                    onSleepTimerClick = { showSleepTimerSheet = true },
-                                    isLiked = uiState.currentTrack?.stashLikedAt != null,
-                                    onLikeTap = viewModel::onLikeTap,
+
+                                    if (room != null) com.stash.feature.nowplaying.listen.PickLine(room)
+
+                                    Spacer(modifier = Modifier.height(StackRhythm.InfoToProgress))
+
+                                    foot(footShared)
+
+                                    // "Up next · Title — Artist": a tap opens the queue, or the session
+                                    // in a room (whose Up next is the room's). Art view only: lyrics
+                                    // mode keeps the bottom for the lyrics.
+                                    Spacer(modifier = Modifier.height(StackRhythm.ControlsToUpNext))
+                                    UpNextLine(
+                                        peek = if (room != null) {
+                                            roomUpNextPeek(room.queue)
+                                        } else {
+                                            upNextPeek(uiState.queue, uiState.currentIndex, uiState.repeatMode)
+                                        },
+                                        inRoom = room != null,
+                                        onOpen = { if (room != null) showSession = true else showQueue = true },
+                                    )
+                                    },
                                 )
 
-                                // Quality line — codec + bit-depth/sample-rate + bitrate, when known.
-                                // Sized smaller than the artist/album line; degrades gracefully when
-                                // some fields are missing (returns a partial line, not nothing).
-                                // When the active MediaItem is sourced from an http(s) URI (Kennyy
-                                // stream rather than a local file), a small wifi glyph prefixes
-                                // the line so the user knows playback is using their connection.
-                                if (track != null) {
-                                    val qualityText = trackQualityText(track)
-                                    if (qualityText != null) {
-                                        Spacer(modifier = Modifier.height(StackRhythm.ArtistToQuality))
-                                        // The live verdict ("Bit-perfect", "Hi-Res") rides on the end;
-                                        // tapping opens the full signal path, the only place that
-                                        // says when Android resampled the song.
-                                        val badge = signalVerdict?.let { with(com.stash.feature.nowplaying.ui.SignalPathBadge) { it.badge() } }
-                                        QualityLine(
-                                            qualityText = if (badge != null) "$qualityText \u00B7 $badge" else qualityText,
-                                            isStreaming = uiState.isStreaming,
-                                            onClick = { showSignalPath = true },
+                                // Live-lyrics bar — sits exactly where the MiniPlayer is on other
+                                // screens (the scaffold hides MiniPlayer on this route), directly
+                                // above the nav bar. Zero-height when Hidden, so the content
+                                // column keeps the full screen for lyric-less tracks.
+                                WithAlbumChrome { barChrome ->
+                                    LiveLyricsBar(
+                                        state = lyricsState,
+                                        currentPositionMs = { lyricsPosition.value },
+                                        // Over full art's dark blend the album's ink is used only when
+                                        // it's light enough to read there; white otherwise.
+                                        accentColor = barChrome.ink.let { ink ->
+                                            if (fullArtDark && ink.luminance() < 0.5f) androidx.compose.ui.graphics.Color.White else ink
+                                        },
+                                        liveEnabled = liveLyricsEnabled,
+                                        onTap = viewModel::onShowLyrics,
+                                        modifier = controlsLayer,
+                                        isPlaying = uiState.isPlaying && !uiState.isBuffering,
+                                        playbackSpeed = playbackSpeed,
+                                        transparent = fullArtDark,
+                                    )
+                                }
+                            }
+                        } else {
+                            // -- Lyrics mode: the web's phone layout. A compact header, the lyrics
+                            // filling the middle, progress + transport at the bottom. --
+                            Column(modifier = Modifier.fillMaxSize()) {
+                                val displayArtist = remember(track) { track?.artist?.primaryArtist().orEmpty() }
+                                // The header reads only these settled values (not uiState itself), and
+                                // its enter/exit modifiers are remembered, so the 250ms position tick
+                                // that recomposes this screen skips the header and its marquees.
+                                val headerInk = npInk()
+                                val headerLiked = uiState.currentTrack?.stashLikedAt != null
+                                val lyricsMenuItems = lyricsMenuItemsFor(
+                                        lyricsState,
+                                        lyricsSyncOffsetMs,
+                                        canSaveToFile = track?.isDownloaded == true,
+                                        outputKnown = lyricsOutputOffset != null,
+                                        canGetWordSynced = uiState.currentTrackStored == true && appleLyricsEnabled,
+                                    )
+                                val savingLyrics = exportingLyricsTrackId != null
+                                val rise = with(LocalDensity.current) { RiseDistance.roundToPx() }
+                                val headerTextEnter = remember(this@AnimatedContent, rise) {
+                                    Modifier.animateEnterExit(enter = riseIn(rise, RISE_STAGGER_MS), exit = fadeOut(tween(MODE_FADE_OUT_MS)))
+                                }
+                                val headerActionsEnter = remember(this@AnimatedContent, rise) {
+                                    Modifier.animateEnterExit(enter = riseIn(rise, RISE_STAGGER_MS * 2), exit = fadeOut(tween(MODE_FADE_OUT_MS)))
+                                }
+                                val paneEnter = remember(this@AnimatedContent, rise) {
+                                    Modifier.animateEnterExit(enter = riseIn(rise, RISE_STAGGER_MS * 3), exit = fadeOut(tween(MODE_FADE_OUT_MS)))
+                                }
+                                LyricsModeHeader(
+                                    cover = {
+                                        CompactCover(
+                                            artModel = artModel,
+                                            onClick = { viewModel.onDismissLyrics() },
+                                            modifier = artShared.then(heroLayer(isCurrentMode = reading, cornerDp = CompactCoverCornerDp)),
+                                        )
+                                    },
+                                    title = track?.title.orEmpty(),
+                                    artist = displayArtist,
+                                    ink = headerInk,
+                                    modifier = Modifier.padding(start = 24.dp, end = 12.dp, top = 8.dp),
+                                    textModifier = headerTextEnter.then(controlsLayer),
+                                    actionsModifier = headerActionsEnter.then(controlsLayer),
+                                ) {
+                                    // The sleep timer, as on the art view (and in the web's header);
+                                    // accented, with its live countdown under the moon, while armed.
+                                    SleepTimerButton(
+                                        state = sleepTimerState,
+                                        onClick = { showSleepTimerSheet = true },
+                                        activeTint = chrome.accent,
+                                        idleTint = headerInk.copy(alpha = 0.7f),
+                                        buttonSize = 48.dp,
+                                        iconSize = 22.dp,
+                                    )
+                                    // An All Songs file can't be liked (no library row): no heart.
+                                    if (uiState.currentTrack?.isScannedSong != true) {
+                                        com.stash.core.ui.components.LikeButton(
+                                            isLiked = headerLiked,
+                                            onTap = { viewModel.onLikeTap() },
+                                            unlikedTint = headerInk.copy(alpha = 0.7f),
+                                            size = 26.dp,
                                         )
                                     }
+                                    LyricsMenuButton(
+                                        items = lyricsMenuItems,
+                                        liveEnabled = liveLyricsEnabled,
+                                        onLiveToggle = { viewModel.setLiveLyricsBarEnabled(it) },
+                                        offsetMs = lyricsSyncOffsetMs,
+                                        onOffsetChange = { viewModel.setLyricsSyncOffsetMs(it) },
+                                        outputOffset = lyricsOutputOffset,
+                                        onOutputOffsetChange = { viewModel.setLyricsOutputOffsetMs(it) },
+                                        savingToFile = savingLyrics,
+                                        onSaveToFile = { viewModel.exportLyricsForCurrentTrack() },
+                                        gettingWordSynced = upgradingLyricsTrackId != null,           // new
+                                        onGetWordSynced = { viewModel.getWordSyncedLyricsForCurrentTrack() }, // new
+                                        ink = headerInk,
+                                    )
                                 }
-
-                                if (room != null) com.stash.feature.nowplaying.listen.PickLine(room)
-
-                                Spacer(modifier = Modifier.height(StackRhythm.InfoToProgress))
-
-                                foot(footShared)
-
-                                // "Up next · Title — Artist": a tap opens the queue, or the session
-                                // in a room (whose Up next is the room's). Art view only: lyrics
-                                // mode keeps the bottom for the lyrics.
-                                Spacer(modifier = Modifier.height(StackRhythm.ControlsToUpNext))
-                                UpNextLine(
-                                    peek = if (room != null) {
-                                        roomUpNextPeek(room.queue)
-                                    } else {
-                                        upNextPeek(uiState.queue, uiState.currentIndex, uiState.repeatMode)
-                                    },
-                                    inRoom = room != null,
-                                    onOpen = { if (room != null) showSession = true else showQueue = true },
-                                )
-                                },
-                            )
-
-                            // Live-lyrics bar — sits exactly where the MiniPlayer is on other
-                            // screens (the scaffold hides MiniPlayer on this route), directly
-                            // above the nav bar. Zero-height when Hidden, so the content
-                            // column keeps the full screen for lyric-less tracks.
-                            WithAlbumChrome { barChrome ->
-                                LiveLyricsBar(
+                                LyricsPane(
                                     state = lyricsState,
                                     currentPositionMs = { lyricsPosition.value },
-                                    accentColor = barChrome.ink,
-                                    liveEnabled = liveLyricsEnabled,
-                                    onTap = viewModel::onShowLyrics,
-                                    modifier = controlsLayer,
                                     isPlaying = uiState.isPlaying && !uiState.isBuffering,
                                     playbackSpeed = playbackSpeed,
+                                    onSeek = { if (!isListener) viewModel.onLyricsLineSeek(it) }, // a listener follows the room
+                                    onRetry = viewModel::onLyricsRetry,
+                                    ink = npInk(),
+                                    accent = { chrome.ink },
+                                    light = npIsLight(),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .weight(1f)
+                                        .padding(top = 4.dp)
+                                        .then(paneEnter)
+                                        .then(controlsLayer),
                                 )
+                                foot(Modifier.then(controlsLayer).padding(horizontal = 24.dp).then(footShared))
+                                Spacer(modifier = Modifier.height(LyricsFootBottom))
                             }
-                        }
-                    } else {
-                        // -- Lyrics mode: the web's phone layout. A compact header, the lyrics
-                        // filling the middle, progress + transport at the bottom. --
-                        Column(modifier = Modifier.fillMaxSize()) {
-                            val displayArtist = remember(track) { track?.artist?.primaryArtist().orEmpty() }
-                            // The header reads only these settled values (not uiState itself), and
-                            // its enter/exit modifiers are remembered, so the 250ms position tick
-                            // that recomposes this screen skips the header and its marquees.
-                            val headerInk = npInk()
-                            val headerLiked = uiState.currentTrack?.stashLikedAt != null
-                            val lyricsMenuItems = lyricsMenuItemsFor(
-                                    lyricsState,
-                                    lyricsSyncOffsetMs,
-                                    canSaveToFile = track?.isDownloaded == true,
-                                    outputKnown = lyricsOutputOffset != null,
-                                    canGetWordSynced = uiState.currentTrackStored == true && appleLyricsEnabled,
-                                )
-                            val savingLyrics = exportingLyricsTrackId != null
-                            val rise = with(LocalDensity.current) { RiseDistance.roundToPx() }
-                            val headerTextEnter = remember(this@AnimatedContent, rise) {
-                                Modifier.animateEnterExit(enter = riseIn(rise, RISE_STAGGER_MS), exit = fadeOut(tween(MODE_FADE_OUT_MS)))
-                            }
-                            val headerActionsEnter = remember(this@AnimatedContent, rise) {
-                                Modifier.animateEnterExit(enter = riseIn(rise, RISE_STAGGER_MS * 2), exit = fadeOut(tween(MODE_FADE_OUT_MS)))
-                            }
-                            val paneEnter = remember(this@AnimatedContent, rise) {
-                                Modifier.animateEnterExit(enter = riseIn(rise, RISE_STAGGER_MS * 3), exit = fadeOut(tween(MODE_FADE_OUT_MS)))
-                            }
-                            LyricsModeHeader(
-                                cover = {
-                                    CompactCover(
-                                        artModel = artModel,
-                                        onClick = { viewModel.onDismissLyrics() },
-                                        modifier = artShared.then(heroLayer(isCurrentMode = reading, cornerDp = CompactCoverCornerDp)),
-                                    )
-                                },
-                                title = track?.title.orEmpty(),
-                                artist = displayArtist,
-                                ink = headerInk,
-                                modifier = Modifier.padding(start = 24.dp, end = 12.dp, top = 8.dp),
-                                textModifier = headerTextEnter.then(controlsLayer),
-                                actionsModifier = headerActionsEnter.then(controlsLayer),
-                            ) {
-                                // The sleep timer, as on the art view (and in the web's header);
-                                // accented, with its live countdown under the moon, while armed.
-                                SleepTimerButton(
-                                    state = sleepTimerState,
-                                    onClick = { showSleepTimerSheet = true },
-                                    activeTint = chrome.accent,
-                                    idleTint = headerInk.copy(alpha = 0.7f),
-                                    buttonSize = 48.dp,
-                                    iconSize = 22.dp,
-                                )
-                                // An All Songs file can't be liked (no library row): no heart.
-                                if (uiState.currentTrack?.isScannedSong != true) {
-                                    com.stash.core.ui.components.LikeButton(
-                                        isLiked = headerLiked,
-                                        onTap = { viewModel.onLikeTap() },
-                                        unlikedTint = headerInk.copy(alpha = 0.7f),
-                                        size = 26.dp,
-                                    )
-                                }
-                                LyricsMenuButton(
-                                    items = lyricsMenuItems,
-                                    liveEnabled = liveLyricsEnabled,
-                                    onLiveToggle = { viewModel.setLiveLyricsBarEnabled(it) },
-                                    offsetMs = lyricsSyncOffsetMs,
-                                    onOffsetChange = { viewModel.setLyricsSyncOffsetMs(it) },
-                                    outputOffset = lyricsOutputOffset,
-                                    onOutputOffsetChange = { viewModel.setLyricsOutputOffsetMs(it) },
-                                    savingToFile = savingLyrics,
-                                    onSaveToFile = { viewModel.exportLyricsForCurrentTrack() },
-                                    gettingWordSynced = upgradingLyricsTrackId != null,           // new
-                                    onGetWordSynced = { viewModel.getWordSyncedLyricsForCurrentTrack() }, // new
-                                    ink = headerInk,
-                                )
-                            }
-                            LyricsPane(
-                                state = lyricsState,
-                                currentPositionMs = { lyricsPosition.value },
-                                isPlaying = uiState.isPlaying && !uiState.isBuffering,
-                                playbackSpeed = playbackSpeed,
-                                onSeek = { if (!isListener) viewModel.onLyricsLineSeek(it) }, // a listener follows the room
-                                onRetry = viewModel::onLyricsRetry,
-                                ink = npInk(),
-                                accent = { chrome.ink },
-                                light = npIsLight(),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .weight(1f)
-                                    .padding(top = 4.dp)
-                                    .then(paneEnter)
-                                    .then(controlsLayer),
-                            )
-                            foot(Modifier.then(controlsLayer).padding(horizontal = 24.dp).then(footShared))
-                            Spacer(modifier = Modifier.height(LyricsFootBottom))
                         }
                     }
                 }
             }
+            if (room != null) com.stash.feature.nowplaying.listen.FloatingReactions(together.reactions, animate = ambientAnimationEnabled, modifier = Modifier.fillMaxSize().then(controlsLayer))
+            com.stash.feature.nowplaying.ui.PageZoomLayer(pageZoom)
         }
-        if (room != null) com.stash.feature.nowplaying.listen.FloatingReactions(together.reactions, animate = ambientAnimationEnabled, modifier = Modifier.fillMaxSize().then(controlsLayer))
-        com.stash.feature.nowplaying.ui.PageZoomLayer(pageZoom)
     }
 
     if (showOptionsSheet && track != null) WithAlbumChrome { sheetChrome ->
@@ -1421,130 +1539,168 @@ private fun riseIn(risePx: Int, delayMs: Int): EnterTransition =
         slideInVertically(tween(RISE_MS, delayMillis = delayMs, easing = FastOutSlowInEasing)) { risePx }
 
 /**
- * Title, artist · album, the sleep timer (leading edge) and the like heart (trailing edge),
- * under the big art. Tap the title/artist to open the artist profile; the trailing chevron
- * signals it's actionable, and swaps to a spinner while the artist name is being resolved.
- * Symmetric horizontal padding keeps the title/artist block optically centred under the art.
+ * Title, artist · album, the like heart, and the button beside the title ([sideButton]: the
+ * sleep timer unless Settings says otherwise), under the big art. Tap the title/artist to open the
+ * artist profile; the trailing chevron signals it's actionable, and swaps to a spinner while the
+ * artist name is being resolved.
+ *
+ * Centred (the default): the side button floats at the leading edge and the heart at the
+ * trailing one, with symmetric padding keeping the title optically centred under the art. With
+ * [alignStart] (Settings > Appearance > Title alignment), the title and artist sit at the leading
+ * edge and the side button and heart follow at the trailing one.
  */
 @Composable
 private fun TrackInfoBlock(
     track: com.stash.core.model.Track?,
     resolvingArtist: Boolean,
     onTrackInfoTapped: () -> Unit,
-    sleepTimerState: SleepTimerController.State,
-    onSleepTimerClick: () -> Unit,
     isLiked: Boolean,
     onLikeTap: () -> Unit,
+    alignStart: Boolean,
+    sideButton: (@Composable (Modifier) -> Unit)?,
 ) {
-    Box(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 40.dp)
-                .then(
-                    if (track != null) {
-                        Modifier.clickable(enabled = !resolvingArtist) { onTrackInfoTapped() }
-                    } else {
-                        Modifier
-                    },
-                ),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                // A long title scrolls instead of ending in "…": every
-                // character is worth more than an ellipsis here, and the
-                // width the format badge used to take beside it now
-                // belongs to the title — QualityLine below already says
-                // FLAC and the bit depth, so the badge said it twice.
-                Text(
-                    text = track?.title ?: "Not Playing",
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = npInk(),
-                    maxLines = 1,
-                    softWrap = false,
-                    overflow = TextOverflow.Clip,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier
-                        .weight(1f, fill = false)
-                        .marqueeWhileShown(),
-                )
-                if (track != null) {
-                    Spacer(modifier = Modifier.width(6.dp))
-                    if (resolvingArtist) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            strokeWidth = 2.dp,
-                            color = npInk(),
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                            contentDescription = "Open artist",
-                            tint = npInk().copy(alpha = 0.6f),
-                            modifier = Modifier.size(18.dp),
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(StackRhythm.TitleToArtist))
-
-            // Collapse collaboration credits to the lead act
-            // ("Metro Boomin, Travis Scott" → "Metro Boomin"), and
-            // remember the split — this Text recomposes with every
-            // player-state change.
-            val displayArtist = remember(track) { track?.artist?.primaryArtist() }
-            Text(
-                text = buildString {
-                    if (track != null && displayArtist != null) {
-                        append(displayArtist)
-                        if (track.album.isNotBlank()) {
-                            append(" • ")
-                            append(track.album)
-                        }
-                    }
-                },
-                fontSize = 15.sp,
-                color = npInk().copy(alpha = 0.7f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-        // Sleep timer — floated to the leading edge, mirroring the
-        // Like heart's placement on the trailing edge. Accented
-        // while a timer is armed, with the time left under the moon
-        // ("23m", "0:45", "End"), so the state is visible at a
-        // glance without opening the sheet.
-        // The album accent is read in its own scope: the crossfade recomposes the button, not the title.
-        if (track != null) WithAlbumChrome { chrome ->
-            SleepTimerButton(
-                state = sleepTimerState,
-                onClick = onSleepTimerClick,
-                activeTint = chrome.accent,
-                idleTint = npInk().copy(alpha = 0.7f),
-                buttonSize = 26.dp,
-                iconSize = 20.dp,
-                modifier = Modifier.align(Alignment.CenterStart),
-            )
-        }
-
-        // Like heart — floated to the trailing edge and vertically centred
-        // against the title/artist block. The track's other actions live in
-        // the top row (pinned) or the ⋮ menu. None for an All Songs file (no library row).
-        if (track != null && !track.isScannedSong) {
+    val tapToArtist = if (track != null) {
+        Modifier.clickable(enabled = !resolvingArtist) { onTrackInfoTapped() }
+    } else {
+        Modifier
+    }
+    // Like heart — beside the title. The track's other actions live in the top row (pinned) or the
+    // ⋮ menu. None for an All Songs file (no library row).
+    val heart: (@Composable (Modifier) -> Unit)? = if (track != null && !track.isScannedSong) {
+        { m ->
             com.stash.core.ui.components.LikeButton(
                 isLiked = isLiked,
                 onTap = onLikeTap,
                 unlikedTint = npInk().copy(alpha = 0.7f),
                 size = 26.dp,
-                modifier = Modifier.align(Alignment.CenterEnd),
+                modifier = m,
+            )
+        }
+    } else {
+        null
+    }
+    if (alignStart) {
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            TitleAndArtist(track, resolvingArtist, alignStart = true, modifier = Modifier.weight(1f).then(tapToArtist))
+            if (track != null) sideButton?.invoke(Modifier.padding(start = 12.dp))
+            heart?.invoke(Modifier.padding(start = 12.dp))
+        }
+        return
+    }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        TitleAndArtist(
+            track,
+            resolvingArtist,
+            alignStart = false,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 40.dp).then(tapToArtist),
+        )
+        // The side button floats at the leading edge, mirroring the heart at the trailing one
+        // (the sleep timer accented while armed, its time left under the moon).
+        if (track != null) sideButton?.invoke(Modifier.align(Alignment.CenterStart))
+        heart?.invoke(Modifier.align(Alignment.CenterEnd))
+    }
+}
+
+/** The title (with its chevron to the artist) over artist · album, centred or at the leading edge. */
+@Composable
+private fun TitleAndArtist(
+    track: com.stash.core.model.Track?,
+    resolvingArtist: Boolean,
+    alignStart: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = if (alignStart) Alignment.Start else Alignment.CenterHorizontally,
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = if (alignStart) Arrangement.Start else Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // A long title scrolls instead of ending in "…": every
+            // character is worth more than an ellipsis here, and the
+            // width the format badge used to take beside it now
+            // belongs to the title — QualityLine below already says
+            // FLAC and the bit depth, so the badge said it twice.
+            Text(
+                text = track?.title ?: "Not Playing",
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                color = npInk(),
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Clip,
+                textAlign = if (alignStart) TextAlign.Start else TextAlign.Center,
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .marqueeWhileShown(),
+            )
+            if (track != null) {
+                Spacer(modifier = Modifier.width(6.dp))
+                if (resolvingArtist) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = npInk(),
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                        contentDescription = "Open artist",
+                        tint = npInk().copy(alpha = 0.6f),
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(StackRhythm.TitleToArtist))
+
+        // Collapse collaboration credits to the lead act
+        // ("Metro Boomin, Travis Scott" → "Metro Boomin"), and
+        // remember the split — this Text recomposes with every
+        // player-state change.
+        val displayArtist = remember(track) { track?.artist?.primaryArtist() }
+        Text(
+            text = buildString {
+                if (track != null && displayArtist != null) {
+                    append(displayArtist)
+                    if (track.album.isNotBlank()) {
+                        append(" • ")
+                        append(track.album)
+                    }
+                }
+            },
+            fontSize = 15.sp,
+            color = npInk().copy(alpha = 0.7f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = if (alignStart) TextAlign.Start else TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+/**
+ * One of Now Playing's actions as the button beside the title: its icon at the sleep timer's
+ * size, accented while it's on (radio playing, lyrics open), doing what its top-row pin does.
+ */
+@Composable
+private fun TitleActionButton(
+    action: NowPlayingAction,
+    visualState: ActionVisualState,
+    onAction: (NowPlayingAction) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val visual = actionVisual(action, visualState, pinned = true)
+    WithAlbumChrome { chrome ->
+        IconButton(onClick = { onAction(action) }, modifier = modifier.size(26.dp)) {
+            Icon(
+                imageVector = visual.icon,
+                contentDescription = visual.label,
+                tint = if (visual.active) chrome.accent else npInk().copy(alpha = 0.7f),
+                modifier = Modifier.size(20.dp),
             )
         }
     }
@@ -1707,9 +1863,6 @@ private fun InsidePageSection(
         }
     }
 }
-
-/** A cycled page turned over by hand becomes the front after this: once the turn hides it. */
-private const val CYCLE_RESET_AFTER_MS = 300L
 
 /** The narrowest and widest a back cover is drawn (width over height). */
 private const val BACK_MIN_ASPECT = 0.6f

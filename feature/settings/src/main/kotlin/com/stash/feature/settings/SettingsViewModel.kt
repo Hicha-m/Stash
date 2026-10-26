@@ -1689,6 +1689,72 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch { nowPlayingPreference.setCycleAlbumArt(enabled) }
     }
 
+    /** Settings > Appearance > Title alignment. */
+    val titleAlign: StateFlow<com.stash.core.data.prefs.NpTitleAlign> = nowPlayingPreference.titleAlign.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        com.stash.core.data.prefs.NpTitleAlign.CENTER,
+    )
+
+    fun onTitleAlignChanged(align: com.stash.core.data.prefs.NpTitleAlign) {
+        viewModelScope.launch { nowPlayingPreference.setTitleAlign(align) }
+    }
+
+    /** Settings > Appearance > Button beside the title. */
+    val titleButton: StateFlow<com.stash.core.data.prefs.TitleButton> = nowPlayingPreference.titleButton.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        com.stash.core.data.prefs.TitleButton.SLEEP_TIMER,
+    )
+
+    fun onTitleButtonChanged(button: com.stash.core.data.prefs.TitleButton) {
+        viewModelScope.launch { nowPlayingPreference.setTitleButton(button) }
+    }
+
+    /** Settings > Appearance > Full art blend. */
+    val fullArtBlend: StateFlow<com.stash.core.data.prefs.FullArtBlend> = nowPlayingPreference.fullArtBlend.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        com.stash.core.data.prefs.FullArtBlend.BLURRED,
+    )
+
+    fun onFullArtBlendChanged(blend: com.stash.core.data.prefs.FullArtBlend) {
+        viewModelScope.launch { nowPlayingPreference.setFullArtBlend(blend) }
+    }
+
+    /** Settings > Appearance > Discogs art. */
+    val discogsArt: StateFlow<Boolean> = nowPlayingPreference.discogsArt.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        true,
+    )
+
+    fun onDiscogsArtChanged(on: Boolean) {
+        viewModelScope.launch { nowPlayingPreference.setDiscogsArt(on) }
+    }
+
+    /** Settings > Appearance > Full art zoom. */
+    val fullArtZoom: StateFlow<Float> = nowPlayingPreference.fullArtZoom.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        com.stash.core.data.prefs.NowPlayingPreference.FULL_ART_ZOOM_DEFAULT,
+    )
+
+    fun onFullArtZoomChanged(zoom: Float) {
+        viewModelScope.launch { nowPlayingPreference.setFullArtZoom(zoom) }
+    }
+
+    /** Settings > Appearance > Full art pan. */
+    val fullArtPan: StateFlow<com.stash.core.data.prefs.FullArtPan> = nowPlayingPreference.fullArtPan.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        com.stash.core.data.prefs.FullArtPan.NORMAL,
+    )
+
+    fun onFullArtPanChanged(pan: com.stash.core.data.prefs.FullArtPan) {
+        viewModelScope.launch { nowPlayingPreference.setFullArtPan(pan) }
+    }
+
     /** How the Now Playing ambient moves (Settings > Appearance > Ambient style). */
     fun onAmbientStyleChanged(style: com.stash.core.data.prefs.AmbientStyle) {
         viewModelScope.launch { nowPlayingPreference.setAmbientStyle(style) }

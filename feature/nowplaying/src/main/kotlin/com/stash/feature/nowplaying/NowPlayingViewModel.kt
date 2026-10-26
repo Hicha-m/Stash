@@ -175,6 +175,39 @@ class NowPlayingViewModel @Inject constructor(
     val cycleAlbumArt: StateFlow<Boolean> = nowPlayingPreference.cycleAlbumArt
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
+    /**
+     * The full art layout (the top row's toggle), kept for next time. Null until DataStore answers,
+     * so a Now Playing left in full art opens straight into it.
+     */
+    val fullArt: StateFlow<Boolean?> = nowPlayingPreference.fullArt
+        .map<Boolean, Boolean?> { it }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** Settings > Appearance > Full art zoom. */
+    val fullArtZoom: StateFlow<Float> = nowPlayingPreference.fullArtZoom
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), com.stash.core.data.prefs.NowPlayingPreference.FULL_ART_ZOOM_DEFAULT)
+
+    /** Settings > Appearance > Full art pan. */
+    val fullArtPan: StateFlow<com.stash.core.data.prefs.FullArtPan> = nowPlayingPreference.fullArtPan
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), com.stash.core.data.prefs.FullArtPan.NORMAL)
+
+    /** Settings > Appearance > Full art blend. */
+    val fullArtBlend: StateFlow<com.stash.core.data.prefs.FullArtBlend> = nowPlayingPreference.fullArtBlend
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), com.stash.core.data.prefs.FullArtBlend.BLURRED)
+
+    /** Settings > Appearance > Title alignment. */
+    val titleAlign: StateFlow<com.stash.core.data.prefs.NpTitleAlign> = nowPlayingPreference.titleAlign
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), com.stash.core.data.prefs.NpTitleAlign.CENTER)
+
+    /** Settings > Appearance > Button beside the title. */
+    val titleButton: StateFlow<com.stash.core.data.prefs.TitleButton> = nowPlayingPreference.titleButton
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), com.stash.core.data.prefs.TitleButton.SLEEP_TIMER)
+
+    fun onToggleFullArt() {
+        val on = fullArt.value != true
+        viewModelScope.launch { nowPlayingPreference.setFullArt(on) }
+    }
+
     /** Settings > Appearance > Ambient style. */
     val ambientStyle: StateFlow<com.stash.core.data.prefs.AmbientStyle?> = nowPlayingPreference.ambientStyle
         .map<com.stash.core.data.prefs.AmbientStyle, com.stash.core.data.prefs.AmbientStyle?> { it }
