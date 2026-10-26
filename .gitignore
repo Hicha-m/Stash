@@ -47,6 +47,7 @@ obj/
 keystore.properties
 keystore-password-SAVE-THEN-DELETE.txt
 keystore-base64-SAVE-THEN-DELETE.txt
+stash-release.base64.txt
 
 # Google Services
 google-services.json
